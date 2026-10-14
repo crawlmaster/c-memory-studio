@@ -1,0 +1,30 @@
+# Environment & Secrets
+.env
+*.env.local
+
+# C / C++ build outputs & debug binaries
+*.o
+*.out
+*.exe
+*.dSYM/
+target
+target.c
+/sandbox/workspace/*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.pytest_cache/
+
+# Node / Frontend
+node_modules/
+dist/
+.vite/
+*.log
+
+# Valgrind outputs
+*.xml
+valgrind-out.txt
