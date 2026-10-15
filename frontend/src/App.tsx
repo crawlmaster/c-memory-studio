@@ -13,7 +13,7 @@ import { CodeEditor } from "./components/Editor/CodeEditor";
 import { ArrayVisualizer } from "./components/Visualizer/ArrayVisualizer";
 import { GraphVisualizer } from "./components/Visualizer/GraphVisualizer";
 import { HeapVisualizer } from "./components/HeapView/HeapVisualizer";
-import { type HighlightTarget } from "./types/debug";
+import { type HighlightTarget } from "./types/debugger";
 import {
   BarChart3,
   Share2,
@@ -361,6 +361,7 @@ export const App: React.FC = () => {
                 key={`graph-${sessionId}`}
                 graph={currentFrame?.graph || { nodes: [], edges: [] }}
                 locals={currentFrame?.stack_frames?.locals}
+                arrays={currentFrame?.arrays || []}
                 isConnecting={isConnecting}
               />
             )}

@@ -1,59 +1,64 @@
 /**
- * frontend/src/types/debug.ts
+ * frontend/src/types/debugger.ts
+ * Purely structural DWARF data contracts for C-Memory-Studio.
+ * Free of legacy aliases (`from`/`to`) and redundant pointer maps.
  */
 
-export interface ArrayTupleElement {
-  label: string;
-  value: number | string;
-  secondary?: string;
-}
+export type CompoundArrayElement = {
+  fields: Record<string, number | string>;
+  address?: string;
+};
 
-export interface ArrayData {
+export type ArrayElement = number | string | CompoundArrayElement;
+
+export interface ArraySnapshot {
   name: string;
-  type?: string;
-  elements: Array<number | string | ArrayTupleElement>;
+  type: string;
+  element_type?: string;
+  is_compound?: boolean;
+  capacity?: number;
+  elements: ArrayElement[];
   active_indices: Record<string, number>;
 }
 
 export interface GraphNode {
   id: string;
-  type?: string;
   label?: string;
-  fields: Record<string, number | string | null>;
-  is_active: boolean;
+  type?: string;
+  c_type?: string;
+  fields: Record<string, number | string>;
+  pointers?: string[]; // Stack pointer badges: ["head", "curr", "s"]
   is_freed?: boolean;
-  pointers?: string[];
+  is_active?: boolean;
 }
 
 export interface GraphEdge {
-  source?: string;
-  from?: string;
-  target?: string;
-  to?: string;
-  label: string;
-  is_active?: boolean;
-  is_directed?: boolean;
+  source: string;
+  target: string;
+  label?: string;
 }
 
 export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
-  stack_pointers?: Record<string, string>;
-  mode?: "abstract_graph" | "pointer_mesh";
 }
 
-export interface DebugFrame {
-  step?: number;
+export interface ExecutionStepFrame {
+  step: number;
   line: number;
-  source_file?: string;
-  call_stack?: string[];
-  arrays: ArrayData[];
+  source_file: string;
+  call_stack: string[];
+  arrays: ArraySnapshot[];
   graph: GraphData;
-  stack_frames?: {
+  stack_frames: {
     locals: Record<string, number | string>;
   };
-  status?: "running" | "completed" | "error";
+  status: "running" | "completed" | "error";
 }
+
+// Type aliases for backward compatibility with existing component props
+export type ArrayData = ArraySnapshot;
+export type DebugFrame = ExecutionStepFrame;
 
 export type MemoryBlockState =
   | "DEFINITELY_LOST"

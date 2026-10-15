@@ -13,7 +13,7 @@ import {
   type ValgrindAuditResponse,
   type MemoryBlock,
   type HighlightTarget,
-} from "../../types/debug";
+} from "../../types/debugger";
 import {
   ShieldAlert,
   ShieldCheck,

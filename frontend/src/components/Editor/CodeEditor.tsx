@@ -20,7 +20,7 @@ import {
   Gauge,
   Loader2,
 } from "lucide-react";
-import { type HighlightTarget } from "../../types/debug";
+import { type HighlightTarget } from "../../types/debugger";
 
 export interface CodeEditorProps {
   code: string;
