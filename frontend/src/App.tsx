@@ -1,30 +1,34 @@
 /**
  * frontend/src/App.tsx
- * Master 50/50 split-pane layout for C-Memory-Studio:
- * - Left Pane: Monaco CodeEditor + Debugger Controls
- * - Right Pane: Tabbed Studio ("Array & Sorting", "Pointers & Graph Mesh", "Heap & Leaks (Valgrind)")
- * - Automatic tab switching when arrays/graphs appear or Valgrind completes
+ * Master 50/50 split-pane layout for C-Memory-Studio.
+ * Fixes:
+ * 1. Eliminates Valgrind tab auto-close loop by honoring manual user tab clicks (`userSelectedTabRef`).
+ * 2. Persists C code in `localStorage` under `'c_memory_studio_saved_code'`.
+ * 3. Adds a "Reset to Demo Code" action in the header bar.
  */
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { useDebugSession } from "./hooks/useDebugSession";
 import { CodeEditor } from "./components/Editor/CodeEditor";
 import { ArrayVisualizer } from "./components/Visualizer/ArrayVisualizer";
 import { GraphVisualizer } from "./components/Visualizer/GraphVisualizer";
 import { HeapVisualizer } from "./components/HeapView/HeapVisualizer";
-import type { HighlightTarget } from "./types/debug";
+import { type HighlightTarget } from "./types/debug";
 import {
   BarChart3,
   Share2,
   ShieldAlert,
   Terminal,
   AlertCircle,
+  RotateCcw,
   X,
 } from "lucide-react";
 
 type StudioTab = "arrays" | "graph" | "valgrind";
 
-const DEFAULT_DEMO_C_CODE = `#include <stdlib.h>
+const LOCAL_STORAGE_CODE_KEY = "c_memory_studio_saved_code";
+
+export const DEFAULT_DEMO_C_CODE = `#include <stdlib.h>
 
 struct Node {
     int val;
@@ -39,14 +43,21 @@ struct Node* create_node(int v) {
 }
 
 int main(void) {
-    // 1. Contiguous Array & Bubble Sort Pass
-    int arr[4] = {8, 2, 5, 1};
-    for (int i = 0; i < 3; i++) {
-        int j = i + 1;
-        if (arr[i] > arr[j]) {
-            int tmp = arr[i];
-            arr[i] = arr[j];
-            arr[j] = tmp;
+    // 1. Contiguous Array & Binary Search Demo
+    int arr[6] = {2, 5, 8, 12, 16, 23};
+    int n = 6;
+    int target = 16;
+    int low = 0;
+    int high = n - 1;
+
+    while (low <= high) {
+        int middle = low + (high - low) / 2;
+        if (arr[middle] == target) {
+            break;
+        } else if (arr[middle] < target) {
+            low = middle + 1;
+        } else {
+            high = middle - 1;
         }
     }
 
@@ -67,10 +78,24 @@ int main(void) {
 `;
 
 export const App: React.FC = () => {
-  const [code, setCode] = useState<string>(DEFAULT_DEMO_C_CODE);
+  // Initialize from localStorage or fall back to DEFAULT_DEMO_C_CODE
+  const [code, setCode] = useState<string>(() => {
+    try {
+      const saved = window.localStorage.getItem(LOCAL_STORAGE_CODE_KEY);
+      return saved !== null && saved.trim().length > 0
+        ? saved
+        : DEFAULT_DEMO_C_CODE;
+    } catch {
+      return DEFAULT_DEMO_C_CODE;
+    }
+  });
+
   const [activeTab, setActiveTab] = useState<StudioTab>("arrays");
   const [highlightedLine, setHighlightedLine] =
     useState<HighlightTarget | null>(null);
+
+  // Tracks whether the user manually clicked a tab so we never hijack their navigation
+  const userOverrodeTabRef = useRef<boolean>(false);
 
   const {
     stepIndex,
@@ -95,28 +120,49 @@ export const App: React.FC = () => {
     clearError,
   } = useDebugSession();
 
-  // Auto-switch between "Array & Sorting" and "Pointers & Graph Mesh" based on active frame content
+  // Persist code to localStorage whenever it changes
   useEffect(() => {
-    if (!currentFrame) return;
+    try {
+      window.localStorage.setItem(LOCAL_STORAGE_CODE_KEY, code);
+    } catch {
+      // Ignore storage quota errors in private browsing
+    }
+  }, [code]);
+
+  // Auto-switch between "arrays" and "graph" ONLY during active trace stepping
+  // when the user has NOT manually locked a tab (e.g. clicking Valgrind).
+  useEffect(() => {
+    if (!currentFrame || userOverrodeTabRef.current) return;
 
     const hasGraphNodes =
       currentFrame.graph && currentFrame.graph.nodes.length > 0;
     const hasArrays = currentFrame.arrays && currentFrame.arrays.length > 0;
 
-    if (hasGraphNodes && activeTab === "arrays" && !hasArrays) {
+    if (hasGraphNodes && !hasArrays) {
       setActiveTab("graph");
-    } else if (hasArrays && activeTab === "valgrind") {
+    } else if (hasArrays && !hasGraphNodes) {
       setActiveTab("arrays");
     }
-  }, [currentFrame, activeTab]);
+  }, [currentFrame]);
+
+  const handleManualTabSelect = useCallback((tab: StudioTab) => {
+    userOverrodeTabRef.current = true;
+    setActiveTab(tab);
+  }, []);
 
   const handleStartTrace = useCallback(() => {
+    // Allow auto-tab selection for the newly started trace session
+    userOverrodeTabRef.current = false;
     setHighlightedLine(null);
+    setActiveTab("arrays");
     startTrace(code);
   }, [code, startTrace]);
 
   const handleRunValgrind = useCallback(async () => {
+    // Explicitly lock onto the Valgrind tab so `currentFrame` never kicks us out
+    userOverrodeTabRef.current = true;
     setActiveTab("valgrind");
+
     const result = await runValgrindAudit(code);
     if (result?.blocks && result.blocks.length > 0) {
       const firstBlock = result.blocks[0];
@@ -133,6 +179,17 @@ export const App: React.FC = () => {
     }
   }, [code, runValgrindAudit]);
 
+  const handleResetDemoCode = useCallback(() => {
+    stop();
+    setHighlightedLine(null);
+    setCode(DEFAULT_DEMO_C_CODE);
+    try {
+      window.localStorage.setItem(LOCAL_STORAGE_CODE_KEY, DEFAULT_DEMO_C_CODE);
+    } catch {
+      // Ignore
+    }
+  }, [stop]);
+
   const arrayCount = currentFrame?.arrays?.length || 0;
   const graphNodeCount = currentFrame?.graph?.nodes?.length || 0;
   const valgrindIssueCount = valgrindData?.blocks?.length || 0;
@@ -141,18 +198,26 @@ export const App: React.FC = () => {
     <div className="flex flex-col h-screen w-screen bg-slate-950 text-slate-100 overflow-hidden">
       {/* Top Application Header Bar */}
       <header className="flex items-center justify-between px-4 py-2.5 bg-slate-900 border-b border-slate-800 shrink-0">
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-3">
           <div className="w-7 h-7 rounded-lg bg-sky-500/15 border border-sky-500/40 flex items-center justify-center text-sky-400">
             <Terminal className="w-4 h-4" />
           </div>
-          <div>
-            <h1 className="text-sm font-mono font-bold tracking-tight text-white flex items-center gap-2">
-              <span>C-Memory-Studio</span>
-              <span className="px-1.5 py-0.5 text-[10px] font-mono bg-slate-800 text-sky-400 rounded border border-slate-700">
-                GDB/MI + Valgrind XML v4
-              </span>
-            </h1>
-          </div>
+          <h1 className="text-sm font-mono font-bold tracking-tight text-white flex items-center gap-2">
+            <span>C-Memory-Studio</span>
+            <span className="px-1.5 py-0.5 text-[10px] font-mono bg-slate-800 text-sky-400 rounded border border-slate-700">
+              GDB/MI + Valgrind XML v4
+            </span>
+          </h1>
+
+          <button
+            type="button"
+            onClick={handleResetDemoCode}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs font-mono transition cursor-pointer ml-2"
+            title="Reset Editor to Default C Demo Snippet"
+          >
+            <RotateCcw className="w-3 h-3 text-sky-400" />
+            <span>Reset to Demo Code</span>
+          </button>
         </div>
 
         {/* Call Stack Pill Trail */}
@@ -179,7 +244,7 @@ export const App: React.FC = () => {
         </div>
       </header>
 
-      {/* Global Error Banner (Compiler stderr / Connection errors) */}
+      {/* Global Error Banner */}
       {error && (
         <div className="bg-rose-950/95 border-b border-rose-600 px-4 py-2.5 flex items-start justify-between gap-3 shrink-0">
           <div className="flex items-start gap-2.5 overflow-x-auto">
@@ -232,7 +297,7 @@ export const App: React.FC = () => {
           <div className="flex items-center border-b border-slate-800 bg-slate-900 px-2 shrink-0">
             <button
               type="button"
-              onClick={() => setActiveTab("arrays")}
+              onClick={() => handleManualTabSelect("arrays")}
               className={`flex items-center gap-2 px-4 py-2.5 text-xs font-mono font-semibold border-b-2 transition cursor-pointer ${
                 activeTab === "arrays"
                   ? "border-sky-400 text-sky-400 bg-slate-950/60"
@@ -250,7 +315,7 @@ export const App: React.FC = () => {
 
             <button
               type="button"
-              onClick={() => setActiveTab("graph")}
+              onClick={() => handleManualTabSelect("graph")}
               className={`flex items-center gap-2 px-4 py-2.5 text-xs font-mono font-semibold border-b-2 transition cursor-pointer ${
                 activeTab === "graph"
                   ? "border-sky-400 text-sky-400 bg-slate-950/60"
@@ -268,7 +333,7 @@ export const App: React.FC = () => {
 
             <button
               type="button"
-              onClick={() => setActiveTab("valgrind")}
+              onClick={() => handleManualTabSelect("valgrind")}
               className={`flex items-center gap-2 px-4 py-2.5 text-xs font-mono font-semibold border-b-2 transition cursor-pointer ${
                 activeTab === "valgrind"
                   ? "border-amber-400 text-amber-400 bg-slate-950/60"
@@ -297,6 +362,7 @@ export const App: React.FC = () => {
             {activeTab === "graph" && (
               <GraphVisualizer
                 graph={currentFrame?.graph || { nodes: [], edges: [] }}
+                locals={currentFrame?.stack_frames?.locals}
               />
             )}
 

@@ -7,7 +7,10 @@ Features:
   - Emits `stack_pointers` map and per-node `pointers: List[str]` (`head`, `curr`, `second`).
   - Tracks `free()` calls and `ptmalloc2` tcache safe-linking mangling (`addr >> 12`) to mark
     freed heap chunks with `is_freed: True` (`[FREED / DANGLING]`) without following corrupt pointers.
-  - Zero-redundancy stepping and cached `ptype` reflection.
+  - Smart stepping (`-exec-step` into user functions, `-exec-next` over stdlib routines).
+  - Uninitialized current-line declaration guard (`int middle = ...` before execution).
+  - Full dynamic index association (`middle`, `mid`, `low`, `high`, `pivot`, `i`, `j`, etc.)
+    while preserving search target scalars (`target`, `key`) in `stack_frames.locals`.
 """
 
 import asyncio
@@ -32,19 +35,41 @@ STEP_INACTIVITY_TIMEOUT_SEC = 3.0
 MAX_ARRAY_ELEMENTS = 256
 MAX_GRAPH_NODES = 20
 
-SIZE_VAR_CANDIDATES = {
-    "n", "len", "length", "size", "count", "capacity", "num", "v_size", "arr_size"
-}
-INDEX_VAR_CANDIDATES = {
-    "i", "j", "k", "idx", "index", "min_idx", "max_idx",
-    "pivot", "low", "high", "left", "right", "mid", "l", "r", "top", "front", "rear"
-}
-STRUCT_VALUE_FIELDS = {"val", "value", "key", "data", "id", "info", "weight", "item"}
-
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 FIXED_ARR_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_\s]*?)\s*\[(\d+)\]$")
 PTR_TYPE_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_\s\*]*?)\s*\*$")
 FREE_CALL_RE = re.compile(r"\bfree\s*\(\s*([a-zA-Z_][a-zA-Z0-9_\->\.\[\]]*)\s*\)")
+
+# ==============================================================================
+# Variable Classification Constants
+# ==============================================================================
+
+SIZE_VAR_CANDIDATES = {
+    "n", "len", "length", "size", "count", "capacity", "num", "v_size", "arr_size"
+}
+
+# Variables that represent array sizes, search targets, temporary swap values, or return flags
+# (Excluded from array index badges even if their numeric value happens to fall in [0, n-1])
+NON_INDEX_SCALAR_NAMES = {
+    "n", "len", "length", "size", "count", "capacity", "num", "v_size", "arr_size",
+    "target", "key", "val", "value", "search", "x", "elem", "item", "needle",
+    "tmp", "temp", "swap", "found", "res", "result", "ans", "ret", "flag", "sum", "max", "min"
+}
+
+# Explicit index variable names (allowed to show at boundary -1 or array_len for loop termination)
+INDEX_VAR_CANDIDATES = {
+    "i", "j", "k", "idx", "index", "min_idx", "max_idx",
+    "pivot", "low", "high", "left", "right", "mid", "middle",
+    "l", "r", "start", "end", "pos", "top", "front", "rear", "curr_idx"
+}
+
+STDLIB_CALL_RE = re.compile(
+    r"\b(malloc|calloc|realloc|free|printf|fprintf|sprintf|snprintf|scanf|fscanf|puts|putchar|getchar|memcpy|memmove|memset|memcmp|strlen|strcpy|strncpy|strcmp|exit|abort)\s*\("
+)
+USER_FUNC_CALL_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
+C_CONTROL_KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "typeof"}
+
+STRUCT_VALUE_FIELDS = {"val", "value", "key", "data", "id", "info", "weight", "item"}
 
 
 # ==============================================================================
@@ -218,6 +243,8 @@ class GDBTracer:
     High-speed GDB/MI execution tracer with:
       - `stack_pointers` and per-node `pointers` mapping (`head`, `curr`, `second`)
       - Automatic `free()` detection & glibc tcache safe-linking poison detection
+      - Smart user-function stepping & uninitialized variable guard
+      - Full dynamic array index association (`middle`, `low`, `high`, `pivot`, `i`, `j`)
       - Recursive BFS heap graph discovery
     """
 
@@ -235,7 +262,7 @@ class GDBTracer:
         self.session_start_time = 0.0
         self.last_step_time = 0.0
 
-        # Source lines (1-indexed) to detect `free(ptr)` statements before execution
+        # Source lines (1-indexed) to inspect `free(ptr)`, declarations, and function calls
         self._source_lines: List[str] = [""]
         if self.source_path.exists():
             self._source_lines.extend(
@@ -378,12 +405,11 @@ class GDBTracer:
     def _record_pending_free_on_current_line(self) -> None:
         """
         Checks if the current source line about to be stepped over contains `free(<expr>)`.
-        If so, evaluates `<expr>` right before `-exec-next` executes and records the
-        target address in `self._freed_addresses`.
+        If so, evaluates `<expr>` right before execution and records the target address
+        in `self._freed_addresses`.
         """
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line]
-            # Strip single-line comments
             src_line = src_line.split("//")[0]
             for match in FREE_CALL_RE.finditer(src_line):
                 ptr_expr = match.group(1).strip()
@@ -392,17 +418,67 @@ class GDBTracer:
                 if addr and self._is_valid_heap_or_data_address(addr):
                     self._freed_addresses.add(addr)
 
-    def step_next_user_line(self) -> bool:
-        self._check_budget()
+    def _is_declared_on_current_line(self, var_name: str) -> bool:
+        """
+        Returns True if `var_name` is being declared and initialized on `self._current_line`
+        (e.g. `int middle = low + (high - low) / 2;`).
+        Because GDB stops BEFORE executing `self._current_line`, `var_name` holds uninitialized
+        stack bytes until the line executes on the next step.
+        """
+        if not (1 <= self._current_line < len(self._source_lines)):
+            return False
+        src_line = self._source_lines[self._current_line].split("//")[0].strip()
+        # Do not suppress loop headers like `for (int i = 0; i < n; i++)` once inside the loop
+        if src_line.startswith("for ") or src_line.startswith("for("):
+            return False
+        decl_pattern = (
+            rf"\b(?:int|long|short|size_t|ssize_t|unsigned|float|double|char)\s+"
+            rf"[^;]*\b{re.escape(var_name)}\s*="
+        )
+        return bool(re.search(decl_pattern, src_line))
 
-        # Check if the line we are about to execute calls free(...)
+    def _should_step_into_current_line(self) -> bool:
+        """
+        Determines whether the current C line calls a user-defined algorithm function
+        (e.g. `binary_search(v, n, target)`) vs a standard library routine (`malloc`, `free`, `printf`)
+        or node-allocation factory (`create_node`).
+        """
+        if not (1 <= self._current_line < len(self._source_lines)):
+            return False
+        src_line = self._source_lines[self._current_line].split("//")[0].strip()
+        if not src_line:
+            return False
+
+        # Step over standard library routines so we never enter glibc internals
+        if STDLIB_CALL_RE.search(src_line):
+            return False
+
+        for match in USER_FUNC_CALL_RE.finditer(src_line):
+            fn_name = match.group(1)
+            # Keep node allocation helpers atomic so `main`'s pointer mesh stays in scope
+            if fn_name in C_CONTROL_KEYWORDS or fn_name.startswith("create_"):
+                continue
+            return True
+        return False
+
+    def step_next_user_line(self) -> bool:
+        """
+        Advances execution by one source line in `target.c`.
+        Uses `-exec-step` when a user algorithm function is called on the line,
+        and `-exec-next` on normal lines and stdlib calls.
+        """
+        self._check_budget()
         self._record_pending_free_on_current_line()
 
-        responses = self._cmd("-exec-next")
+        mi_step_cmd = (
+            "-exec-step" if self._should_step_into_current_line() else "-exec-next"
+        )
+        responses = self._cmd(mi_step_cmd)
         if self._update_stop_state(responses):
             return False
 
-        for _ in range(3):
+        # If -exec-step entered an external glibc header/function, finish back to target.c
+        for _ in range(4):
             if (
                 self._current_file == self.source_path.name
                 and self._current_line > 0
@@ -413,6 +489,7 @@ class GDBTracer:
                 "__libc_start_call_main",
                 "__libc_start_main",
                 "_start",
+                "exit",
             }:
                 return False
 
@@ -446,12 +523,19 @@ class GDBTracer:
         raw_array_vars: List[Tuple[str, str, int]] = []
         raw_ptr_vars: List[Tuple[str, str, str]] = []
 
+        # ----------------------------------------------------------------------
+        # Pass 1: Classify all variables in scope
+        # ----------------------------------------------------------------------
         for v in raw_vars:
             v_name = v.get("name", "")
             v_type = v.get("type", "").strip()
             v_val = v.get("value", "")
 
             if not v_name or not v_type:
+                continue
+
+            # Skip variables whose declaration on the current line has not executed yet
+            if self._is_declared_on_current_line(v_name):
                 continue
 
             arr_match = FIXED_ARR_RE.match(v_type)
@@ -478,7 +562,11 @@ class GDBTracer:
                             if self._current_line - 1 < len(self._source_lines)
                             else ""
                         )
-                        if v_name in line_txt and ("malloc" in line_txt or "calloc" in line_txt or "create_" in line_txt):
+                        if v_name in line_txt and (
+                            "malloc" in line_txt
+                            or "calloc" in line_txt
+                            or "create_" in line_txt
+                        ):
                             self._freed_addresses.discard(addr)
                     active_struct_ptrs[v_name] = (addr, target_type)
                 elif target_type in {
@@ -501,7 +589,9 @@ class GDBTracer:
             if isinstance(parsed_val, int):
                 scalar_ints[v_name] = parsed_val
 
-        # Pass 2: Contiguous Arrays
+        # ----------------------------------------------------------------------
+        # Pass 2: Contiguous Arrays (Fixed Stack + Dynamic Heap Buffers)
+        # ----------------------------------------------------------------------
         arrays_snapshot: List[ArraySnapshot] = []
         inferred_len = self._infer_dynamic_array_length(scalar_ints)
 
@@ -520,13 +610,19 @@ class GDBTracer:
                 )
 
         for ptr_name, elem_type, addr in raw_ptr_vars:
-            if addr not in self._freed_addresses and inferred_len and 1 <= inferred_len <= MAX_ARRAY_ELEMENTS:
+            if (
+                addr not in self._freed_addresses
+                and inferred_len
+                and 1 <= inferred_len <= MAX_ARRAY_ELEMENTS
+            ):
                 deref_expr = f"*({elem_type}[{inferred_len}]*){ptr_name}"
                 expr_val = self._eval_expr(deref_expr)
                 if expr_val:
                     elements = parse_gdb_array(expr_val)
                     if elements:
-                        active_idx = self._collect_active_indices(scalar_ints, len(elements))
+                        active_idx = self._collect_active_indices(
+                            scalar_ints, len(elements)
+                        )
                         arrays_snapshot.append(
                             ArraySnapshot(
                                 name=ptr_name,
@@ -536,7 +632,9 @@ class GDBTracer:
                             )
                         )
 
+        # ----------------------------------------------------------------------
         # Pass 3: Recursive BFS Heap Pointer & Graph Mesh Discovery
+        # ----------------------------------------------------------------------
         graph_snapshot = self._crawl_pointer_graph(active_struct_ptrs)
 
         self.step_count += 1
@@ -613,7 +711,9 @@ class GDBTracer:
                 line = raw_line.strip().rstrip(";")
                 if not line:
                     continue
-                m = re.match(r"^(.+?[\s\*]+)([a-zA-Z_][a-zA-Z0-9_]*(\[\d+\])?)$", line)
+                m = re.match(
+                    r"^(.+?[\s\*]+)([a-zA-Z_][a-zA-Z0-9_]*(\[\d+\])?)$", line
+                )
                 if m:
                     f_type = m.group(1).strip()
                     f_name = m.group(2).split("[")[0].strip()
@@ -670,7 +770,6 @@ class GDBTracer:
         edges: List[GraphEdge] = []
         seen_edges: Set[Tuple[str, str, str]] = set()
 
-        # Map each valid heap address -> list of local stack pointer names pointing to it
         addr_to_ptr_names: Dict[str, List[str]] = {}
         stack_pointers_out: Dict[str, str] = {}
         valid_seeds: List[Tuple[str, str]] = []
@@ -841,14 +940,36 @@ class GDBTracer:
     def _collect_active_indices(
         self, scalar_ints: Dict[str, int], array_len: int
     ) -> Dict[str, int]:
+        """
+        Dynamically maps in-scope integer variables to array indices:
+        1. Explicit index names (`i`, `j`, `middle`, `mid`, `low`, `high`, `left`, `right`, `pivot`)
+           are included when within `[-1, array_len]` (allowing boundary OOB visibility).
+        2. Any other integer variable (not in `NON_INDEX_SCALAR_NAMES` like `target` or `n`)
+           whose value falls strictly within `[0, array_len - 1]` is included automatically.
+        """
         active: Dict[str, int] = {}
         for var_name, val in scalar_ints.items():
             low_name = var_name.lower()
-            if low_name in INDEX_VAR_CANDIDATES or low_name.endswith(
-                ("_idx", "_index", "_pos")
+
+            # Never treat array lengths (`n`, `size`) or search keys (`target`, `key`) as indices
+            if low_name in NON_INDEX_SCALAR_NAMES or low_name.endswith(
+                ("_len", "_size", "_count", "_cap", "_val", "_target", "_key")
             ):
+                continue
+
+            is_explicit_idx = (
+                low_name in INDEX_VAR_CANDIDATES
+                or low_name.endswith(("_idx", "_index", "_pos", "_ptr"))
+            )
+
+            if is_explicit_idx:
                 if -1 <= val <= array_len:
                     active[var_name] = val
+            else:
+                # Arbitrary user index variable in [0, array_len - 1]
+                if 0 <= val < array_len:
+                    active[var_name] = val
+
         return active
 
 
