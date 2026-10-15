@@ -6,10 +6,10 @@
  */
 
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import type {
-  DebugFrame,
-  ValgrindAuditResponse,
-  GraphEdge,
+import {
+  type DebugFrame,
+  type ValgrindAuditResponse,
+  type GraphEdge,
 } from "../types/debug";
 
 const WS_TRACE_URL =
@@ -39,6 +39,7 @@ export interface UseDebugSessionReturn {
   seekTo: (index: number) => void;
   setPlaybackSpeedMs: (speedMs: number) => void;
   runValgrindAudit: (code: string, stdin?: string) => Promise<ValgrindAuditResponse | null>;
+  clearValgrindData: () => void;
   clearError: () => void;
 }
 
@@ -52,6 +53,8 @@ function normalizeFrame(raw: Record<string, unknown>, fallbackStep: number): Deb
     from: String(e.from ?? e.source ?? ""),
     to: String(e.to ?? e.target ?? ""),
     label: String(e.label ?? ""),
+    is_active: Boolean(e.is_active),
+    is_directed: Boolean(e.is_directed),
   }));
 
   return {
@@ -67,6 +70,12 @@ function normalizeFrame(raw: Record<string, unknown>, fallbackStep: number): Deb
         ? (rawGraph.nodes as DebugFrame["graph"]["nodes"])
         : [],
       edges: normalizedEdges,
+      stack_pointers:
+        rawGraph.stack_pointers && typeof rawGraph.stack_pointers === "object"
+          ? (rawGraph.stack_pointers as Record<string, string>)
+          : {},
+      mode:
+        rawGraph.mode === "abstract_graph" ? "abstract_graph" : "pointer_mesh",
     },
     stack_frames:
       raw.stack_frames && typeof raw.stack_frames === "object"
@@ -93,7 +102,6 @@ export function useDebugSession(): UseDebugSessionReturn {
   const wsRef = useRef<WebSocket | null>(null);
   const playIntervalRef = useRef<number | null>(null);
 
-  // Clean up WebSocket and interval on unmount
   useEffect(() => {
     return () => {
       if (wsRef.current) {
@@ -106,7 +114,6 @@ export function useDebugSession(): UseDebugSessionReturn {
     };
   }, []);
 
-  // Manage the auto-play interval loop whenever `isPlaying` or `playbackSpeedMs` changes
   useEffect(() => {
     if (playIntervalRef.current !== null) {
       window.clearInterval(playIntervalRef.current);
@@ -123,7 +130,6 @@ export function useDebugSession(): UseDebugSessionReturn {
         if (prevIndex + 1 < frames.length) {
           return prevIndex + 1;
         }
-        // If the backend has finished streaming and we reached the last frame, stop playing
         if (!isRunning) {
           setIsPlaying(false);
         }
@@ -152,9 +158,15 @@ export function useDebugSession(): UseDebugSessionReturn {
     }
   }, []);
 
+  const clearValgrindData = useCallback(() => {
+    setValgrindData(null);
+  }, []);
+
   const startTrace = useCallback(
     (code: string, stdin: string = "") => {
       stop();
+      // Immediately clear stale Valgrind audit report and previous errors on new GDB trace
+      setValgrindData(null);
       setError(null);
       setFrames([]);
       setStepIndex(0);
@@ -180,7 +192,6 @@ export function useDebugSession(): UseDebugSessionReturn {
           try {
             const payload = JSON.parse(event.data);
 
-            // Handle compilation or runtime error events emitted by backend
             if (payload.event === "compile_error") {
               setError(`Compilation Failed:\n${payload.stderr || "Unknown compiler error"}`);
               setIsRunning(false);
@@ -204,7 +215,6 @@ export function useDebugSession(): UseDebugSessionReturn {
               return;
             }
 
-            // Standard execution frame
             if (typeof payload.line === "number") {
               setFrames((prev) => {
                 const nextFrame = normalizeFrame(payload, prev.length + 1);
@@ -254,7 +264,6 @@ export function useDebugSession(): UseDebugSessionReturn {
 
   const play = useCallback(() => {
     if (frames.length === 0) return;
-    // If at the very end of the timeline, restart from frame 0
     setStepIndex((prev) => (prev >= frames.length - 1 ? 0 : prev));
     setIsPlaying(true);
   }, [frames.length]);
@@ -275,6 +284,7 @@ export function useDebugSession(): UseDebugSessionReturn {
   const runValgrindAudit = useCallback(
     async (code: string, stdin: string = ""): Promise<ValgrindAuditResponse | null> => {
       setIsAuditingValgrind(true);
+      setValgrindData(null);
       setError(null);
 
       try {
@@ -344,6 +354,7 @@ export function useDebugSession(): UseDebugSessionReturn {
     seekTo,
     setPlaybackSpeedMs,
     runValgrindAudit,
+    clearValgrindData,
     clearError,
   };
 }

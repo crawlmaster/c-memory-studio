@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-backend/src/analyzer/valgrind.py
+backend/src/analyzer/valgrind.py (also compatible as valgrind_service.py)
 
 Automated Valgrind Memcheck Auditor for C-Memory-Studio.
-Compiles C code with `-g3 -O0 -no-pie -fno-builtin`, executes Valgrind with XML v4 output,
-and extracts heap summaries, leak records, and invalid memory accesses.
+Uses BOTH:
+  1. `--xml=yes --xml-file=/sandbox/workspace/valgrind.xml` for leaks & invalid accesses.
+  2. `--xtree-memory=full --xtree-memory-file=/sandbox/workspace/valgrind_xtree.kcg`
+     to deterministically extract lifetime `total_allocated_bytes`, `total_freed_bytes`,
+     and per-site clean allocation metadata even when `--xml=yes` suppresses stderr's HEAP SUMMARY.
 """
 
 import os
@@ -13,7 +16,7 @@ import signal
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -25,10 +28,10 @@ WORKSPACE_DIR = Path(os.getenv("TMPFS_PATH", "/sandbox/workspace"))
 SOURCE_FILENAME = "valgrind_target.c"
 BINARY_FILENAME = "valgrind_target"
 XML_FILENAME = "valgrind.xml"
+XTREE_FILENAME = "valgrind_xtree.kcg"
 
 EXECUTION_TIMEOUT_SEC = 5
 
-# Mapping from Valgrind XML <kind> to C-Memory-Studio state contract
 VALGRIND_KIND_MAP: Dict[str, str] = {
     "Leak_DefinitelyLost": "DEFINITELY_LOST",
     "Leak_IndirectlyLost": "INDIRECTLY_LOST",
@@ -45,15 +48,18 @@ VALGRIND_KIND_MAP: Dict[str, str] = {
     "SyscallParam": "INVALID_ACCESS",
 }
 
-FATAL_ERROR_STATES = {"INVALID_ACCESS", "INVALID_FREE", "UNINITIALIZED_READ"}
-
-# Regex patterns to extract hex addresses, byte sizes, and stderr heap totals
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 WHAT_SIZE_RE = re.compile(r"size\s+(\d+)", re.IGNORECASE)
 AUXWHAT_BLOCK_SIZE_RE = re.compile(r"block of size\s+([\d,]+)", re.IGNORECASE)
 HEAP_USAGE_RE = re.compile(
     r"total heap usage:\s*([\d,]+)\s+allocs,\s*([\d,]+)\s+frees,\s*([\d,]+)\s+bytes allocated",
     re.IGNORECASE,
+)
+# Matches Callgrind/xtree totals line:
+# `totals: curB curBk totB totBk totFdB totFdBk`
+XTREE_TOTALS_RE = re.compile(
+    r"^totals:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$",
+    re.MULTILINE,
 )
 
 
@@ -81,6 +87,8 @@ class MemoryBlockReport(BaseModel):
 class AuditSummary(BaseModel):
     total_allocated_bytes: int
     total_freed_bytes: int
+    total_alloc_calls: int = 0
+    total_free_calls: int = 0
     leaked_bytes: int
     leak_count: int
     has_fatal_errors: bool
@@ -112,7 +120,6 @@ def compile_valgrind_target(
     source_path = workspace / SOURCE_FILENAME
     binary_path = workspace / BINARY_FILENAME
 
-    # Remove stale artifacts from previous runs
     if binary_path.exists():
         binary_path.unlink()
 
@@ -146,14 +153,18 @@ def compile_valgrind_target(
 def execute_valgrind(
     binary_path: Path,
     xml_path: Path,
+    xtree_path: Path,
     stdin_data: str = "",
 ) -> Tuple[int, str, str, bool]:
     """
-    Executes Valgrind Memcheck on `binary_path` and writes XML v4 report to `xml_path`.
+    Executes Valgrind Memcheck on `binary_path`, generating both:
+      - XML v4 error/leak report at `xml_path`
+      - Callgrind xtree full heap ledger at `xtree_path` (captures exact totB & totFdB)
     Returns: (exit_code, stdout, stderr, timed_out)
     """
-    if xml_path.exists():
-        xml_path.unlink()
+    for p in (xml_path, xtree_path):
+        if p.exists():
+            p.unlink()
 
     valgrind_cmd = [
         "valgrind",
@@ -161,6 +172,8 @@ def execute_valgrind(
         "--leak-check=full",
         "--show-leak-kinds=all",
         "--track-origins=yes",
+        "--xtree-memory=full",
+        f"--xtree-memory-file={xtree_path}",
         "--xml=yes",
         f"--xml-file={xml_path}",
         str(binary_path),
@@ -176,21 +189,57 @@ def execute_valgrind(
         )
         return (proc.returncode, proc.stdout, proc.stderr, False)
     except subprocess.TimeoutExpired as exc:
-        stderr_partial = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        stdout_partial = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr_partial = (
+            exc.stderr.decode("utf-8", errors="replace")
+            if isinstance(exc.stderr, bytes)
+            else (exc.stderr or "")
+        )
+        stdout_partial = (
+            exc.stdout.decode("utf-8", errors="replace")
+            if isinstance(exc.stdout, bytes)
+            else (exc.stdout or "")
+        )
         return (-1, stdout_partial, stderr_partial, True)
+
+
+# ==============================================================================
+# Xtree Memory Ledger Parser (`valgrind_xtree.kcg`)
+# ==============================================================================
+
+def parse_xtree_heap_totals(xtree_path: Path) -> Tuple[int, int, int, int]:
+    """
+    Parses `/sandbox/workspace/valgrind_xtree.kcg` generated by `--xtree-memory=full`.
+    The file contains header `events: curB  curBk  totB  totBk  totFdB  totFdBk`
+    and a footer line:
+      `totals: <curB> <curBk> <totB> <totBk> <totFdB> <totFdBk>`
+    Returns: `(total_allocated_bytes, total_alloc_blocks, total_freed_bytes, total_freed_blocks)`
+    """
+    if not xtree_path.exists():
+        return (0, 0, 0, 0)
+
+    try:
+        content = xtree_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return (0, 0, 0, 0)
+
+    match = XTREE_TOTALS_RE.search(content)
+    if match:
+        tot_b = int(match.group(3))
+        tot_bk = int(match.group(4))
+        tot_fd_b = int(match.group(5))
+        tot_fd_bk = int(match.group(6))
+        return (tot_b, tot_bk, tot_fd_b, tot_fd_bk)
+
+    return (0, 0, 0, 0)
 
 
 # ==============================================================================
 # XML Parsing & Stack Frame Extraction
 # ==============================================================================
 
-def _extract_user_frame(stack_elem: Optional[ET.Element], target_file: str = SOURCE_FILENAME) -> Tuple[SourceLocation, str]:
-    """
-    Scans `<stack>/<frame>` entries from top to bottom.
-    Finds the innermost frame matching `valgrind_target.c` (allocation or detection site),
-    and extracts the instruction pointer `<ip>` or fallback function/line.
-    """
+def _extract_user_frame(
+    stack_elem: Optional[ET.Element], target_file: str = SOURCE_FILENAME
+) -> Tuple[SourceLocation, str]:
     if stack_elem is None:
         return (SourceLocation(), "0x0")
 
@@ -220,7 +269,6 @@ def _extract_user_frame(stack_elem: Optional[ET.Element], target_file: str = SOU
                 first_ip,
             )
 
-    # Fallback if user compiled without matching file symbols or error happened in main
     if frames:
         top = frames[0]
         fn_text = (top.findtext("fn") or "unknown").strip()
@@ -229,29 +277,24 @@ def _extract_user_frame(stack_elem: Optional[ET.Element], target_file: str = SOU
             line_num = int(top.findtext("line") or 0)
         except ValueError:
             line_num = 0
-        return (SourceLocation(file=file_text, function=fn_text, line=line_num), first_ip)
+        return (
+            SourceLocation(file=file_text, function=fn_text, line=line_num),
+            first_ip,
+        )
 
     return (SourceLocation(), first_ip)
 
 
-def _extract_bytes_and_blocks(error_elem: ET.Element, what_text: str, auxwhat_texts: List[str]) -> Tuple[int, int]:
-    """
-    Extracts `(size_bytes, block_count)` from `<xwhat>` (for leaks) or `<what>`/`<auxwhat>`
-    (for InvalidRead/InvalidWrite/InvalidFree).
-    Supports both Valgrind XML v4 standard tags (`<leakedbytes>`, `<leakedblocks>`)
-    and generic (`<bytes>`, `<blocks>`) tags.
-    """
+def _extract_bytes_and_blocks(
+    error_elem: ET.Element, what_text: str, auxwhat_texts: List[str]
+) -> Tuple[int, int]:
     xwhat = error_elem.find("xwhat")
     if xwhat is not None:
         bytes_str = (
-            xwhat.findtext("leakedbytes")
-            or xwhat.findtext("bytes")
-            or "0"
+            xwhat.findtext("leakedbytes") or xwhat.findtext("bytes") or "0"
         ).strip()
         blocks_str = (
-            xwhat.findtext("leakedblocks")
-            or xwhat.findtext("blocks")
-            or "1"
+            xwhat.findtext("leakedblocks") or xwhat.findtext("blocks") or "1"
         ).strip()
         try:
             b_val = int(bytes_str.replace(",", ""))
@@ -263,14 +306,11 @@ def _extract_bytes_and_blocks(error_elem: ET.Element, what_text: str, auxwhat_te
             blk_val = 1
         return (b_val, blk_val)
 
-    # If not a leak (e.g., InvalidRead/InvalidWrite), inspect `<auxwhat>` for allocated block size
-    # e.g. "Address 0x4a5b044 is 0 bytes after a block of size 64 alloc'd"
     for aux in auxwhat_texts:
         m_blk = AUXWHAT_BLOCK_SIZE_RE.search(aux)
         if m_blk:
             return (int(m_blk.group(1).replace(",", "")), 1)
 
-    # Or extract access size from `<what>`: "Invalid write of size 4"
     m_what = WHAT_SIZE_RE.search(what_text)
     if m_what:
         return (int(m_what.group(1)), 1)
@@ -279,11 +319,6 @@ def _extract_bytes_and_blocks(error_elem: ET.Element, what_text: str, auxwhat_te
 
 
 def _extract_target_address(auxwhat_texts: List[str], fallback_ip: str) -> str:
-    """
-    Extracts the heap memory address involved in the error from `<auxwhat>`
-    (e.g., 'Address 0x5555555592a0 is 0 bytes inside a block...'),
-    or falls back to the stack frame instruction pointer if Valgrind didn't emit a heap address.
-    """
     for aux in auxwhat_texts:
         match = HEX_ADDR_RE.search(aux)
         if match:
@@ -292,10 +327,6 @@ def _extract_target_address(auxwhat_texts: List[str], fallback_ip: str) -> str:
 
 
 def _sanitize_or_recover_xml(xml_path: Path) -> Optional[ET.Element]:
-    """
-    Parses `/sandbox/workspace/valgrind.xml`. If the inferior process was killed by SIGKILL
-    (timeout) or crashed mid-stream leaving `</valgrindoutput>` unclosed, repairs the XML tail.
-    """
     if not xml_path.exists():
         return None
 
@@ -306,12 +337,12 @@ def _sanitize_or_recover_xml(xml_path: Path) -> Optional[ET.Element]:
     try:
         return ET.fromstring(raw_xml)
     except ET.ParseError:
-        # Attempt recovery if `</valgrindoutput>` was truncated on timeout/crash
         if "<valgrindoutput>" in raw_xml and not raw_xml.endswith("</valgrindoutput>"):
-            # Strip any half-written trailing tag and close root
             last_close = raw_xml.rfind("</error>")
             if last_close != -1:
-                repaired = raw_xml[: last_close + len("</error>")] + "\n</valgrindoutput>"
+                repaired = (
+                    raw_xml[: last_close + len("</error>")] + "\n</valgrindoutput>"
+                )
             else:
                 repaired = raw_xml + "\n</valgrindoutput>"
             try:
@@ -323,12 +354,13 @@ def _sanitize_or_recover_xml(xml_path: Path) -> Optional[ET.Element]:
 
 def parse_valgrind_report(
     xml_path: Path,
+    xtree_path: Path,
     stderr_text: str,
     exit_code: int,
 ) -> Tuple[AuditSummary, List[MemoryBlockReport]]:
     """
-    Parses the Valgrind XML v4 file and stderr heap summary into structured
-    `AuditSummary` and `List[MemoryBlockReport]`.
+    Combines Valgrind's XML v4 report (`valgrind.xml`) and Xtree memory ledger
+    (`valgrind_xtree.kcg`) into `AuditSummary` and `List[MemoryBlockReport]`.
     """
     root = _sanitize_or_recover_xml(xml_path)
     blocks: List[MemoryBlockReport] = []
@@ -344,7 +376,6 @@ def parse_valgrind_report(
             if not raw_kind:
                 continue
 
-            # Map Valgrind kind to our standardized state
             if raw_kind in VALGRIND_KIND_MAP:
                 mapped_state = VALGRIND_KIND_MAP[raw_kind]
             elif raw_kind.startswith("Leak_"):
@@ -352,14 +383,12 @@ def parse_valgrind_report(
             else:
                 mapped_state = "INVALID_ACCESS"
 
-            # Extract human-readable description from <xwhat><text> or <what>
             xwhat_elem = error_elem.find("xwhat")
             if xwhat_elem is not None and xwhat_elem.findtext("text"):
                 description = xwhat_elem.findtext("text", "").strip()
             else:
                 description = (error_elem.findtext("what") or raw_kind).strip()
 
-            # Normalize multi-line Valgrind descriptions
             description = re.sub(r"\s+", " ", description)
 
             auxwhat_texts = [
@@ -380,23 +409,22 @@ def parse_valgrind_report(
             is_leak = raw_kind.startswith("Leak_")
 
             if is_leak:
-                # For Leak_* errors, stacks[0] is the allocation site (where malloc/calloc was called)
                 if stacks:
                     allocated_at, fallback_ip = _extract_user_frame(stacks[0])
-                if mapped_state in {"DEFINITELY_LOST", "INDIRECTLY_LOST", "POSSIBLY_LOST"}:
+                if mapped_state in {
+                    "DEFINITELY_LOST",
+                    "INDIRECTLY_LOST",
+                    "POSSIBLY_LOST",
+                }:
                     leaked_bytes_total += size_bytes
                     leak_count += blk_count
             else:
-                # For InvalidRead / InvalidWrite / InvalidFree:
-                # stacks[0] is the detection site (where invalid access/free occurred)
-                # stacks[1] (if present) is the allocation site of the target heap block
                 has_fatal_errors = True
                 if len(stacks) >= 1:
                     detected_at, fallback_ip = _extract_user_frame(stacks[0])
                 if len(stacks) >= 2:
                     allocated_at, _ = _extract_user_frame(stacks[1])
                 else:
-                    # Populate allocated_at with detected_at so callers expecting allocated_at never NullRef
                     allocated_at = detected_at
 
             address = _extract_target_address(auxwhat_texts, fallback_ip)
@@ -415,7 +443,6 @@ def parse_valgrind_report(
                 )
             )
 
-        # Also check if Valgrind caught a fatal signal (<fatal_signal> tag in XML v4)
         fatal_sig_elem = root.find("fatal_signal")
         if fatal_sig_elem is not None:
             has_fatal_errors = True
@@ -436,7 +463,6 @@ def parse_valgrind_report(
                 )
             )
 
-    # Detect fatal signal from exit code if not already flagged
     signal_name: Optional[str] = None
     if exit_code < 0:
         has_fatal_errors = True
@@ -446,36 +472,46 @@ def parse_valgrind_report(
         except ValueError:
             signal_name = f"SIG({sig_num})"
     elif exit_code in {134, 139}:
-        # 128 + 6 (SIGABRT = 134), 128 + 11 (SIGSEGV = 139)
         has_fatal_errors = True
         signal_name = "SIGABRT" if exit_code == 134 else "SIGSEGV"
 
-    # Extract lifetime heap totals from Valgrind stderr if available,
-    # otherwise compute lower bound from XML blocks.
-    total_allocated_bytes = sum(
-        b.size_bytes for b in blocks if b.state in {
-            "DEFINITELY_LOST", "INDIRECTLY_LOST", "POSSIBLY_LOST", "STILL_REACHABLE"
+    # 1. Primary source for total allocated & freed bytes: Xtree memory ledger (`valgrind_xtree.kcg`)
+    xtree_alloc_b, xtree_alloc_bk, xtree_freed_b, xtree_freed_bk = (
+        parse_xtree_heap_totals(xtree_path)
+    )
+
+    # 2. Secondary fallback: unfreed bytes in XML + stderr text regex
+    unfreed_bytes_in_xml = sum(
+        b.size_bytes
+        for b in blocks
+        if b.state
+        in {
+            "DEFINITELY_LOST",
+            "INDIRECTLY_LOST",
+            "POSSIBLY_LOST",
+            "STILL_REACHABLE",
         }
     )
+
+    total_allocated_bytes = max(xtree_alloc_b, unfreed_bytes_in_xml)
+    total_freed_bytes = xtree_freed_b
+
     m_heap = HEAP_USAGE_RE.search(stderr_text)
     if m_heap:
         try:
-            parsed_total = int(m_heap.group(3).replace(",", ""))
-            total_allocated_bytes = max(total_allocated_bytes, parsed_total)
+            stderr_alloc_b = int(m_heap.group(3).replace(",", ""))
+            total_allocated_bytes = max(total_allocated_bytes, stderr_alloc_b)
         except ValueError:
             pass
 
-    # Still-reachable + leaked bytes remain unfreed at exit; freed = total_allocated - unfreed
-    unfreed_bytes = sum(
-        b.size_bytes for b in blocks if b.state in {
-            "DEFINITELY_LOST", "INDIRECTLY_LOST", "POSSIBLY_LOST", "STILL_REACHABLE"
-        }
-    )
-    total_freed_bytes = max(0, total_allocated_bytes - unfreed_bytes)
+    if total_freed_bytes == 0 and total_allocated_bytes > unfreed_bytes_in_xml:
+        total_freed_bytes = total_allocated_bytes - unfreed_bytes_in_xml
 
     summary = AuditSummary(
         total_allocated_bytes=total_allocated_bytes,
         total_freed_bytes=total_freed_bytes,
+        total_alloc_calls=xtree_alloc_bk,
+        total_free_calls=xtree_freed_bk,
         leaked_bytes=leaked_bytes_total,
         leak_count=leak_count,
         has_fatal_errors=has_fatal_errors,
@@ -494,8 +530,8 @@ def run_memory_audit(source_code: str, stdin_data: str = "") -> ValgrindAuditRes
     """
     Full synchronous pipeline:
     1. Compiles `source_code` to `/sandbox/workspace/valgrind_target`
-    2. Runs Valgrind Memcheck with XML v4 output to `/sandbox/workspace/valgrind.xml`
-    3. Parses XML + stderr summary and returns `ValgrindAuditResponse`.
+    2. Runs Valgrind Memcheck with `--xml=yes` AND `--xtree-memory=full`
+    3. Parses XML + Xtree totals and returns `ValgrindAuditResponse`.
     """
     compiled_ok, binary_path, _, gcc_stderr = compile_valgrind_target(source_code)
     if not compiled_ok:
@@ -505,14 +541,18 @@ def run_memory_audit(source_code: str, stdin_data: str = "") -> ValgrindAuditRes
         )
 
     xml_path = WORKSPACE_DIR / XML_FILENAME
+    xtree_path = WORKSPACE_DIR / XTREE_FILENAME
+
     exit_code, _, valgrind_stderr, timed_out = execute_valgrind(
         binary_path=binary_path,
         xml_path=xml_path,
+        xtree_path=xtree_path,
         stdin_data=stdin_data,
     )
 
     summary, blocks = parse_valgrind_report(
         xml_path=xml_path,
+        xtree_path=xtree_path,
         stderr_text=valgrind_stderr,
         exit_code=exit_code,
     )

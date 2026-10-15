@@ -1,7 +1,5 @@
 /**
  * frontend/src/types/debug.ts
- * Complete TypeScript contracts for the WebSocket GDB execution tracer
- * and the REST Valgrind Memcheck heap auditor.
  */
 
 export interface ArrayData {
@@ -22,19 +20,20 @@ export interface GraphNode {
 }
 
 export interface GraphEdge {
-  /** Normalized source address (supports both `source` and legacy `from`) */
   source?: string;
   from?: string;
-  /** Normalized target address (supports both `target` and legacy `to`) */
   target?: string;
   to?: string;
   label: string;
+  is_active?: boolean;
+  is_directed?: boolean;
 }
 
 export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
   stack_pointers?: Record<string, string>;
+  mode?: "abstract_graph" | "pointer_mesh";
 }
 
 export interface DebugFrame {
@@ -80,6 +79,8 @@ export interface MemoryBlock {
 export interface MemorySummary {
   total_allocated_bytes: number;
   total_freed_bytes: number;
+  total_alloc_calls?: number;
+  total_free_calls?: number;
   leaked_bytes: number;
   leak_count: number;
   has_fatal_errors: boolean;

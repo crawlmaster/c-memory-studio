@@ -2,20 +2,17 @@
  * frontend/src/components/HeapView/HeapVisualizer.tsx
  * Academic slide-style Valgrind Heap Memory Block Visualizer.
  * - Top summary bar: Total Allocated, Total Freed, Total Leaked, Fatal Error alert badge
- * - Proportional sequential memory block strip + detailed card view
- * - Color-coded states:
- *   * DEFINITELY_LOST: Red with diagonal striping
- *   * INVALID_ACCESS / INVALID_FREE: Crimson red with warning icon + detected_at vs allocated_at
- *   * STILL_REACHABLE / POSSIBLY_LOST: Amber/Orange
- *   * Freed / Clean: Emerald Green
- * - Clicking any block or line callout triggers `onSelectLine` to reveal & flash the line in Monaco
+ * - Proportional sequential memory block strip:
+ *   * Renders a full 100% Emerald Green strip when `blocks` is empty and `total_allocated_bytes == total_freed_bytes > 0`
+ *   * Renders a clear "Stack-Only Execution (0 Heap Bytes)" state if no heap allocations occurred
+ * - Color-coded states for leaks and invalid accesses with click-to-jump in Monaco
  */
 
 import React from "react";
-import type {
-  ValgrindAuditResponse,
-  MemoryBlock,
-  HighlightTarget,
+import {
+  type ValgrindAuditResponse,
+  type MemoryBlock,
+  type HighlightTarget,
 } from "../../types/debug";
 import {
   ShieldAlert,
@@ -25,6 +22,7 @@ import {
   ArrowUpRight,
   Cpu,
   Layers,
+  CheckCircle2,
 } from "lucide-react";
 
 export interface HeapVisualizerProps {
@@ -50,10 +48,10 @@ export const HeapVisualizer: React.FC<HeapVisualizerProps> = ({
       <div className="flex flex-col items-center justify-center h-full bg-slate-950 text-slate-300 p-8">
         <div className="w-10 h-10 border-3 border-amber-500 border-t-transparent rounded-full animate-spin mb-4" />
         <p className="text-sm font-mono font-semibold">
-          Executing Valgrind Memcheck (--leak-check=full --track-origins=yes)...
+          Executing Valgrind Memcheck (--leak-check=full --xtree-memory=full)...
         </p>
         <p className="text-xs text-slate-500 mt-1">
-          Inspecting synthetic CPU shadow memory and heap allocation blocks
+          Inspecting synthetic CPU shadow memory and heap allocation ledger
         </p>
       </div>
     );
@@ -83,14 +81,23 @@ export const HeapVisualizer: React.FC<HeapVisualizerProps> = ({
   }
 
   const { summary, blocks = [] } = valgrindData;
+  const freedBytes = Math.max(0, summary.total_freed_bytes);
   const totalArenaBytes = Math.max(
     summary.total_allocated_bytes,
-    summary.total_freed_bytes + summary.leaked_bytes,
+    freedBytes + summary.leaked_bytes,
     1
   );
 
-  // Construct synthetic "Freed / Clean" block segment so the proportional strip shows freed heap alongside leaks
-  const freedBytes = Math.max(0, summary.total_freed_bytes);
+  const isCompletelyCleanWithHeapUsage =
+    blocks.length === 0 &&
+    !summary.has_fatal_errors &&
+    summary.total_allocated_bytes > 0 &&
+    freedBytes > 0;
+
+  const isZeroHeapUsage =
+    blocks.length === 0 &&
+    summary.total_allocated_bytes === 0 &&
+    freedBytes === 0;
 
   const handleBlockClick = (block: MemoryBlock, preferDetected: boolean = false) => {
     const targetLoc =
@@ -132,7 +139,7 @@ export const HeapVisualizer: React.FC<HeapVisualizerProps> = ({
             Total Freed (Clean)
           </div>
           <div className="text-xl font-mono font-bold text-emerald-300 mt-1">
-            {summary.total_freed_bytes.toLocaleString()}{" "}
+            {freedBytes.toLocaleString()}{" "}
             <span className="text-xs font-normal text-emerald-400/80">bytes</span>
           </div>
         </div>
@@ -204,81 +211,116 @@ export const HeapVisualizer: React.FC<HeapVisualizerProps> = ({
             </p>
           </div>
           <span className="text-xs font-mono text-slate-400">
-            Arena Span: {totalArenaBytes} B
+            Arena Span: {summary.total_allocated_bytes.toLocaleString()} B
           </span>
         </div>
 
         {/* Sequential Proportional Strip */}
-        <div className="w-full min-h-[78px] rounded-lg bg-slate-950 border border-slate-800 p-1.5 flex items-stretch gap-1.5 overflow-x-auto">
-          {freedBytes > 0 && (
-            <div
-              style={{
-                flexGrow: Math.max(1, Math.round((freedBytes / totalArenaBytes) * 100)),
-                minWidth: "130px",
-              }}
-              className="rounded-md bg-emerald-950/70 border border-emerald-600/60 p-2.5 flex flex-col justify-between transition hover:border-emerald-400"
-            >
-              <div className="flex items-center justify-between text-[11px] font-mono">
-                <span className="text-emerald-300 font-bold">FREED / CLEAN</span>
-                <span className="text-emerald-400">{freedBytes} B</span>
-              </div>
-              <div className="text-[11px] font-mono text-emerald-200/80 truncate mt-1">
-                Reclaimed via free()
-              </div>
+        <div className="w-full min-h-[82px] rounded-lg bg-slate-950 border border-slate-800 p-1.5 flex items-stretch gap-1.5 overflow-x-auto">
+          {isZeroHeapUsage ? (
+            <div className="w-full rounded-md bg-slate-900/70 border border-slate-800 p-3 flex items-center justify-center text-xs font-mono text-slate-400">
+              0 Heap Bytes Allocated (Stack-Only Execution)
             </div>
+          ) : isCompletelyCleanWithHeapUsage ? (
+            <div className="w-full rounded-md bg-gradient-to-r from-emerald-950/90 via-emerald-900/60 to-emerald-950/90 border-2 border-emerald-500/80 p-3.5 flex items-center justify-between shadow-[0_0_20px_rgba(16,185,129,0.2)]">
+              <div className="flex items-center gap-2.5">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                <div>
+                  <div className="text-xs font-mono font-extrabold text-emerald-200 tracking-wide">
+                    100% FREED / CLEAN HEAP ARENA
+                  </div>
+                  <div className="text-[11px] font-mono text-emerald-300/85 mt-0.5">
+                    All {freedBytes.toLocaleString()} bytes across{" "}
+                    {summary.total_alloc_calls || "all"} heap allocation(s) were
+                    cleanly reclaimed via free()
+                  </div>
+                </div>
+              </div>
+              <span className="px-2.5 py-1 rounded bg-emerald-500 text-slate-950 font-mono text-xs font-extrabold">
+                {freedBytes.toLocaleString()} /{" "}
+                {summary.total_allocated_bytes.toLocaleString()} B Freed
+              </span>
+            </div>
+          ) : (
+            <>
+              {freedBytes > 0 && (
+                <div
+                  style={{
+                    flexGrow: Math.max(
+                      15,
+                      Math.round((freedBytes / totalArenaBytes) * 100)
+                    ),
+                    minWidth: "145px",
+                  }}
+                  className="rounded-md bg-emerald-950/70 border border-emerald-600/70 p-2.5 flex flex-col justify-between transition hover:border-emerald-400"
+                >
+                  <div className="flex items-center justify-between text-[11px] font-mono">
+                    <span className="text-emerald-300 font-bold">
+                      FREED / CLEAN
+                    </span>
+                    <span className="text-emerald-400">
+                      {freedBytes.toLocaleString()} B
+                    </span>
+                  </div>
+                  <div className="text-[11px] font-mono text-emerald-200/80 truncate mt-1">
+                    Reclaimed via free()
+                  </div>
+                </div>
+              )}
+
+              {blocks.map((block) => {
+                const weight = Math.max(
+                  15,
+                  Math.round(((block.size_bytes || 32) / totalArenaBytes) * 100)
+                );
+
+                const isDefLost = block.state === "DEFINITELY_LOST";
+                const isInvalid =
+                  block.state === "INVALID_ACCESS" ||
+                  block.state === "INVALID_FREE" ||
+                  block.state === "UNINITIALIZED_READ";
+
+                let borderAndBg =
+                  "bg-amber-950/60 border-amber-500/80 text-amber-200";
+                if (isDefLost) {
+                  borderAndBg = "border-red-500 text-red-100";
+                } else if (isInvalid) {
+                  borderAndBg =
+                    "bg-rose-950/90 border-2 border-rose-500 text-rose-100 shadow-[0_0_15px_rgba(244,63,94,0.35)]";
+                }
+
+                return (
+                  <button
+                    key={block.id}
+                    type="button"
+                    onClick={() => handleBlockClick(block, isInvalid)}
+                    style={{
+                      flexGrow: weight,
+                      minWidth: "155px",
+                      ...(isDefLost ? DIAGONAL_RED_STRIPE_STYLE : {}),
+                    }}
+                    className={`rounded-md border p-2.5 flex flex-col justify-between text-left transition transform hover:-translate-y-0.5 cursor-pointer ${borderAndBg}`}
+                  >
+                    <div className="flex items-center justify-between gap-1 text-[11px] font-mono w-full">
+                      <span className="font-bold truncate">{block.address}</span>
+                      <span className="px-1.5 py-0.2 rounded bg-black/40 text-[10px]">
+                        {block.size_bytes} B
+                      </span>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-1 mt-2 w-full">
+                      <span className="text-[10px] font-mono uppercase tracking-tight font-semibold truncate">
+                        {block.state}
+                      </span>
+                      <span className="text-[10px] font-mono opacity-85 truncate">
+                        {block.allocated_at?.function || "main"}()
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </>
           )}
-
-          {blocks.map((block) => {
-            const weight = Math.max(
-              15,
-              Math.round(((block.size_bytes || 32) / totalArenaBytes) * 100)
-            );
-
-            const isDefLost = block.state === "DEFINITELY_LOST";
-            const isInvalid =
-              block.state === "INVALID_ACCESS" ||
-              block.state === "INVALID_FREE" ||
-              block.state === "UNINITIALIZED_READ";
-
-            let borderAndBg =
-              "bg-amber-950/60 border-amber-500/80 text-amber-200";
-            if (isDefLost) {
-              borderAndBg = "border-red-500 text-red-100";
-            } else if (isInvalid) {
-              borderAndBg =
-                "bg-rose-950/90 border-2 border-rose-500 text-rose-100 shadow-[0_0_15px_rgba(244,63,94,0.35)]";
-            }
-
-            return (
-              <button
-                key={block.id}
-                type="button"
-                onClick={() => handleBlockClick(block, isInvalid)}
-                style={{
-                  flexGrow: weight,
-                  minWidth: "155px",
-                  ...(isDefLost ? DIAGONAL_RED_STRIPE_STYLE : {}),
-                }}
-                className={`rounded-md border p-2.5 flex flex-col justify-between text-left transition transform hover:-translate-y-0.5 cursor-pointer ${borderAndBg}`}
-              >
-                <div className="flex items-center justify-between gap-1 text-[11px] font-mono w-full">
-                  <span className="font-bold truncate">{block.address}</span>
-                  <span className="px-1.5 py-0.2 rounded bg-black/40 text-[10px]">
-                    {block.size_bytes} B
-                  </span>
-                </div>
-
-                <div className="flex items-center justify-between gap-1 mt-2 w-full">
-                  <span className="text-[10px] font-mono uppercase tracking-tight font-semibold truncate">
-                    {block.state}
-                  </span>
-                  <span className="text-[10px] font-mono opacity-85 truncate">
-                    {block.allocated_at?.function || "main"}()
-                  </span>
-                </div>
-              </button>
-            );
-          })}
         </div>
 
         {/* Legend */}
@@ -308,15 +350,16 @@ export const HeapVisualizer: React.FC<HeapVisualizerProps> = ({
       {/* 3. Detailed Valgrind Diagnostic Cards */}
       <div className="space-y-3">
         <h4 className="text-xs font-mono uppercase tracking-wider text-slate-400">
-          Detailed Block & Access Diagnostics ({blocks.length})
+          Detailed Block &amp; Access Diagnostics ({blocks.length})
         </h4>
 
         {blocks.length === 0 ? (
           <div className="rounded-xl bg-emerald-950/20 border border-emerald-800/50 p-4 flex items-center gap-3 text-emerald-300 text-xs font-mono">
             <ShieldCheck className="w-5 h-5 shrink-0 text-emerald-400" />
             <span>
-              All heap blocks were cleanly freed and no invalid memory operations
-              were detected.
+              {summary.total_allocated_bytes > 0
+                ? `All ${summary.total_allocated_bytes.toLocaleString()} allocated heap bytes were cleanly freed via free() and no invalid memory operations were detected.`
+                : "No heap leaks or invalid memory operations were detected."}
             </span>
           </div>
         ) : (
@@ -367,7 +410,6 @@ export const HeapVisualizer: React.FC<HeapVisualizerProps> = ({
                   {block.description}
                 </p>
 
-                {/* Allocation vs Detection Callouts (Click to Jump in Monaco) */}
                 <div className="flex flex-wrap items-center gap-3 mt-3">
                   {block.allocated_at && (
                     <button

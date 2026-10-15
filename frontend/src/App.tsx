@@ -1,10 +1,9 @@
 /**
  * frontend/src/App.tsx
  * Master 50/50 split-pane layout for C-Memory-Studio.
- * Fixes:
- * 1. Eliminates Valgrind tab auto-close loop by honoring manual user tab clicks (`userSelectedTabRef`).
- * 2. Persists C code in `localStorage` under `'c_memory_studio_saved_code'`.
- * 3. Adds a "Reset to Demo Code" action in the header bar.
+ * - Immediately invalidates stale Valgrind reports when code is edited or a new GDB trace starts.
+ * - Passes `graphNodes` to `ArrayVisualizer` so struct-embedded buffers (`s->data`) display
+ *   sister container fields (`capacity`, `top`, struct address).
  */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
@@ -30,55 +29,40 @@ const LOCAL_STORAGE_CODE_KEY = "c_memory_studio_saved_code";
 
 export const DEFAULT_DEMO_C_CODE = `#include <stdlib.h>
 
-struct Node {
-    int val;
-    struct Node *next;
-};
+typedef struct stack_t {
+    int *data;
+    int top;
+    int capacity;
+} *stack;
 
-struct Node* create_node(int v) {
-    struct Node *n = (struct Node*)malloc(sizeof(struct Node));
-    n->val = v;
-    n->next = NULL;
-    return n;
+stack create_stack(int cap) {
+    stack s = (stack)malloc(sizeof(struct stack_t));
+    s->capacity = cap;
+    s->top = -1;
+    s->data = (int*)calloc(cap, sizeof(int));
+    return s;
+}
+
+void push(stack s, int val) {
+    if (s->top < s->capacity - 1) {
+        s->top++;
+        s->data[s->top] = val;
+    }
 }
 
 int main(void) {
-    // 1. Contiguous Array & Binary Search Demo
-    int arr[6] = {2, 5, 8, 12, 16, 23};
-    int n = 6;
-    int target = 16;
-    int low = 0;
-    int high = n - 1;
+    stack s = create_stack(5);
+    push(s, 10);
+    push(s, 25);
+    push(s, 40);
 
-    while (low <= high) {
-        int middle = low + (high - low) / 2;
-        if (arr[middle] == target) {
-            break;
-        } else if (arr[middle] < target) {
-            low = middle + 1;
-        } else {
-            high = middle - 1;
-        }
-    }
-
-    // 2. Dynamic Linked List Pointer Mesh
-    struct Node *head = create_node(10);
-    struct Node *second = create_node(20);
-    head->next = second;
-
-    struct Node *curr = head;
-    while (curr != NULL) {
-        curr = curr->next;
-    }
-
-    // Intentional leak of 'second' for Valgrind Audit demonstration
-    free(head);
+    // Intentional leak of s->data for Valgrind demonstration
+    free(s);
     return 0;
 }
 `;
 
 export const App: React.FC = () => {
-  // Initialize from localStorage or fall back to DEFAULT_DEMO_C_CODE
   const [code, setCode] = useState<string>(() => {
     try {
       const saved = window.localStorage.getItem(LOCAL_STORAGE_CODE_KEY);
@@ -94,7 +78,6 @@ export const App: React.FC = () => {
   const [highlightedLine, setHighlightedLine] =
     useState<HighlightTarget | null>(null);
 
-  // Tracks whether the user manually clicked a tab so we never hijack their navigation
   const userOverrodeTabRef = useRef<boolean>(false);
 
   const {
@@ -117,20 +100,18 @@ export const App: React.FC = () => {
     seekTo,
     setPlaybackSpeedMs,
     runValgrindAudit,
+    clearValgrindData,
     clearError,
   } = useDebugSession();
 
-  // Persist code to localStorage whenever it changes
   useEffect(() => {
     try {
       window.localStorage.setItem(LOCAL_STORAGE_CODE_KEY, code);
     } catch {
-      // Ignore storage quota errors in private browsing
+      // Ignore quota errors
     }
   }, [code]);
 
-  // Auto-switch between "arrays" and "graph" ONLY during active trace stepping
-  // when the user has NOT manually locked a tab (e.g. clicking Valgrind).
   useEffect(() => {
     if (!currentFrame || userOverrodeTabRef.current) return;
 
@@ -145,13 +126,26 @@ export const App: React.FC = () => {
     }
   }, [currentFrame]);
 
+  // Invalidate stale Valgrind data whenever user edits C code in Monaco
+  const handleCodeChange = useCallback(
+    (nextCode: string) => {
+      setCode(nextCode);
+      if (valgrindData !== null) {
+        clearValgrindData();
+      }
+      if (highlightedLine !== null) {
+        setHighlightedLine(null);
+      }
+    },
+    [valgrindData, clearValgrindData, highlightedLine]
+  );
+
   const handleManualTabSelect = useCallback((tab: StudioTab) => {
     userOverrodeTabRef.current = true;
     setActiveTab(tab);
   }, []);
 
   const handleStartTrace = useCallback(() => {
-    // Allow auto-tab selection for the newly started trace session
     userOverrodeTabRef.current = false;
     setHighlightedLine(null);
     setActiveTab("arrays");
@@ -159,7 +153,6 @@ export const App: React.FC = () => {
   }, [code, startTrace]);
 
   const handleRunValgrind = useCallback(async () => {
-    // Explicitly lock onto the Valgrind tab so `currentFrame` never kicks us out
     userOverrodeTabRef.current = true;
     setActiveTab("valgrind");
 
@@ -181,6 +174,7 @@ export const App: React.FC = () => {
 
   const handleResetDemoCode = useCallback(() => {
     stop();
+    clearValgrindData();
     setHighlightedLine(null);
     setCode(DEFAULT_DEMO_C_CODE);
     try {
@@ -188,7 +182,7 @@ export const App: React.FC = () => {
     } catch {
       // Ignore
     }
-  }, [stop]);
+  }, [stop, clearValgrindData]);
 
   const arrayCount = currentFrame?.arrays?.length || 0;
   const graphNodeCount = currentFrame?.graph?.nodes?.length || 0;
@@ -269,7 +263,7 @@ export const App: React.FC = () => {
         <section className="w-full lg:w-1/2 h-1/2 lg:h-full min-h-0">
           <CodeEditor
             code={code}
-            onChange={setCode}
+            onChange={handleCodeChange}
             activeLine={currentFrame?.line ?? null}
             highlightedLine={highlightedLine}
             stepIndex={stepIndex}
@@ -356,6 +350,7 @@ export const App: React.FC = () => {
               <ArrayVisualizer
                 arrays={currentFrame?.arrays || []}
                 locals={currentFrame?.stack_frames?.locals}
+                graphNodes={currentFrame?.graph?.nodes || []}
               />
             )}
 
