@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1
+FROM ubuntu:24.04
+
+# Prevent interactive prompts during apt package installation
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+# 1. Install toolchains, debugging utilities, DWARF/ELF headers, Python, and tini
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    clang \
+    llvm \
+    gdb \
+    valgrind \
+    make \
+    cmake \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    libdwarf-dev \
+    libelf-dev \
+    tini \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Create isolated non-root user (UID/GID 1001)
+RUN groupadd -g 1001 sandboxuser && \
+    useradd -m -u 1001 -g 1001 -s /bin/bash sandboxuser
+
+# 3. Provision Python virtual environment and install dependencies
+RUN python3 -m venv "${VIRTUAL_ENV}" && \
+    pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+        fastapi \
+        "uvicorn[standard]" \
+        pygdbmi \
+        pydantic \
+        lxml \
+        websockets
+
+# 4. Set up directories
+WORKDIR /sandbox/app
+RUN mkdir -p /sandbox/workspace && \
+    chown -R sandboxuser:sandboxuser /sandbox
+
+# Copy entrypoint script
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Copiaza codul sursa al backend-ului
+COPY --chown=sandboxuser:sandboxuser ./backend /sandbox/app
+
+# Drop privileges to non-root user
+USER sandboxuser
+
+EXPOSE 8080
+
+# 5. Use tini as PID 1 to reap orphaned/zombie GDB & Valgrind inferior processes
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+
+# Ajustat la calea reala src.main:app
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]

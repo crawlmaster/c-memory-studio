@@ -1,0 +1,32 @@
+services:
+  c-memory-studio-backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: c-memory-studio-backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    environment:
+      - TMPFS_PATH=/sandbox/workspace
+      - MAX_EXECUTION_TIMEOUT=10
+    # Drop all kernel capabilities and grant only SYS_PTRACE for GDB/Valgrind
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_PTRACE
+    # Disable seccomp filtering to allow GDB ptrace/personality(ADDR_NO_RANDOMIZE)
+    # and Valgrind synthetic syscall interception
+    security_opt:
+      - seccomp:unconfined
+    # Hardware & Resource limits (Compose Specification standard)
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+    # Mount 512MB RAM disk with explicit execution, security, and permission flags
+    tmpfs:
+      - /sandbox/workspace:size=512m,mode=1777,exec,nosuid,nodev,uid=1001,gid=1001
+    volumes:
+      - ../backend:/sandbox/app
