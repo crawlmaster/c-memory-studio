@@ -2,18 +2,18 @@
 """
 backend/src/debugger/gdb_engine.py
 
-High-performance GDB/MI Execution Tracer, Mathematical Graph Extractor,
-ADT Container Inspector & Recursive Heap Mesh Crawler.
+Algorithm-Agnostic DWARF/GDB-MI Introspection Engine for C-Memory-Studio.
 Features:
-  - Increased step budget (`MAX_STEPS = 2000`, `SESSION_TIMEOUT_SEC = 30.0`).
-  - Smart atomic stepping (`-exec-next`) over micro-helpers (`new_*`, `create_*`, `swap_*`,
-    `is_*`, `add_edge`, `min_heapify`, `extract_min`, `decrease_key`, `free_*`) so tracing
-    focuses on core algorithmic loops (`main`, `dijkstra`, `bfs`, `dfs`, etc.).
-  - Mathematical Graph Adjacency List Detector: automatically detects `Graph` structs
-    containing `(V, adj)` and emits abstract vertices (`node-0` .. `node-(V-1)`) with
-    live `dist[v]` (`∞` for `INT_MAX`), PQ status (`IN_PQ` vs `SETTLED`), weighted edges
-    (`w: 9`), and active relaxation pointers (`u ↓`, `v ↓`, `src ↓`).
-  - Persistent Graph Root Cache across stack frames to eliminate visual flickering.
+  1. Multi-Frame Call Stack Harvesting: Inspects variables across all active user frames
+     (from leaf function up to `main()`) so caller data structures never vanish during helper calls.
+  2. Structural Graph Inference (Zero Hardcoded Struct Names):
+     - Adjacency Lists: Any struct with an integer vertex count and a `Node **` / `Node *[]`
+       pointing to self-referential list nodes containing a destination index and optional weight.
+     - Adjacency Matrices: Any 2D array `T mat[V][V]` or `T **mat` (Floyd-Warshall, dense Dijkstra).
+     - Edge Lists: Any struct array `Edge edges[E]` or `g->edge` containing `(u, v, [w])` tuples
+       (Bellman-Ford, Kruskal).
+  3. Generic Struct-Pointer & Struct-Value Dynamic Buffer Inspection:
+     - Inspects any `Type **array` or `Type *array` by reflecting its DWARF `ptype` fields dynamically.
 """
 
 import asyncio
@@ -32,49 +32,61 @@ from pygdbmi.gdbcontroller import GdbController
 # ==============================================================================
 
 TMPFS_ROOT = Path(os.getenv("TMPFS_PATH", "/sandbox/workspace"))
-MAX_STEPS = 2000                 # Increased from 500 to 2000 for graph/heap algorithms
-SESSION_TIMEOUT_SEC = 30.0       # Increased to 30.0s
+MAX_STEPS = 2000
+SESSION_TIMEOUT_SEC = 30.0
 STEP_INACTIVITY_TIMEOUT_SEC = 3.0
 MAX_ARRAY_ELEMENTS = 256
 MAX_STRUCT_BUFFER_ELEMENTS = 64
 MAX_GRAPH_NODES = 32
-INT_MAX_THRESHOLD = 2147483600   # Detect INT_MAX (2147483647) / INF values
+# Treat typical C infinity sentinel constants (INT_MAX, 0x3f3f3f3f, 1e9, 99999) as ∞
+INF_SENTINEL_VALUES = {2147483647, 1061109567, 1000000000, 999999999, 999999, 99999, 65535}
+INT_MAX_THRESHOLD = 1000000000
 
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 FIXED_ARR_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_\s]*?)\s*\[(\d+)\]$")
+FIXED_2D_ARR_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_\s]*?)\s*\[(\d+)\]\s*\[(\d+)\]$")
 PTR_TYPE_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_\s\*]*?)\s*\*$")
-FREE_CALL_RE = re.compile(r"\bfree(?:_graph|_list|_tree|_heap)?\s*\(\s*([a-zA-Z_][a-zA-Z0-9_\->\.\[\]]*)\s*\)")
+FREE_CALL_RE = re.compile(
+    r"\bfree(?:_[a-zA-Z0-9_]+)?\s*\(\s*([a-zA-Z_][a-zA-Z0-9_\->\.\[\]]*)\s*\)"
+)
 
 # ==============================================================================
-# Variable & Struct Field Classification Constants
+# Heuristic Role Hints (Used Only to Rank Structural Candidates, Never Required)
 # ==============================================================================
 
-SIZE_VAR_CANDIDATES = {
-    "n", "len", "length", "size", "count", "capacity", "cap",
-    "max_size", "maxsize", "num", "v_size", "arr_size", "v", "V"
-}
+VERTEX_COUNT_HINTS = {"v", "V", "n", "N", "num_vertices", "num_nodes", "vertices", "nodes", "order", "nv"}
+EDGE_COUNT_HINTS = {"e", "E", "m", "M", "num_edges", "edges_count", "ne"}
+DEST_FIELD_HINTS = ("dest", "to", "target", "v", "vertex", "node", "neighbor", "adj", "id")
+SRC_FIELD_HINTS = ("src", "from", "u", "source", "start")
+WEIGHT_FIELD_HINTS = ("weight", "w", "cost", "dist", "distance", "len", "length", "val", "value", "priority")
+DISTANCE_ARRAY_HINTS = ("dist", "d", "distance", "distances", "cost", "shortest", "dp")
 
 STRUCT_CAPACITY_FIELDS = (
     "capacity", "cap", "max_size", "maxsize", "alloc", "allocated",
-    "size", "len", "length", "count", "n", "V", "num_vertices"
+    "size", "len", "length", "count", "n", "V", "num_vertices", "num_nodes", "E", "num_edges"
 )
 
 STRUCT_INDEX_FIELDS = {
     "top", "front", "rear", "head", "tail", "idx", "index", "pos",
-    "curr", "current", "min_idx", "max_idx"
+    "curr", "current", "min_idx", "max_idx", "smallest", "left", "right"
+}
+
+AUXILIARY_MAP_FIELD_NAMES = {
+    "pos", "position", "positions", "indices", "index_map", "lookup", "rank", "visited", "in_heap", "in_queue"
 }
 
 NON_INDEX_SCALAR_NAMES = {
     "n", "len", "length", "size", "count", "capacity", "cap", "max_size", "maxsize",
-    "num", "v_size", "arr_size", "V", "d_u", "weight", "dist",
+    "num", "v_size", "arr_size", "V", "E", "d_u", "weight", "dist", "cost",
     "target", "key", "val", "value", "search", "x", "elem", "item", "needle",
     "tmp", "temp", "swap", "found", "res", "result", "ans", "ret", "flag", "sum", "max", "min"
 }
 
 INDEX_VAR_CANDIDATES = {
-    "i", "j", "k", "u", "v", "src", "dest", "idx", "index", "min_idx", "max_idx",
-    "pivot", "low", "high", "left", "right", "mid", "middle",
-    "l", "r", "start", "end", "pos", "top", "front", "rear", "curr_idx", "smallest"
+    "i", "j", "k", "u", "v", "src", "dest", "node", "curr_v", "next_v",
+    "idx", "index", "min_idx", "max_idx", "pivot", "low", "high",
+    "left", "right", "mid", "middle", "l", "r", "start", "end",
+    "pos", "top", "front", "rear", "curr_idx", "smallest"
 }
 
 PRIMITIVE_TYPES = {
@@ -92,7 +104,6 @@ STDLIB_CALL_RE = re.compile(
 USER_FUNC_CALL_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
 C_CONTROL_KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "typeof"}
 
-# Micro-helpers that should be stepped OVER atomically (`-exec-next`) rather than stepped into
 ATOMIC_HELPER_PREFIXES = (
     "create_", "new_", "init_", "alloc_", "make_",
     "swap_", "is_", "has_", "get_", "set_", "free_", "destroy_", "delete_", "print_"
@@ -102,8 +113,6 @@ ATOMIC_HELPER_NAMES = {
     "extract_min", "extract_max", "decrease_key", "increase_key",
     "push_heap", "pop_heap"
 }
-
-STRUCT_VALUE_FIELDS = {"val", "value", "key", "data", "id", "info", "weight", "item", "top", "size", "capacity", "V", "dest", "dist"}
 
 
 # ==============================================================================
@@ -144,7 +153,7 @@ class GraphSnapshot(BaseModel):
     nodes: List[GraphNode]
     edges: List[GraphEdge]
     stack_pointers: Dict[str, str] = Field(default_factory=dict)
-    mode: str = "pointer_mesh"  # "abstract_graph" or "pointer_mesh"
+    mode: str = "pointer_mesh"
 
 
 class ExecutionSnapshot(BaseModel):
@@ -163,7 +172,6 @@ class ExecutionSnapshot(BaseModel):
 # ==============================================================================
 
 def extract_hex_address(raw_val: str) -> Optional[str]:
-    """Extracts a canonical hex address (e.g. '0x4212a0') from GDB output."""
     if not raw_val:
         return None
     match = HEX_ADDR_RE.search(raw_val)
@@ -180,10 +188,6 @@ def extract_hex_address(raw_val: str) -> Optional[str]:
 
 
 def is_explicit_null(raw_val: str, is_known_pointer: bool = False) -> bool:
-    """
-    Returns True if GDB formatted a pointer value as 0x0 (NULL).
-    Never treats a bare decimal '0' as NULL unless `is_known_pointer=True`.
-    """
     val = raw_val.strip().lower()
     if val in {"0x0", "null", "(nil)"}:
         return True
@@ -199,7 +203,6 @@ def is_explicit_null(raw_val: str, is_known_pointer: bool = False) -> bool:
 
 
 def parse_scalar(val_str: str) -> Any:
-    """Parses a GDB scalar value string into a Python int, float, or canonical hex string."""
     val_str = val_str.strip()
     if re.match(r"^-?\d+\s+'.*'$", val_str):
         return int(val_str.split()[0])
@@ -214,15 +217,45 @@ def parse_scalar(val_str: str) -> Any:
         return val_str
 
 
+def is_infinity_like(val: Any) -> bool:
+    if not isinstance(val, int):
+        return False
+    return val >= INT_MAX_THRESHOLD or val in INF_SENTINEL_VALUES
+
+
 def format_distance_val(val: Any) -> Any:
-    """Formats INT_MAX / INF values cleanly as '∞' for display."""
-    if isinstance(val, int) and val >= INT_MAX_THRESHOLD:
+    if is_infinity_like(val):
         return "∞"
     return val
 
 
+def split_top_level_braces(inner: str) -> List[str]:
+    """Splits a comma-separated GDB string at depth 0 (preserving nested `{...}`)."""
+    tokens: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for ch in inner:
+        if ch == "{":
+            depth += 1
+            current.append(ch)
+        elif ch == "}":
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            tok = "".join(current).strip()
+            if tok:
+                tokens.append(tok)
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        tok = "".join(current).strip()
+        if tok:
+            tokens.append(tok)
+    return tokens
+
+
 def parse_gdb_array(raw_val: str, max_elems: int = MAX_ARRAY_ELEMENTS) -> List[Any]:
-    """Parses GDB's `{2, 5, 8, 1}` array string into a Python list."""
     raw_val = raw_val.strip()
     if not (raw_val.startswith("{") and raw_val.endswith("}")):
         return []
@@ -231,20 +264,21 @@ def parse_gdb_array(raw_val: str, max_elems: int = MAX_ARRAY_ELEMENTS) -> List[A
         return []
 
     elements: List[Any] = []
-    parts = [p.strip() for p in inner.split(",") if p.strip()]
+    parts = split_top_level_braces(inner)
     for part in parts:
         rep_match = re.match(r"^(.+?)\s*<repeats\s+(\d+)\s+times>$", part)
         if rep_match:
             base_val = parse_scalar(rep_match.group(1))
             count = min(int(rep_match.group(2)), max_elems)
             elements.extend([base_val] * count)
+        elif part.startswith("{") and part.endswith("}"):
+            elements.append(part)
         else:
             elements.append(parse_scalar(part))
     return elements[:max_elems]
 
 
 def parse_gdb_struct_body(raw_val: str) -> Dict[str, str]:
-    """Parses `{val = 10, next = 0x4212c0}` into `{"val": "10", "next": "0x4212c0"}`."""
     raw_val = raw_val.strip()
     brace_start = raw_val.find("{")
     brace_end = raw_val.rfind("}")
@@ -256,27 +290,7 @@ def parse_gdb_struct_body(raw_val: str) -> Dict[str, str]:
         return {}
 
     fields: Dict[str, str] = {}
-    depth = 0
-    current_token: List[str] = []
-    tokens: List[str] = []
-
-    for ch in inner:
-        if ch == "{":
-            depth += 1
-            current_token.append(ch)
-        elif ch == "}":
-            depth -= 1
-            current_token.append(ch)
-        elif ch == "," and depth == 0:
-            tokens.append("".join(current_token).strip())
-            current_token = []
-        else:
-            current_token.append(ch)
-
-    if current_token:
-        tokens.append("".join(current_token).strip())
-
-    for tok in tokens:
+    for tok in split_top_level_braces(inner):
         if "=" in tok:
             k, v = tok.split("=", 1)
             fields[k.strip()] = v.strip()
@@ -284,18 +298,10 @@ def parse_gdb_struct_body(raw_val: str) -> Dict[str, str]:
 
 
 # ==============================================================================
-# Optimized GDB-MI Session Controller (`GDBTracer`)
+# Algorithm-Agnostic GDB-MI Session Controller (`GDBTracer`)
 # ==============================================================================
 
 class GDBTracer:
-    """
-    High-speed GDB/MI execution tracer with:
-      - Mathematical Graph Adjacency List abstraction (`Graph *g` -> vertices `0..V-1` & weighted edges)
-      - Persistent Graph root tracking across helper stack frames
-      - Smart atomic step-over for micro-helpers (`add_edge`, `extract_min`, `decrease_key`, `min_heapify`)
-      - Pointer-typedef ADT resolution & struct-embedded buffer inspection
-    """
-
     def __init__(
         self,
         binary_path: Path,
@@ -320,10 +326,6 @@ class GDBTracer:
         self._struct_field_types_cache: Dict[str, Dict[str, str]] = {}
         self._freed_addresses: Set[str] = set()
         self._last_valid_node_fields: Dict[str, Dict[str, Any]] = {}
-
-        # Persistent mathematical Graph root (var_name, hex_addr, struct_type)
-        # so the graph never flickers or disappears if execution steps into a helper function.
-        self._persistent_graph_root: Optional[Tuple[str, str, str]] = None
 
         self._current_line: int = 0
         self._current_file: str = ""
@@ -460,16 +462,11 @@ class GDBTracer:
                 addr = extract_hex_address(raw_addr or "")
                 if addr and self._is_valid_heap_or_data_address(addr):
                     self._freed_addresses.add(addr)
-                    if (
-                        self._persistent_graph_root
-                        and self._persistent_graph_root[1] == addr
-                    ):
-                        self._persistent_graph_root = None
 
-    def _is_declared_on_current_line(self, var_name: str) -> bool:
-        if not (1 <= self._current_line < len(self._source_lines)):
+    def _is_declared_on_current_line(self, var_name: str, line_num: int) -> bool:
+        if not (1 <= line_num < len(self._source_lines)):
             return False
-        src_line = self._source_lines[self._current_line].split("//")[0].strip()
+        src_line = self._source_lines[line_num].split("//")[0].strip()
         if src_line.startswith("for ") or src_line.startswith("for("):
             return False
         decl_pattern = (
@@ -479,12 +476,6 @@ class GDBTracer:
         return bool(re.search(decl_pattern, src_line))
 
     def _should_step_into_current_line(self) -> bool:
-        """
-        Steps INTO primary algorithm functions (`dijkstra`, `bfs`, `dfs`, `bellman_ford`, `prim`,
-        `binary_search`, `quick_sort`, `merge_sort`, `push`, `pop`), while stepping OVER (`-exec-next`)
-        trivial constructors, swaps, predicates, and heapify micro-helpers (`new_adj_node`,
-        `add_edge`, `extract_min`, `decrease_key`, `min_heapify`, `free_graph`).
-        """
         if not (1 <= self._current_line < len(self._source_lines)):
             return False
         src_line = self._source_lines[self._current_line].split("//")[0].strip()
@@ -504,7 +495,6 @@ class GDBTracer:
         if not user_calls:
             return False
 
-        # Only step into the line if at least one called function is NOT a micro-helper
         for fn_name in user_calls:
             low_fn = fn_name.lower()
             if low_fn in ATOMIC_HELPER_NAMES or low_fn.startswith(ATOMIC_HELPER_PREFIXES):
@@ -549,6 +539,16 @@ class GDBTracer:
         )
 
     def _resolve_type_info(self, raw_type: str) -> Tuple[str, str]:
+        """
+        Resolves any C type into `(category, target_c_type)`:
+          - `("struct_ptr_array", "struct Node")` -> for `Node **` or `struct Node **`
+          - `("primitive_ptr_array", "int")`      -> for `int **` (2D dynamic matrix)
+          - `("struct_ptr", "struct stack_t")`    -> for `struct Node *`, `Graph *`, or pointer-typedef
+          - `("struct_val", "struct stack_t")`    -> for `struct Node` by value
+          - `("primitive_ptr", "int")`            -> for `int *`, `double *`
+          - `("primitive", "int")`                -> for `int`, `size_t`
+          - `("other", raw_type)`
+        """
         clean = raw_type.replace("const", "").replace("volatile", "").strip()
         if clean in self._type_resolution_cache:
             return self._type_resolution_cache[clean]
@@ -558,6 +558,18 @@ class GDBTracer:
             self._type_resolution_cache[clean] = res
             return res
 
+        if clean.endswith("**"):
+            base_no_stars = clean.rstrip("*").strip()
+            if base_no_stars in PRIMITIVE_TYPES:
+                res = ("primitive_ptr_array", base_no_stars)
+                self._type_resolution_cache[clean] = res
+                return res
+            base_kind, base_resolved = self._resolve_type_info(base_no_stars)
+            if base_kind == "struct_val":
+                res = ("struct_ptr_array", base_resolved)
+                self._type_resolution_cache[clean] = res
+                return res
+
         ptr_match = PTR_TYPE_RE.match(clean)
         if ptr_match:
             base = ptr_match.group(1).strip()
@@ -565,7 +577,7 @@ class GDBTracer:
                 res = ("primitive_ptr", base)
                 self._type_resolution_cache[clean] = res
                 return res
-            if base.startswith("struct "):
+            if base.startswith("struct ") and not base.endswith("*"):
                 self._ensure_struct_field_types(base)
                 res = ("struct_ptr", base)
                 self._type_resolution_cache[clean] = res
@@ -573,6 +585,14 @@ class GDBTracer:
             base_kind, base_resolved = self._resolve_type_info(base)
             if base_kind == "struct_val":
                 res = ("struct_ptr", base_resolved)
+                self._type_resolution_cache[clean] = res
+                return res
+            if base_kind == "struct_ptr":
+                res = ("struct_ptr_array", base_resolved)
+                self._type_resolution_cache[clean] = res
+                return res
+            if base_kind == "primitive_ptr":
+                res = ("primitive_ptr_array", base_resolved)
                 self._type_resolution_cache[clean] = res
                 return res
 
@@ -592,7 +612,7 @@ class GDBTracer:
                 r"type\s*=\s*(struct\s+[a-zA-Z_][a-zA-Z0-9_]*)", full_console
             )
             canonical_struct = (
-                header_match.group(1).strip() if header_match else clean
+                header_match.group(1).strip() if header_match else f"struct {clean}"
             )
             self._parse_and_cache_ptype_fields(canonical_struct, full_console)
             if canonical_struct != clean:
@@ -602,7 +622,9 @@ class GDBTracer:
 
             brace_end = full_console.rfind("}")
             tail = full_console[brace_end + 1 :].strip() if brace_end != -1 else ""
-            if "*" in tail:
+            if "**" in tail:
+                res = ("struct_ptr_array", canonical_struct)
+            elif "*" in tail:
                 res = ("struct_ptr", canonical_struct)
             else:
                 res = ("struct_val", canonical_struct)
@@ -623,7 +645,7 @@ class GDBTracer:
                 return (False, "primitive", clean_type)
 
             f_kind, f_target_type = self._resolve_type_info(clean_type)
-            if f_kind in {"primitive_ptr", "struct_ptr"} or "*" in clean_type:
+            if f_kind in {"primitive_ptr", "primitive_ptr_array", "struct_ptr", "struct_ptr_array"} or "*" in clean_type:
                 return (True, f_kind, f_target_type)
             if f_kind in {"primitive", "struct_val"}:
                 return (False, f_kind, f_target_type)
@@ -634,6 +656,63 @@ class GDBTracer:
 
         return (False, "primitive", clean_type or "int")
 
+    def _collect_all_frame_variables(self) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """
+        Walks the call stack from leaf frame (level 0) up to `main()`.
+        Returns `(call_stack_names, merged_variables_with_frame_level)`.
+        Variables in frame 0 take precedence, while container pointers in outer frames
+        (`main()`) are retained so graphs/matrices/heaps never flicker across function calls.
+        """
+        frame_res = self._cmd("-stack-list-frames")
+        user_frames: List[Tuple[int, str, int]] = []
+        call_stack: List[str] = []
+
+        for r in frame_res:
+            if r.get("type") == "result" and r.get("message") == "done":
+                stack_payload = r.get("payload", {}).get("stack", [])
+                for f_entry in stack_payload:
+                    f = f_entry.get("frame", f_entry) if isinstance(f_entry, dict) else {}
+                    func = f.get("func", "")
+                    file_raw = f.get("file") or f.get("fullname") or ""
+                    level = int(f.get("level", 0))
+                    line = int(f.get("line", 0)) if "line" in f else 0
+                    if func in {"__libc_start_call_main", "__libc_start_main", "_start"}:
+                        continue
+                    if Path(file_raw).name == self.source_path.name:
+                        user_frames.append((level, func, line))
+                break
+
+        if not user_frames:
+            user_frames = [(0, self._current_func, self._current_line)]
+
+        call_stack = [fn for _, fn, _ in reversed(user_frames)]
+        merged_vars: List[Dict[str, Any]] = []
+        seen_var_names: Set[str] = set()
+
+        for level, _, frame_line in user_frames:
+            if level != 0:
+                self._cmd(f"-stack-select-frame {level}")
+
+            var_res = self._cmd("-stack-list-variables --simple-values")
+            for r in var_res:
+                if r.get("type") == "result" and r.get("message") == "done":
+                    for v in r.get("payload", {}).get("variables", []):
+                        v_name = v.get("name", "")
+                        if not v_name or v_name in seen_var_names:
+                            continue
+                        if self._is_declared_on_current_line(v_name, frame_line):
+                            continue
+                        seen_var_names.add(v_name)
+                        v_copy = dict(v)
+                        v_copy["frame_level"] = level
+                        merged_vars.append(v_copy)
+                    break
+
+        if len(user_frames) > 1:
+            self._cmd("-stack-select-frame 0")
+
+        return (call_stack, merged_vars)
+
     def inspect_state(self) -> Optional[ExecutionSnapshot]:
         self._check_budget()
         if (
@@ -642,45 +721,53 @@ class GDBTracer:
         ):
             return None
 
-        var_responses = self._cmd("-stack-list-variables --simple-values")
-        raw_vars: List[Dict[str, str]] = []
-        for r in var_responses:
-            if r.get("type") == "result" and r.get("message") == "done":
-                raw_vars = r.get("payload", {}).get("variables", [])
-                break
+        call_stack, raw_vars = self._collect_all_frame_variables()
 
         locals_out: Dict[str, Any] = {}
         scalar_ints: Dict[str, int] = {}
+        leaf_scalar_ints: Dict[str, int] = {}
         active_struct_ptrs: Dict[str, Tuple[str, str]] = {}
-        raw_array_vars: List[Tuple[str, str, int]] = []
-        raw_ptr_vars: List[Tuple[str, str, str]] = []
+        raw_array_vars: List[Tuple[str, str, int, int]] = []        # (name, elem_type, len, frame_level)
+        raw_2d_array_vars: List[Tuple[str, str, int, int, int]] = []  # (name, elem_type, rows, cols, frame_level)
+        raw_ptr_vars: List[Tuple[str, str, str, int]] = []          # (name, elem_type, addr, frame_level)
+        raw_2d_ptr_vars: List[Tuple[str, str, str, int]] = []       # (name, elem_type, addr, frame_level)
 
         # ----------------------------------------------------------------------
-        # Pass 1: Classify all variables in scope
+        # Pass 1: Classify all variables across active call stack frames
         # ----------------------------------------------------------------------
         for v in raw_vars:
             v_name = v.get("name", "")
             v_type = v.get("type", "").strip()
             v_val = v.get("value", "")
+            f_level = int(v.get("frame_level", 0))
 
             if not v_name or not v_type:
                 continue
 
-            if self._is_declared_on_current_line(v_name):
+            # Category A1: Fixed 2D stack array (`int [5][5]`)
+            arr_2d_match = FIXED_2D_ARR_RE.match(v_type)
+            if arr_2d_match:
+                elem_type = arr_2d_match.group(1).strip()
+                rows = min(int(arr_2d_match.group(2)), MAX_GRAPH_NODES)
+                cols = min(int(arr_2d_match.group(3)), MAX_GRAPH_NODES)
+                raw_2d_array_vars.append((v_name, elem_type, rows, cols, f_level))
                 continue
 
+            # Category A2: Fixed 1D stack array (`int [10]` or `struct Edge [8]`)
             arr_match = FIXED_ARR_RE.match(v_type)
             if arr_match:
                 elem_type = arr_match.group(1).strip()
                 arr_len = min(int(arr_match.group(2)), MAX_ARRAY_ELEMENTS)
-                raw_array_vars.append((v_name, elem_type, arr_len))
+                raw_array_vars.append((v_name, elem_type, arr_len, f_level))
                 continue
 
             type_kind, resolved_target = self._resolve_type_info(v_type)
 
+            # Category B: Struct pointer (`struct Node *`, `Graph *`, `MinHeap *`, `Edge *`)
             if type_kind == "struct_ptr":
                 addr = extract_hex_address(v_val)
-                locals_out[v_name] = addr if addr else "0x0"
+                if f_level == 0:
+                    locals_out[v_name] = addr if addr else "0x0"
                 if not addr:
                     continue
 
@@ -702,41 +789,73 @@ class GDBTracer:
                 active_struct_ptrs[v_name] = (addr, resolved_target)
                 continue
 
-            if type_kind == "primitive_ptr":
+            # Category C1: 2D Dynamic Matrix (`int **mat`)
+            if type_kind == "primitive_ptr_array":
                 addr = extract_hex_address(v_val)
-                locals_out[v_name] = addr if addr else "0x0"
+                if f_level == 0:
+                    locals_out[v_name] = addr if addr else "0x0"
                 if addr:
-                    raw_ptr_vars.append((v_name, resolved_target, addr))
+                    raw_2d_ptr_vars.append((v_name, resolved_target, addr, f_level))
                 continue
 
+            # Category C2: 1D Primitive pointer (`int *dist`, `int *v`)
+            if type_kind == "primitive_ptr":
+                addr = extract_hex_address(v_val)
+                if f_level == 0:
+                    locals_out[v_name] = addr if addr else "0x0"
+                if addr:
+                    raw_ptr_vars.append((v_name, resolved_target, addr, f_level))
+                continue
+
+            # Category D: Struct by value (`struct Graph g;`)
             if type_kind == "struct_val":
+                if f_level != 0:
+                    self._cmd(f"-stack-select-frame {f_level}")
                 addr_raw = self._eval_expr(f"&{v_name}")
+                if f_level != 0:
+                    self._cmd("-stack-select-frame 0")
                 addr = extract_hex_address(addr_raw or "")
                 if addr:
                     active_struct_ptrs[v_name] = (addr, resolved_target)
-                    locals_out[v_name] = addr
+                    if f_level == 0:
+                        locals_out[v_name] = addr
                 continue
 
+            # Category E: Scalar primitive (`int`, `size_t`, `float`, `char`)
             parsed_val = parse_scalar(v_val)
             if isinstance(parsed_val, int):
                 scalar_ints[v_name] = parsed_val
-                locals_out[v_name] = format_distance_val(parsed_val)
-            else:
+                if f_level == 0:
+                    leaf_scalar_ints[v_name] = parsed_val
+                    locals_out[v_name] = format_distance_val(parsed_val)
+            elif f_level == 0:
                 locals_out[v_name] = parsed_val
 
         # ----------------------------------------------------------------------
-        # Pass 2: Top-Level Contiguous Arrays (Fixed Stack + Dynamic Heap Buffers like `dist`)
+        # Pass 2: Contiguous 1D Arrays (Primitive Arrays & Edge-List Struct Arrays)
         # ----------------------------------------------------------------------
         arrays_snapshot: List[ArraySnapshot] = []
+        live_arrays_raw: Dict[str, List[Any]] = {}
+        stack_edge_lists: List[Tuple[str, str, int, int]] = []  # (var_name, struct_type, count, frame_level)
         inferred_len = self._infer_dynamic_array_length(scalar_ints)
 
-        for arr_name, elem_type, _ in raw_array_vars:
+        for arr_name, elem_type, arr_len, f_level in raw_array_vars:
+            elem_kind, elem_resolved = self._resolve_type_info(elem_type)
+            if elem_kind == "struct_val":
+                stack_edge_lists.append((arr_name, elem_resolved, arr_len, f_level))
+                continue
+
+            if f_level != 0:
+                self._cmd(f"-stack-select-frame {f_level}")
             expr_val = self._eval_expr(arr_name)
+            if f_level != 0:
+                self._cmd("-stack-select-frame 0")
+
             if expr_val:
-                elements = [
-                    format_distance_val(x) for x in parse_gdb_array(expr_val)
-                ]
-                active_idx = self._collect_active_indices(scalar_ints, len(elements))
+                raw_elements = parse_gdb_array(expr_val)
+                live_arrays_raw[arr_name] = raw_elements
+                elements = [format_distance_val(x) for x in raw_elements]
+                active_idx = self._collect_active_indices(leaf_scalar_ints, len(elements))
                 arrays_snapshot.append(
                     ArraySnapshot(
                         name=arr_name,
@@ -746,17 +865,14 @@ class GDBTracer:
                     )
                 )
 
-        # Keep raw integer array values (e.g. `dist`) for the mathematical graph overlay
-        live_arrays_raw: Dict[str, List[Any]] = {}
-
-        for ptr_name, elem_type, addr in raw_ptr_vars:
+        for ptr_name, elem_type, addr, _ in raw_ptr_vars:
             if (
                 addr not in self._freed_addresses
                 and inferred_len
                 and 1 <= inferred_len <= MAX_ARRAY_ELEMENTS
                 and self._is_valid_heap_or_data_address(addr)
             ):
-                deref_expr = f"*({elem_type}[{inferred_len}]*){ptr_name}"
+                deref_expr = f"*({elem_type}[{inferred_len}]*)({addr})"
                 expr_val = self._eval_expr(deref_expr)
                 if expr_val:
                     raw_elements = parse_gdb_array(expr_val)
@@ -766,7 +882,7 @@ class GDBTracer:
                             format_distance_val(x) for x in raw_elements
                         ]
                         active_idx = self._collect_active_indices(
-                            scalar_ints, len(formatted_elements)
+                            leaf_scalar_ints, len(formatted_elements)
                         )
                         arrays_snapshot.append(
                             ArraySnapshot(
@@ -778,32 +894,35 @@ class GDBTracer:
                         )
 
         # ----------------------------------------------------------------------
-        # Pass 3: Mathematical Graph Adjacency List Detection OR Raw Pointer Mesh
+        # Pass 3: Generic Graph Inference (Adjacency List, 2D Matrix, or Edge List)
         # ----------------------------------------------------------------------
-        abstract_graph = self._try_extract_mathematical_graph(
-            active_struct_ptrs, scalar_ints, live_arrays_raw
+        abstract_graph, consumed_graph_addrs = self._infer_generic_mathematical_graph(
+            active_struct_ptrs=active_struct_ptrs,
+            raw_2d_array_vars=raw_2d_array_vars,
+            raw_2d_ptr_vars=raw_2d_ptr_vars,
+            stack_edge_lists=stack_edge_lists,
+            scalar_ints=scalar_ints,
+            leaf_scalar_ints=leaf_scalar_ints,
+            live_arrays_raw=live_arrays_raw,
         )
 
         if abstract_graph is not None:
             graph_snapshot = abstract_graph
-            # Still extract embedded primitive arrays (e.g., `h->pos` from MinHeap)
             _, embedded_arrays = self._crawl_pointer_graph(
-                active_struct_ptrs, scalar_ints, skip_graph_struct=True
+                active_struct_ptrs,
+                leaf_scalar_ints,
+                excluded_addrs=consumed_graph_addrs,
             )
             arrays_snapshot.extend(embedded_arrays)
         else:
             graph_snapshot, embedded_arrays = self._crawl_pointer_graph(
-                active_struct_ptrs, scalar_ints, skip_graph_struct=False
+                active_struct_ptrs,
+                leaf_scalar_ints,
+                excluded_addrs=set(),
             )
             arrays_snapshot.extend(embedded_arrays)
 
         self.step_count += 1
-        call_stack = (
-            ["main"]
-            if self._current_func == "main"
-            else ["main", self._current_func]
-        )
-
         return ExecutionSnapshot(
             step=self.step_count,
             line=self._current_line,
@@ -815,174 +934,302 @@ class GDBTracer:
             status="running",
         )
 
-    def _try_extract_mathematical_graph(
+    # ==========================================================================
+    # Generic Mathematical Graph Inference (Adjacency List / Matrix / Edge List)
+    # ==========================================================================
+
+    def _find_distance_array(
+        self, num_v: int, live_arrays_raw: Dict[str, List[Any]]
+    ) -> List[Any]:
+        """Finds any active 1D integer array of length `num_v` representing vertex distances/costs."""
+        for hint in DISTANCE_ARRAY_HINTS:
+            if hint in live_arrays_raw and len(live_arrays_raw[hint]) >= num_v:
+                return live_arrays_raw[hint]
+        for arr_vals in live_arrays_raw.values():
+            if len(arr_vals) == num_v:
+                return arr_vals
+        return []
+
+    def _infer_generic_mathematical_graph(
         self,
         active_struct_ptrs: Dict[str, Tuple[str, str]],
+        raw_2d_array_vars: List[Tuple[str, str, int, int, int]],
+        raw_2d_ptr_vars: List[Tuple[str, str, str, int]],
+        stack_edge_lists: List[Tuple[str, str, int, int]],
         scalar_ints: Dict[str, int],
+        leaf_scalar_ints: Dict[str, int],
+        live_arrays_raw: Dict[str, List[Any]],
+    ) -> Tuple[Optional[GraphSnapshot], Set[str]]:
+        """
+        Inspects active data structures structurally to detect:
+          1. Adjacency List Structs (any struct with a vertex count + pointer array of linked list nodes)
+          2. Structs with an Edge Array (`g->edge` / `g->edges` for Bellman-Ford / Kruskal)
+          3. 2D Adjacency Matrices (`int mat[V][V]` or `int **mat` for Floyd-Warshall / dense Dijkstra)
+          4. Stack/Heap Edge List Arrays (`struct Edge edges[E]`)
+        Returns `(GraphSnapshot, set_of_consumed_struct_addresses)`.
+        """
+        consumed_addrs: Set[str] = set()
+
+        # ----------------------------------------------------------------------
+        # Strategy 1: Structural Inspection of Active Struct Pointers
+        # ----------------------------------------------------------------------
+        for _, (s_addr, s_type) in active_struct_ptrs.items():
+            if not self._is_valid_heap_or_data_address(s_addr) or s_addr in self._freed_addresses:
+                continue
+
+            f_types = self._ensure_struct_field_types(s_type)
+            if not f_types:
+                continue
+
+            s_deref = self._eval_expr(f"*(({s_type} *){s_addr})")
+            if not s_deref:
+                continue
+            s_fields = parse_gdb_struct_body(s_deref)
+
+            # Collect integer scalar fields inside this struct
+            int_fields: Dict[str, int] = {}
+            for k, v_str in s_fields.items():
+                decl_t = f_types.get(k, "")
+                is_ptr, _, _ = self._is_field_pointer_type(decl_t, k, v_str)
+                if not is_ptr:
+                    val = parse_scalar(v_str)
+                    if isinstance(val, int):
+                        int_fields[k] = val
+
+            # Find vertex count candidate inside struct (or fall back to frame scalar V/n)
+            num_v = self._pick_vertex_count(int_fields, scalar_ints)
+            if not num_v or not (1 <= num_v <= MAX_GRAPH_NODES):
+                continue
+
+            # Check every pointer field in `s_type` to see if it is:
+            # (1A) A pointer-to-pointer adjacency list (`Node **`) where `Node` is self-referential
+            # (1B) A pointer to a contiguous array of Edge structs (`Edge *`) where `Edge` has (u, v, [w])
+            for f_name, f_decl_type in f_types.items():
+                f_val_str = s_fields.get(f_name, "")
+                f_addr = extract_hex_address(f_val_str)
+                if not f_addr or not self._is_valid_heap_or_data_address(f_addr):
+                    continue
+
+                f_kind, f_target = self._resolve_type_info(f_decl_type)
+
+                # Case 1A: `Node **` Adjacency List
+                if f_kind == "struct_ptr_array" or "**" in f_decl_type:
+                    node_s_type = (
+                        f_target
+                        if f_kind == "struct_ptr_array"
+                        else f_decl_type.replace("*", "").strip()
+                    )
+                    if not node_s_type.startswith("struct "):
+                        _, res_s = self._resolve_type_info(node_s_type)
+                        node_s_type = res_s or f"struct {node_s_type}"
+
+                    node_f_types = self._ensure_struct_field_types(node_s_type)
+                    # A linked adjacency list node MUST have a self-referential pointer field (e.g. `next`)
+                    next_field = self._find_self_ref_field(node_s_type, node_f_types)
+                    if next_field:
+                        snap = self._build_graph_from_adj_list(
+                            num_v=num_v,
+                            adj_array_addr=f_addr,
+                            adj_node_type=node_s_type,
+                            node_f_types=node_f_types,
+                            next_field=next_field,
+                            active_struct_ptrs=active_struct_ptrs,
+                            leaf_scalar_ints=leaf_scalar_ints,
+                            live_arrays_raw=live_arrays_raw,
+                        )
+                        if snap is not None:
+                            consumed_addrs.add(s_addr)
+                            return (snap, consumed_addrs)
+
+                # Case 1B: `Edge *` Contiguous Edge Array inside a Graph struct (Bellman-Ford / Kruskal)
+                if f_kind == "struct_ptr":
+                    edge_s_type = f_target
+                    edge_f_types = self._ensure_struct_field_types(edge_s_type)
+                    if self._is_edge_triplet_struct(edge_s_type, edge_f_types):
+                        num_e = self._pick_edge_count(int_fields, scalar_ints) or num_v * 2
+                        snap = self._build_graph_from_edge_array(
+                            num_v=num_v,
+                            num_e=min(num_e, 64),
+                            edge_array_expr=f"(({edge_s_type} *){f_addr})",
+                            edge_f_types=edge_f_types,
+                            leaf_scalar_ints=leaf_scalar_ints,
+                            live_arrays_raw=live_arrays_raw,
+                        )
+                        if snap is not None:
+                            consumed_addrs.add(s_addr)
+                            return (snap, consumed_addrs)
+
+        # ----------------------------------------------------------------------
+        # Strategy 2: Top-Level Stack or Heap Edge List (`struct Edge edges[E]`)
+        # ----------------------------------------------------------------------
+        for arr_name, edge_s_type, arr_len, f_level in stack_edge_lists:
+            edge_f_types = self._ensure_struct_field_types(edge_s_type)
+            if self._is_edge_triplet_struct(edge_s_type, edge_f_types):
+                num_v = self._pick_vertex_count({}, scalar_ints) or 0
+                snap = self._build_graph_from_edge_array(
+                    num_v=num_v,
+                    num_e=min(arr_len, 64),
+                    edge_array_expr=arr_name,
+                    edge_f_types=edge_f_types,
+                    leaf_scalar_ints=leaf_scalar_ints,
+                    live_arrays_raw=live_arrays_raw,
+                    frame_level=f_level,
+                )
+                if snap is not None:
+                    return (snap, consumed_addrs)
+
+        # ----------------------------------------------------------------------
+        # Strategy 3: 2D Adjacency Matrix (`int mat[V][V]` or `int **mat`)
+        # ----------------------------------------------------------------------
+        for mat_name, elem_type, rows, cols, f_level in raw_2d_array_vars:
+            if rows == cols and 2 <= rows <= 16 and elem_type in PRIMITIVE_TYPES:
+                snap = self._build_graph_from_2d_matrix(
+                    mat_name=mat_name,
+                    dim=rows,
+                    is_pointer_rows=False,
+                    elem_type=elem_type,
+                    frame_level=f_level,
+                    leaf_scalar_ints=leaf_scalar_ints,
+                    live_arrays_raw=live_arrays_raw,
+                )
+                if snap is not None:
+                    return (snap, consumed_addrs)
+
+        for mat_name, elem_type, addr, f_level in raw_2d_ptr_vars:
+            dim = self._pick_vertex_count({}, scalar_ints)
+            if (
+                dim
+                and 2 <= dim <= 16
+                and self._is_valid_heap_or_data_address(addr)
+                and addr not in self._freed_addresses
+            ):
+                snap = self._build_graph_from_2d_matrix(
+                    mat_name=mat_name,
+                    dim=dim,
+                    is_pointer_rows=True,
+                    elem_type=elem_type,
+                    frame_level=f_level,
+                    leaf_scalar_ints=leaf_scalar_ints,
+                    live_arrays_raw=live_arrays_raw,
+                    base_addr=addr,
+                )
+                if snap is not None:
+                    return (snap, consumed_addrs)
+
+        return (None, consumed_addrs)
+
+    @staticmethod
+    def _pick_vertex_count(struct_ints: Dict[str, int], frame_ints: Dict[str, int]) -> Optional[int]:
+        for k in ("V", "num_vertices", "num_nodes", "vertices", "nodes", "n", "N", "nv"):
+            if k in struct_ints and 1 <= struct_ints[k] <= MAX_GRAPH_NODES:
+                return struct_ints[k]
+        if struct_ints:
+            first_v = next(iter(struct_ints.values()))
+            if 1 <= first_v <= MAX_GRAPH_NODES:
+                return first_v
+        for k in ("V", "num_vertices", "num_nodes", "n", "N"):
+            if k in frame_ints and 1 <= frame_ints[k] <= MAX_GRAPH_NODES:
+                return frame_ints[k]
+        return None
+
+    @staticmethod
+    def _pick_edge_count(struct_ints: Dict[str, int], frame_ints: Dict[str, int]) -> Optional[int]:
+        for k in ("E", "num_edges", "edges_count", "m", "M", "ne"):
+            if k in struct_ints and 1 <= struct_ints[k] <= 128:
+                return struct_ints[k]
+        for k in ("E", "num_edges", "m", "M"):
+            if k in frame_ints and 1 <= frame_ints[k] <= 128:
+                return frame_ints[k]
+        return None
+
+    def _find_self_ref_field(self, struct_type: str, field_types: Dict[str, str]) -> Optional[str]:
+        short_name = struct_type.replace("struct ", "").strip()
+        for f_name, f_decl in field_types.items():
+            if "*" in f_decl and (short_name in f_decl or f_name in {"next", "link"}):
+                return f_name
+        return None
+
+    def _is_edge_triplet_struct(self, struct_type: str, field_types: Dict[str, str]) -> bool:
+        if self._find_self_ref_field(struct_type, field_types):
+            return False
+        int_cols = [
+            k for k, t in field_types.items()
+            if t.replace("const", "").strip() in PRIMITIVE_TYPES and "*" not in t
+        ]
+        return 2 <= len(int_cols) <= 4
+
+    @staticmethod
+    def _classify_adj_node_fields(field_types: Dict[str, str], next_field: str) -> Tuple[str, Optional[str]]:
+        """
+        Dynamically picks `(dest_field, weight_field)` from an adjacency list node's integer members.
+        """
+        scalar_fields = [
+            k for k, t in field_types.items()
+            if k != next_field and "*" not in t
+        ]
+        if not scalar_fields:
+            return ("dest", None)
+
+        dest_f = next(
+            (k for hint in DEST_FIELD_HINTS for k in scalar_fields if k.lower() == hint),
+            scalar_fields[0],
+        )
+        rem = [k for k in scalar_fields if k != dest_f]
+        weight_f = next(
+            (k for hint in WEIGHT_FIELD_HINTS for k in rem if k.lower() == hint),
+            rem[0] if rem else None,
+        )
+        return (dest_f, weight_f)
+
+    @staticmethod
+    def _classify_edge_struct_fields(field_types: Dict[str, str]) -> Tuple[str, str, Optional[str]]:
+        scalar_fields = [k for k, t in field_types.items() if "*" not in t]
+        src_f = next(
+            (k for hint in SRC_FIELD_HINTS for k in scalar_fields if k.lower() == hint),
+            scalar_fields[0],
+        )
+        rem1 = [k for k in scalar_fields if k != src_f]
+        dest_f = next(
+            (k for hint in DEST_FIELD_HINTS for k in rem1 if k.lower() == hint),
+            rem1[0] if rem1 else src_f,
+        )
+        rem2 = [k for k in rem1 if k != dest_f]
+        weight_f = next(
+            (k for hint in WEIGHT_FIELD_HINTS for k in rem2 if k.lower() == hint),
+            rem2[0] if rem2 else None,
+        )
+        return (src_f, dest_f, weight_f)
+
+    def _build_graph_from_adj_list(
+        self,
+        num_v: int,
+        adj_array_addr: str,
+        adj_node_type: str,
+        node_f_types: Dict[str, str],
+        next_field: str,
+        active_struct_ptrs: Dict[str, Tuple[str, str]],
+        leaf_scalar_ints: Dict[str, int],
         live_arrays_raw: Dict[str, List[Any]],
     ) -> Optional[GraphSnapshot]:
-        """
-        Detects if an active (or cached persistent) struct represents a mathematical Graph
-        with an adjacency list (`V` vertices + `adj` array of `AdjListNode*` pointers).
-        When detected, constructs an intuitive mathematical graph:
-          - Nodes: `"node-0"` .. `"node-(V-1)"` with `dist` and PQ status
-          - Edges: `"node-u"` -> `"node-v"` with `"w: <weight>"`
-          - Active pointers: `u ↓`, `v ↓`, `src ↓`
-        """
-        graph_candidate: Optional[Tuple[str, str, str]] = None
-
-        for ptr_name, (addr, s_type) in active_struct_ptrs.items():
-            if not self._is_valid_heap_or_data_address(addr) or addr in self._freed_addresses:
-                continue
-            f_types = self._ensure_struct_field_types(s_type)
-            has_v = any(k in f_types for k in ("V", "num_vertices", "n", "nv", "vertices"))
-            has_adj = any(k in f_types for k in ("adj", "head", "lists", "edges", "array"))
-            if has_v and has_adj and ("Graph" in s_type or "adj" in f_types):
-                graph_candidate = (ptr_name, addr, s_type)
-                self._persistent_graph_root = graph_candidate
-                break
-
-        if graph_candidate is None and self._persistent_graph_root is not None:
-            cached_name, cached_addr, cached_type = self._persistent_graph_root
-            if cached_addr not in self._freed_addresses:
-                graph_candidate = (cached_name, cached_addr, cached_type)
-
-        if graph_candidate is None:
-            return None
-
-        _, g_addr, g_type = graph_candidate
-        g_deref = self._eval_expr(f"*(({g_type} *){g_addr})")
-        if not g_deref:
-            return None
-
-        g_fields = parse_gdb_struct_body(g_deref)
-        v_str = (
-            g_fields.get("V")
-            or g_fields.get("num_vertices")
-            or g_fields.get("n")
-            or "0"
-        )
-        num_v = parse_scalar(v_str)
-        if not isinstance(num_v, int) or not (1 <= num_v <= MAX_GRAPH_NODES):
-            return None
-
-        adj_addr = extract_hex_address(g_fields.get("adj") or g_fields.get("head") or "")
-        if not adj_addr or not self._is_valid_heap_or_data_address(adj_addr):
-            return None
-
-        # Read the array of `AdjListNode *` pointers: `*(void *[V]*)(g->adj)`
-        adj_ptrs_raw = self._eval_expr(f"*(void *[{num_v}]*)({adj_addr})")
+        adj_ptrs_raw = self._eval_expr(f"*(void *[{num_v}]*)({adj_array_addr})")
         if not adj_ptrs_raw:
             return None
         adj_head_addrs = parse_gdb_array(adj_ptrs_raw, max_elems=num_v)
 
-        # Determine adjacency node struct type (e.g. `struct AdjListNode`)
-        g_field_types = self._ensure_struct_field_types(g_type)
-        adj_decl_type = g_field_types.get("adj", "struct AdjListNode **")
-        adj_node_type = adj_decl_type.replace("*", "").strip()
-        if not adj_node_type.startswith("struct "):
-            _, resolved_adj = self._resolve_type_info(adj_node_type)
-            adj_node_type = resolved_adj or "struct AdjListNode"
+        dest_field, weight_field = self._classify_adj_node_fields(node_f_types, next_field)
 
-        # Check if `MinHeap *h` is in scope to determine which vertices are still in the Priority Queue
-        in_pq_vertices: Set[int] = set()
-        for _, (h_addr, h_type) in active_struct_ptrs.items():
-            if "Heap" in h_type and self._is_valid_heap_or_data_address(h_addr):
-                h_deref = self._eval_expr(f"*(({h_type} *){h_addr})")
-                if h_deref:
-                    h_fields = parse_gdb_struct_body(h_deref)
-                    h_size = parse_scalar(h_fields.get("size", "0"))
-                    pos_addr = extract_hex_address(h_fields.get("pos", ""))
-                    if (
-                        isinstance(h_size, int)
-                        and 0 <= h_size <= num_v
-                        and pos_addr
-                        and self._is_valid_heap_or_data_address(pos_addr)
-                    ):
-                        pos_raw = self._eval_expr(f"*(int[{num_v}]*)({pos_addr})")
-                        if pos_raw:
-                            pos_list = parse_gdb_array(pos_raw, max_elems=num_v)
-                            for vert_idx, p_val in enumerate(pos_list):
-                                if isinstance(p_val, int) and p_val < h_size:
-                                    in_pq_vertices.add(vert_idx)
+        # Check if any local pointer in the current frame points to an `adj_node_type` (like `crawl`, `curr`, `e`)
+        active_edge_dest: Optional[int] = None
+        for ptr_var, (p_addr, p_type) in active_struct_ptrs.items():
+            if p_type == adj_node_type and self._is_valid_heap_or_data_address(p_addr):
+                p_deref = self._eval_expr(f"*(({adj_node_type} *){p_addr})")
+                if p_deref:
+                    pf = parse_gdb_struct_body(p_deref)
+                    d_val = parse_scalar(pf.get(dest_field, "-1"))
+                    if isinstance(d_val, int) and 0 <= d_val < num_v:
+                        active_edge_dest = d_val
+                        break
 
-        dist_list = live_arrays_raw.get("dist", [])
-
-        # Identify active vertex indices (`u`, `v`, `src`) from local variables
-        u_val = scalar_ints.get("u")
-        v_val = scalar_ints.get("v")
-        src_val = scalar_ints.get("src")
-
-        # Also check if `crawl` points to a specific `AdjListNode` right now
-        crawl_dest: Optional[int] = None
-        if "crawl" in active_struct_ptrs:
-            c_addr, c_type = active_struct_ptrs["crawl"]
-            if self._is_valid_heap_or_data_address(c_addr):
-                c_deref = self._eval_expr(f"*(({c_type} *){c_addr})")
-                if c_deref:
-                    c_fields = parse_gdb_struct_body(c_deref)
-                    d_parsed = parse_scalar(c_fields.get("dest", "-1"))
-                    if isinstance(d_parsed, int) and 0 <= d_parsed < num_v:
-                        crawl_dest = d_parsed
-
-        # Build vertex nodes: `node-0`, `node-1`, ..., `node-(V-1)`
-        nodes: List[GraphNode] = []
-        stack_pointers_out: Dict[str, str] = {}
-
-        for idx in range(num_v):
-            node_id = f"node-{idx}"
-            ptrs: List[str] = []
-
-            if isinstance(src_val, int) and src_val == idx:
-                ptrs.append("src")
-                stack_pointers_out["src"] = node_id
-            if isinstance(u_val, int) and u_val == idx:
-                ptrs.append("u")
-                stack_pointers_out["u"] = node_id
-            if (
-                isinstance(v_val, int)
-                and v_val == idx
-                and self._current_func == "dijkstra"
-                and "u" in scalar_ints
-            ):
-                ptrs.append("v")
-                stack_pointers_out["v"] = node_id
-            elif crawl_dest == idx and "v" not in ptrs:
-                ptrs.append("crawl->dest")
-
-            raw_d = dist_list[idx] if idx < len(dist_list) else None
-            formatted_d = format_distance_val(raw_d) if raw_d is not None else "—"
-
-            status_str = (
-                "IN_PQ"
-                if idx in in_pq_vertices
-                else ("SETTLED" if dist_list else "VERTEX")
-            )
-
-            fields_dict: Dict[str, Any] = {"vertex": idx}
-            if raw_d is not None:
-                fields_dict["dist"] = formatted_d
-                fields_dict["status"] = status_str
-
-            label_str = (
-                f"V{idx}\ndist: {formatted_d}"
-                if raw_d is not None
-                else f"Vertex {idx}"
-            )
-
-            nodes.append(
-                GraphNode(
-                    id=node_id,
-                    type="Vertex",
-                    label=label_str,
-                    fields=fields_dict,
-                    is_active=(idx == u_val or idx == v_val or idx == crawl_dest),
-                    is_freed=False,
-                    pointers=ptrs,
-                )
-            )
-
-        # Traverse adjacency lists for each vertex `0 .. V-1`
         raw_directed_edges: List[Tuple[int, int, Any]] = []
         for u_idx, head_item in enumerate(adj_head_addrs):
             curr_addr = extract_hex_address(str(head_item))
@@ -1000,21 +1247,210 @@ class GDBTracer:
                 if not node_deref:
                     break
                 nf = parse_gdb_struct_body(node_deref)
-                dest_v = parse_scalar(nf.get("dest", nf.get("v", "-1")))
-                weight_w = parse_scalar(nf.get("weight", nf.get("w", "1")))
-
+                dest_v = parse_scalar(nf.get(dest_field, "-1"))
+                weight_w = (
+                    parse_scalar(nf.get(weight_field, "1"))
+                    if weight_field and weight_field in nf
+                    else None
+                )
                 if isinstance(dest_v, int) and 0 <= dest_v < num_v:
                     raw_directed_edges.append((u_idx, dest_v, weight_w))
 
-                curr_addr = extract_hex_address(nf.get("next", ""))
+                curr_addr = extract_hex_address(nf.get(next_field, ""))
 
-        # Check if all edges are symmetric (undirected graph where add_edge adds u->v and v->u)
+        return self._assemble_abstract_graph_snapshot(
+            num_v=num_v,
+            raw_directed_edges=raw_directed_edges,
+            leaf_scalar_ints=leaf_scalar_ints,
+            live_arrays_raw=live_arrays_raw,
+            active_edge_dest=active_edge_dest,
+        )
+
+    def _build_graph_from_edge_array(
+        self,
+        num_v: int,
+        num_e: int,
+        edge_array_expr: str,
+        edge_f_types: Dict[str, str],
+        leaf_scalar_ints: Dict[str, int],
+        live_arrays_raw: Dict[str, List[Any]],
+        frame_level: int = 0,
+    ) -> Optional[GraphSnapshot]:
+        src_f, dest_f, weight_f = self._classify_edge_struct_fields(edge_f_types)
+        raw_directed_edges: List[Tuple[int, int, Any]] = []
+        max_vert_seen = num_v - 1
+
+        if frame_level != 0:
+            self._cmd(f"-stack-select-frame {frame_level}")
+
+        for idx in range(num_e):
+            elem_str = self._eval_expr(f"({edge_array_expr})[{idx}]")
+            if not elem_str:
+                break
+            ef = parse_gdb_struct_body(elem_str)
+            u_val = parse_scalar(ef.get(src_f, "-1"))
+            v_val = parse_scalar(ef.get(dest_f, "-1"))
+            w_val = (
+                parse_scalar(ef.get(weight_f, "1"))
+                if weight_f and weight_f in ef
+                else None
+            )
+            if (
+                isinstance(u_val, int)
+                and isinstance(v_val, int)
+                and 0 <= u_val < MAX_GRAPH_NODES
+                and 0 <= v_val < MAX_GRAPH_NODES
+            ):
+                if u_val == 0 and v_val == 0 and (w_val == 0 or w_val is None):
+                    continue
+                max_vert_seen = max(max_vert_seen, u_val, v_val)
+                raw_directed_edges.append((u_val, v_val, w_val))
+
+        if frame_level != 0:
+            self._cmd("-stack-select-frame 0")
+
+        final_v = max(num_v, max_vert_seen + 1)
+        if final_v <= 0 or not raw_directed_edges:
+            return None
+
+        return self._assemble_abstract_graph_snapshot(
+            num_v=min(final_v, MAX_GRAPH_NODES),
+            raw_directed_edges=raw_directed_edges,
+            leaf_scalar_ints=leaf_scalar_ints,
+            live_arrays_raw=live_arrays_raw,
+        )
+
+    def _build_graph_from_2d_matrix(
+        self,
+        mat_name: str,
+        dim: int,
+        is_pointer_rows: bool,
+        elem_type: str,
+        frame_level: int,
+        leaf_scalar_ints: Dict[str, int],
+        live_arrays_raw: Dict[str, List[Any]],
+        base_addr: str = "",
+    ) -> Optional[GraphSnapshot]:
+        raw_directed_edges: List[Tuple[int, int, Any]] = []
+
+        if frame_level != 0:
+            self._cmd(f"-stack-select-frame {frame_level}")
+
+        if not is_pointer_rows:
+            mat_raw = self._eval_expr(mat_name)
+            if mat_raw:
+                row_strs = parse_gdb_array(mat_raw, max_elems=dim)
+                for i, r_str in enumerate(row_strs):
+                    if isinstance(r_str, str) and r_str.startswith("{"):
+                        row_vals = parse_gdb_array(r_str, max_elems=dim)
+                        for j, cell_val in enumerate(row_vals):
+                            if (
+                                i != j
+                                and isinstance(cell_val, (int, float))
+                                and cell_val != 0
+                                and not is_infinity_like(cell_val)
+                            ):
+                                raw_directed_edges.append((i, j, cell_val))
+        else:
+            row_ptrs_raw = self._eval_expr(f"*(void *[{dim}]*)({base_addr})")
+            if row_ptrs_raw:
+                row_ptrs = parse_gdb_array(row_ptrs_raw, max_elems=dim)
+                for i, r_ptr in enumerate(row_ptrs):
+                    r_addr = extract_hex_address(str(r_ptr))
+                    if r_addr and self._is_valid_heap_or_data_address(r_addr):
+                        row_str = self._eval_expr(f"*({elem_type}[{dim}]*)({r_addr})")
+                        if row_str:
+                            row_vals = parse_gdb_array(row_str, max_elems=dim)
+                            for j, cell_val in enumerate(row_vals):
+                                if (
+                                    i != j
+                                    and isinstance(cell_val, (int, float))
+                                    and cell_val != 0
+                                    and not is_infinity_like(cell_val)
+                                ):
+                                    raw_directed_edges.append((i, j, cell_val))
+
+        if frame_level != 0:
+            self._cmd("-stack-select-frame 0")
+
+        if not raw_directed_edges:
+            return None
+
+        return self._assemble_abstract_graph_snapshot(
+            num_v=dim,
+            raw_directed_edges=raw_directed_edges,
+            leaf_scalar_ints=leaf_scalar_ints,
+            live_arrays_raw=live_arrays_raw,
+        )
+
+    def _assemble_abstract_graph_snapshot(
+        self,
+        num_v: int,
+        raw_directed_edges: List[Tuple[int, int, Any]],
+        leaf_scalar_ints: Dict[str, int],
+        live_arrays_raw: Dict[str, List[Any]],
+        active_edge_dest: Optional[int] = None,
+    ) -> GraphSnapshot:
+        dist_list = self._find_distance_array(num_v, live_arrays_raw)
+
+        # Dynamically map any vertex-like scalar cursors in the active frame (`u`, `v`, `src`, `curr`, `i`, `j`, `k`)
+        vertex_cursor_vars: List[str] = []
+        for cand in ("src", "source", "start", "u", "v", "curr", "node", "k", "i", "j"):
+            if cand in leaf_scalar_ints:
+                val = leaf_scalar_ints[cand]
+                if 0 <= val < num_v and len(vertex_cursor_vars) < 3:
+                    vertex_cursor_vars.append(cand)
+
+        nodes: List[GraphNode] = []
+        stack_pointers_out: Dict[str, str] = {}
+
+        for idx in range(num_v):
+            node_id = f"node-{idx}"
+            ptrs: List[str] = []
+
+            for c_var in vertex_cursor_vars:
+                if leaf_scalar_ints[c_var] == idx:
+                    ptrs.append(c_var)
+                    stack_pointers_out[c_var] = node_id
+
+            if active_edge_dest == idx and not any(p in {"v", "dest", "to"} for p in ptrs):
+                ptrs.append("target")
+
+            raw_d = dist_list[idx] if idx < len(dist_list) else None
+            formatted_d = format_distance_val(raw_d) if raw_d is not None else "—"
+
+            fields_dict: Dict[str, Any] = {"vertex": idx}
+            if raw_d is not None:
+                fields_dict["dist"] = formatted_d
+                fields_dict["status"] = "REACHED" if formatted_d != "∞" else "UNVISITED"
+
+            label_str = (
+                f"V{idx}\ndist: {formatted_d}"
+                if raw_d is not None
+                else f"Vertex {idx}"
+            )
+
+            nodes.append(
+                GraphNode(
+                    id=node_id,
+                    type="Vertex",
+                    label=label_str,
+                    fields=fields_dict,
+                    is_active=bool(ptrs),
+                    is_freed=False,
+                    pointers=ptrs,
+                )
+            )
+
         edge_lookup = {(u, v, str(w)) for u, v, w in raw_directed_edges}
         edges: List[GraphEdge] = []
         emitted_undirected: Set[Tuple[int, int, str]] = set()
 
+        u_active = leaf_scalar_ints.get("u", leaf_scalar_ints.get("i"))
+        v_active = leaf_scalar_ints.get("v", active_edge_dest if active_edge_dest is not None else leaf_scalar_ints.get("j"))
+
         for u_idx, v_idx, w_val in raw_directed_edges:
-            w_str = str(w_val)
+            w_str = str(w_val) if w_val is not None else ""
             is_symmetric = (v_idx, u_idx, w_str) in edge_lookup
             if is_symmetric:
                 canon_pair = (min(u_idx, v_idx), max(u_idx, v_idx), w_str)
@@ -1023,22 +1459,25 @@ class GDBTracer:
                 emitted_undirected.add(canon_pair)
 
             is_active_edge = (
-                isinstance(u_val, int)
+                isinstance(u_active, int)
+                and isinstance(v_active, int)
                 and (
-                    (u_val == u_idx and (v_val == v_idx or crawl_dest == v_idx))
-                    or (is_symmetric and u_val == v_idx and (v_val == u_idx or crawl_dest == u_idx))
+                    (u_active == u_idx and v_active == v_idx)
+                    or (is_symmetric and u_active == v_idx and v_active == u_idx)
                 )
             )
 
             src_id = f"node-{u_idx}"
             tgt_id = f"node-{v_idx}"
+            edge_label = f"w: {w_val}" if w_val is not None else ""
+
             edges.append(
                 GraphEdge(
                     source=src_id,
                     target=tgt_id,
                     from_node=src_id,
                     to_node=tgt_id,
-                    label=f"w: {w_val}",
+                    label=edge_label,
                     is_active=is_active_edge,
                     is_directed=not is_symmetric,
                 )
@@ -1049,6 +1488,135 @@ class GDBTracer:
             edges=edges,
             stack_pointers=stack_pointers_out,
             mode="abstract_graph",
+        )
+
+    # ==========================================================================
+    # Generic Struct-Pointer Array & ADT Buffer Inspector
+    # ==========================================================================
+
+    def _extract_struct_ptr_array_buffer(
+        self,
+        owner_name: str,
+        field_name: str,
+        array_base_addr: str,
+        elem_struct_type: str,
+        sister_scalars: Dict[str, int],
+        frame_scalar_ints: Dict[str, int],
+    ) -> Optional[ArraySnapshot]:
+        """
+        Generic DWARF-driven inspector for any `Type **array` inside a container struct.
+        Dynamically reads whatever fields exist on `elem_struct_type` without relying on
+        hardcoded struct names like `MinHeapNode`.
+        """
+        active_size = sister_scalars.get("size", sister_scalars.get("count", sister_scalars.get("len")))
+        cap_size = self._infer_struct_buffer_length(sister_scalars)
+
+        if isinstance(active_size, int) and 1 <= active_size <= MAX_STRUCT_BUFFER_ELEMENTS:
+            count_to_read = active_size
+        elif cap_size and 1 <= cap_size <= MAX_STRUCT_BUFFER_ELEMENTS:
+            count_to_read = cap_size
+        else:
+            return None
+
+        ptr_slice_raw = self._eval_expr(f"*(void *[{count_to_read}]*)({array_base_addr})")
+        if not ptr_slice_raw:
+            return None
+
+        elem_addrs = parse_gdb_array(ptr_slice_raw, max_elems=count_to_read)
+        if not elem_addrs:
+            return None
+
+        tuple_elements: List[Any] = []
+        key_to_heap_idx: Dict[int, int] = {}
+
+        for idx, raw_elem_ptr in enumerate(elem_addrs):
+            elem_addr = extract_hex_address(str(raw_elem_ptr))
+            if (
+                not elem_addr
+                or not self._is_valid_heap_or_data_address(elem_addr)
+                or elem_addr in self._freed_addresses
+            ):
+                if active_size == 0:
+                    break
+                continue
+
+            elem_deref = self._eval_expr(f"*(({elem_struct_type} *){elem_addr})")
+            if not elem_deref:
+                if active_size == 0:
+                    break
+                continue
+
+            ef = parse_gdb_struct_body(elem_deref)
+            if not ef:
+                continue
+
+            scalar_members = [
+                (k, parse_scalar(v))
+                for k, v in ef.items()
+                if not extract_hex_address(v)
+            ]
+
+            if len(scalar_members) >= 2:
+                # Pick identifier field first and priority/metric field second using hints or declaration order
+                id_pair = next(
+                    ((k, val) for hint in DEST_FIELD_HINTS for k, val in scalar_members if k.lower() == hint),
+                    scalar_members[0],
+                )
+                rem_members = [(k, val) for k, val in scalar_members if k != id_pair[0]]
+                metric_pair = next(
+                    ((k, val) for hint in WEIGHT_FIELD_HINTS for k, val in rem_members if k.lower() == hint),
+                    rem_members[0],
+                )
+
+                k_name, k_val = id_pair
+                m_name, m_val = metric_pair
+                m_formatted = format_distance_val(m_val)
+
+                if isinstance(k_val, int):
+                    key_to_heap_idx[k_val] = len(tuple_elements)
+
+                tuple_elements.append(
+                    {
+                        "label": f"{k_name}: {k_val}, {m_name}: {m_formatted}",
+                        "value": m_formatted,
+                        "secondary": f"{k_name}={k_val}",
+                    }
+                )
+            elif len(scalar_members) == 1:
+                k_name, k_val = scalar_members[0]
+                v_fmt = format_distance_val(k_val)
+                tuple_elements.append(
+                    {
+                        "label": f"{k_name}: {v_fmt}",
+                        "value": v_fmt,
+                        "secondary": f"#{idx}",
+                    }
+                )
+
+        if not tuple_elements:
+            return None
+
+        active_idx: Dict[str, int] = {"head": 0}
+        if len(tuple_elements) > 1:
+            active_idx["last"] = len(tuple_elements) - 1
+
+        for cursor in ("smallest", "left", "right", "idx", "i", "top", "front", "rear"):
+            if cursor in frame_scalar_ints:
+                c_val = frame_scalar_ints[cursor]
+                if 0 <= c_val < len(tuple_elements):
+                    active_idx[cursor] = c_val
+
+        if "v" in frame_scalar_ints:
+            v_vert = frame_scalar_ints["v"]
+            if v_vert in key_to_heap_idx:
+                active_idx[f"v({v_vert})"] = key_to_heap_idx[v_vert]
+
+        short_type = elem_struct_type.replace("struct ", "").strip() + "*"
+        return ArraySnapshot(
+            name=f"{owner_name}->{field_name} (Priority Queue)",
+            type=short_type,
+            elements=tuple_elements,
+            active_indices=active_idx,
         )
 
     def _ensure_struct_field_types(self, struct_type: str) -> Dict[str, str]:
@@ -1136,12 +1704,13 @@ class GDBTracer:
         self,
         active_struct_ptrs: Dict[str, Tuple[str, str]],
         frame_scalar_ints: Dict[str, int],
-        skip_graph_struct: bool = False,
+        excluded_addrs: Set[str],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
-        visited_addrs: Set[str] = set()
+        visited_addrs: Set[str] = set(excluded_addrs)
         nodes: List[GraphNode] = []
         edges: List[GraphEdge] = []
-        embedded_arrays: List[ArraySnapshot] = []
+        primary_embedded_arrays: List[ArraySnapshot] = []
+        auxiliary_embedded_arrays: List[ArraySnapshot] = []
         seen_edges: Set[Tuple[str, str, str]] = set()
         seen_embedded_buffers: Set[str] = set()
 
@@ -1150,7 +1719,7 @@ class GDBTracer:
         valid_seeds: List[Tuple[str, str, str]] = []
 
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
-            if skip_graph_struct and ("Graph" in s_type or "AdjList" in s_type):
+            if addr in excluded_addrs:
                 continue
             if self._is_valid_heap_or_data_address(addr):
                 stack_pointers_out[ptr_name] = addr
@@ -1256,7 +1825,7 @@ class GDBTracer:
                         active_idx = self._collect_struct_buffer_indices(
                             sister_scalars, frame_scalar_ints, len(sub_items)
                         )
-                        embedded_arrays.append(
+                        primary_embedded_arrays.append(
                             ArraySnapshot(
                                 name=f"{owner_name}->{f_name}",
                                 type="int",
@@ -1278,6 +1847,31 @@ class GDBTracer:
 
                     node_fields[f_name] = target_addr
                     if not self._is_valid_heap_or_data_address(target_addr):
+                        continue
+
+                    if (
+                        (f_kind == "struct_ptr_array" or "**" in declared_f_type)
+                        and target_addr not in self._freed_addresses
+                    ):
+                        elem_struct = (
+                            f_target_type
+                            if f_kind == "struct_ptr_array"
+                            else declared_f_type.replace("*", "").strip()
+                        )
+                        if not elem_struct.startswith("struct "):
+                            _, res_s = self._resolve_type_info(elem_struct)
+                            elem_struct = res_s or f"struct {elem_struct}"
+
+                        pq_snap = self._extract_struct_ptr_array_buffer(
+                            owner_name=owner_name,
+                            field_name=f_name,
+                            array_base_addr=target_addr,
+                            elem_struct_type=elem_struct,
+                            sister_scalars=sister_scalars,
+                            frame_scalar_ints=frame_scalar_ints,
+                        )
+                        if pq_snap is not None:
+                            primary_embedded_arrays.append(pq_snap)
                         continue
 
                     is_primitive_buffer = (
@@ -1307,15 +1901,22 @@ class GDBTracer:
                                         frame_scalar_ints,
                                         len(elements),
                                     )
-                                    arr_display_name = f"{owner_name}->{f_name}"
-                                    embedded_arrays.append(
-                                        ArraySnapshot(
-                                            name=arr_display_name,
-                                            type=elem_c_type,
-                                            elements=elements,
-                                            active_indices=active_idx,
-                                        )
+                                    is_aux_map = f_name.lower() in AUXILIARY_MAP_FIELD_NAMES
+                                    arr_display_name = (
+                                        f"{owner_name}->{f_name} (Reverse Index Map)"
+                                        if is_aux_map
+                                        else f"{owner_name}->{f_name}"
                                     )
+                                    snap_obj = ArraySnapshot(
+                                        name=arr_display_name,
+                                        type=elem_c_type,
+                                        elements=elements,
+                                        active_indices=active_idx,
+                                    )
+                                    if is_aux_map:
+                                        auxiliary_embedded_arrays.append(snap_obj)
+                                    else:
+                                        primary_embedded_arrays.append(snap_obj)
 
                                     if target_addr not in seen_embedded_buffers:
                                         seen_embedded_buffers.add(target_addr)
@@ -1335,7 +1936,7 @@ class GDBTracer:
                                                 },
                                                 is_active=False,
                                                 is_freed=False,
-                                                pointers=[arr_display_name],
+                                                pointers=[f"{owner_name}->{f_name}"],
                                             )
                                         )
                                     edge_key = (addr, target_addr, f_name)
@@ -1350,9 +1951,6 @@ class GDBTracer:
                                                 label=f_name,
                                             )
                                         )
-                        continue
-
-                    if "**" in declared_f_type:
                         continue
 
                     target_s_type = (
@@ -1384,7 +1982,7 @@ class GDBTracer:
 
                 parsed_scalar = format_distance_val(parse_scalar(f_val))
                 node_fields[f_name] = parsed_scalar
-                if node_label is None and f_name.lower() in STRUCT_VALUE_FIELDS:
+                if node_label is None:
                     node_label = f"{f_name}: {parsed_scalar}"
 
             if node_label is None:
@@ -1404,6 +2002,8 @@ class GDBTracer:
                 )
             )
 
+        all_embedded = primary_embedded_arrays + auxiliary_embedded_arrays
+
         return (
             GraphSnapshot(
                 nodes=nodes,
@@ -1411,7 +2011,7 @@ class GDBTracer:
                 stack_pointers=stack_pointers_out,
                 mode="pointer_mesh",
             ),
-            embedded_arrays,
+            all_embedded,
         )
 
     def _collect_struct_buffer_indices(
@@ -1445,8 +2045,8 @@ class GDBTracer:
                 if 1 <= val <= MAX_ARRAY_ELEMENTS:
                     return val
         for name, val in scalar_ints.items():
-            if name.lower() in SIZE_VAR_CANDIDATES or name.lower().endswith(
-                ("_len", "_size", "_count")
+            if name in VERTEX_COUNT_HINTS or name.lower().endswith(
+                ("_len", "_size", "_count", "_vertices", "_nodes")
             ):
                 if 1 <= val <= MAX_ARRAY_ELEMENTS:
                     return val
@@ -1457,8 +2057,7 @@ class GDBTracer:
     ) -> Dict[str, int]:
         active: Dict[str, int] = {}
         for var_name, val in scalar_ints.items():
-            # Keep uppercase 'V' (vertex count) excluded from array indices, while allowing lowercase 'v' (neighbor vertex index)
-            if var_name == "V":
+            if var_name in {"V", "N", "E", "M"}:
                 continue
             low_name = var_name.lower()
 

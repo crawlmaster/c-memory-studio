@@ -1,15 +1,16 @@
 /**
  * frontend/src/components/Visualizer/ArrayVisualizer.tsx
- * Renders 1D contiguous C arrays (`int arr[N]`, dynamic `int *v`) AND
- * struct-embedded ADT buffers (`s->data`, `q->arr`, `heap->elements`) with:
- * - Distinct badges for `top`, `front`, `rear`, `middle`, `mid`, `low`, `high`, `pivot`, `i`, `j`
- * - Sister struct field metadata pills (`capacity`, `top`, `size`) extracted from the container node
- * - Active stack/queue occupancy shading (`0 <= idx <= top`) and `top = -1 (EMPTY)` badge
+ * Renders:
+ * 1. Standard 1D contiguous C arrays (`int arr[N]`, `int *dist`)
+ * 2. Struct-embedded primitive ADT buffers (`s->data`, `h->pos (Reverse Index Map)`)
+ * 3. Pointer-to-Struct Priority Queue / Heap tuple buffers (`h->array (Priority Queue)`)
+ *    where each cell displays both the vertex key (`v=2`) and the distance metric (`d=6` / `∞`),
+ *    with bar height driven by the priority metric `dist`.
  */
 
 import React from "react";
-import { type ArrayData, type GraphNode } from "../../types/debug";
-import { BarChart3, Crosshair, Database, Layers } from "lucide-react";
+import { type ArrayData, type ArrayTupleElement, type GraphNode } from "../../types/debug";
+import { BarChart3, Crosshair, Database, Layers, ListOrdered } from "lucide-react";
 
 export interface ArrayVisualizerProps {
   arrays: ArrayData[];
@@ -18,11 +19,17 @@ export interface ArrayVisualizerProps {
 }
 
 const POINTER_BADGE_PALETTE: Record<string, string> = {
+  min: "bg-amber-400 text-slate-950 border-amber-200 shadow-[0_0_12px_rgba(251,191,36,0.55)]",
+  last: "bg-violet-500 text-white border-violet-300",
+  smallest: "bg-emerald-400 text-slate-950 border-emerald-200",
   top: "bg-emerald-400 text-slate-950 border-emerald-200 shadow-[0_0_12px_rgba(52,211,153,0.55)]",
   front: "bg-cyan-400 text-slate-950 border-cyan-200 shadow-[0_0_10px_rgba(34,211,238,0.45)]",
   rear: "bg-violet-500 text-white border-violet-300 shadow-[0_0_10px_rgba(139,92,246,0.45)]",
   head: "bg-emerald-500 text-slate-950 border-emerald-300",
   tail: "bg-orange-500 text-slate-950 border-orange-300",
+  u: "bg-amber-400 text-slate-950 border-amber-200 shadow-[0_0_10px_rgba(251,191,36,0.5)]",
+  v: "bg-fuchsia-500 text-white border-fuchsia-300 shadow-[0_0_10px_rgba(217,70,239,0.5)]",
+  src: "bg-emerald-400 text-slate-950 border-emerald-200",
   i: "bg-sky-500 text-slate-950 border-sky-300",
   j: "bg-amber-500 text-slate-950 border-amber-300",
   k: "bg-purple-500 text-white border-purple-300",
@@ -64,11 +71,69 @@ function getBadgeStyle(pointerName: string): string {
   if (POINTER_BADGE_PALETTE[key]) {
     return POINTER_BADGE_PALETTE[key];
   }
+  if (key.startsWith("v(")) {
+    return POINTER_BADGE_PALETTE.v;
+  }
   let hash = 0;
   for (let i = 0; i < key.length; i++) {
     hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
   }
   return FALLBACK_PALETTE[hash % FALLBACK_PALETTE.length];
+}
+
+interface ParsedCell {
+  isTuple: boolean;
+  numericMetric: number;
+  primaryText: string;
+  secondaryKey?: string;
+  tooltip?: string;
+}
+
+function parseArrayElement(
+  el: number | string | ArrayTupleElement
+): ParsedCell {
+  // 1. Structured tuple object from gdb_engine (`{ label: "v: 2, d: 6", value: 6, secondary: "v=2" }`)
+  if (el !== null && typeof el === "object" && "value" in el) {
+    const rawMetric = el.value;
+    const num =
+      typeof rawMetric === "number" ? rawMetric : Number(rawMetric);
+    const finiteMetric = Number.isFinite(num) ? num : 0;
+    const primaryStr =
+      rawMetric === "∞" ? "d=∞" : `d=${String(rawMetric)}`;
+
+    return {
+      isTuple: true,
+      numericMetric: finiteMetric,
+      primaryText: primaryStr,
+      secondaryKey: el.secondary || el.label,
+      tooltip: el.label,
+    };
+  }
+
+  // 2. String tuple fallback e.g. `"(v: 2, d: 6)"`
+  if (typeof el === "string" && el.startsWith("(") && el.endsWith(")")) {
+    const inner = el.slice(1, -1);
+    const parts = inner.split(",").map((s) => s.trim());
+    const sec = parts[0] || "";
+    const pri = parts[1] || parts[0] || el;
+    const numMatch = pri.match(/-?\d+(\.\d+)?/);
+    const num = numMatch ? Number(numMatch[0]) : 0;
+    return {
+      isTuple: true,
+      numericMetric: Number.isFinite(num) ? num : 0,
+      primaryText: pri,
+      secondaryKey: sec,
+      tooltip: el,
+    };
+  }
+
+  // 3. Standard scalar number or string ("∞")
+  const num = typeof el === "number" ? el : Number(el);
+  return {
+    isTuple: false,
+    numericMetric: Number.isFinite(num) ? num : 0,
+    primaryText: String(el),
+  };
 }
 
 export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
@@ -95,8 +160,8 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
         <p className="text-xs text-slate-500 max-w-md mt-1">
           Start a GDB trace or step into a function containing stack arrays (e.g.{" "}
           <code className="text-sky-400">int arr[N]</code>), heap buffers (
-          <code className="text-sky-400">int *v, int n</code>), or struct-embedded
-          ADT buffers (<code className="text-emerald-400">s-&gt;data</code>).
+          <code className="text-sky-400">int *dist</code>), or ADT Priority Queues
+          (<code className="text-amber-400">h-&gt;array</code>).
         </p>
       </div>
     );
@@ -105,13 +170,16 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
   return (
     <div className="flex flex-col gap-6 p-5 overflow-y-auto h-full bg-slate-950">
       {arrays.map((arr) => {
+        const isPriorityQueue =
+          arr.name.includes("Priority Queue") ||
+          (arr.type && arr.type.endsWith("*"));
+        const isReverseMap = arr.name.includes("Reverse Index Map");
         const isStructBuffer =
           arr.name.includes("->") || arr.name.includes(".");
         const ownerStructVar = isStructBuffer
           ? arr.name.split(/->|\./)[0]
           : null;
 
-        // Look up the parent container struct node in graphNodes (e.g. `s` -> `struct stack_t`)
         const ownerNode = ownerStructVar
           ? graphNodes.find((n) => n.pointers?.includes(ownerStructVar))
           : undefined;
@@ -129,14 +197,12 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
             ? (ownerNode.fields.top as number)
             : undefined;
 
-        const numericValues = arr.elements.map((el) => {
-          const parsed = typeof el === "number" ? el : Number(el);
-          return Number.isFinite(parsed) ? parsed : 0;
-        });
+        const parsedCells = arr.elements.map(parseArrayElement);
+        const maxVal = Math.max(
+          ...parsedCells.map((c) => Math.abs(c.numericMetric)),
+          1
+        );
 
-        const maxVal = Math.max(...numericValues.map((v) => Math.abs(v)), 1);
-
-        // Map each valid in-bounds array index [0, length - 1] -> list of active pointer names
         const indexToPointers: Record<number, string[]> = {};
         if (arr.active_indices) {
           Object.entries(arr.active_indices).forEach(([ptrName, idxVal]) => {
@@ -157,7 +223,11 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
           <div
             key={arr.name}
             className={`rounded-xl border p-5 shadow-lg ${
-              isStructBuffer
+              isPriorityQueue
+                ? "bg-slate-900/95 border-amber-500/45"
+                : isReverseMap
+                ? "bg-slate-900/75 border-slate-800"
+                : isStructBuffer
                 ? "bg-slate-900/95 border-emerald-500/40"
                 : "bg-slate-900/90 border-slate-800"
             }`}
@@ -165,7 +235,12 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
             {/* Array Header & Sister Field Metadata */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3 mb-5">
               <div className="flex flex-wrap items-center gap-2.5">
-                {isStructBuffer ? (
+                {isPriorityQueue ? (
+                  <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-500/15 border border-amber-500/40 text-amber-300 font-mono text-xs font-semibold">
+                    <ListOrdered className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Min-Heap ({arr.type || "MinHeapNode*"})</span>
+                  </span>
+                ) : isStructBuffer ? (
                   <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 font-mono text-xs font-semibold">
                     <Database className="w-3.5 h-3.5 text-emerald-400" />
                     <span>ADT Buffer ({arr.type || "int"}*)</span>
@@ -181,11 +256,11 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                 </h3>
 
                 <span className="text-xs text-slate-400 font-mono">
-                  (capacity:{" "}
+                  ({arr.elements.length} active
                   {sisterCapacity !== undefined
-                    ? String(sisterCapacity)
-                    : arr.elements.length}{" "}
-                  slots)
+                    ? ` / capacity: ${String(sisterCapacity)}`
+                    : " elements"}
+                  )
                 </span>
 
                 {ownerNode && (
@@ -229,15 +304,6 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                             ? "opacity-65 line-through"
                             : ""
                         }`}
-                        title={
-                          isEmptyTop
-                            ? "Stack is currently empty (top == -1)"
-                            : isOutOfBounds
-                            ? `Index ${idxVal} is outside [0, ${
-                                arr.elements.length - 1
-                              }]`
-                            : `Pointing to ${arr.name}[${idxVal}]`
-                        }
                       >
                         {ptrName} = {idxVal}
                         {isEmptyTop
@@ -254,33 +320,41 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
 
             {/* Bars + Value Cards Strip */}
             <div className="overflow-x-auto pb-2">
-              <div className="inline-flex items-end gap-3 min-w-full pt-12 pb-2 px-2">
-                {arr.elements.map((rawVal, idx) => {
-                  const numVal = numericValues[idx];
-                  const heightPct = Math.max(
-                    12,
-                    Math.round((Math.abs(numVal) / maxVal) * 100)
-                  );
+              <div className="inline-flex items-end gap-3.5 min-w-full pt-12 pb-2 px-2">
+                {parsedCells.map((cell, idx) => {
+                  const heightPct =
+                    cell.primaryText.includes("∞")
+                      ? 18
+                      : Math.max(
+                          14,
+                          Math.round((Math.abs(cell.numericMetric) / maxVal) * 100)
+                        );
                   const activePtrs = indexToPointers[idx] || [];
                   const isHighlighted = activePtrs.length > 0;
-                  const isTopCell = activePtrs.some(
-                    (p) => p.toLowerCase() === "top"
+                  const isMinRoot =
+                    isPriorityQueue && idx === 0;
+                  const isTopCell = activePtrs.some((p) =>
+                    ["top", "min", "smallest"].includes(p.toLowerCase())
                   );
                   const isMiddleActive = activePtrs.some((p) =>
                     ["middle", "mid", "pivot"].includes(p.toLowerCase())
                   );
-                  const matchesSearchTarget = searchKeyEntries.some(
-                    ([, kVal]) => Number(kVal) === numVal
-                  );
+                  const matchesSearchTarget =
+                    !cell.isTuple &&
+                    searchKeyEntries.some(
+                      ([, kVal]) => Number(kVal) === cell.numericMetric
+                    );
 
-                  // If this is a stack with `top`, dim unallocated/popped slots above `top`
                   const isBeyondStackTop =
                     topIndex !== undefined && idx > topIndex;
 
                   return (
                     <div
                       key={`${arr.name}-idx-${idx}`}
-                      className={`flex flex-col items-center group min-w-[58px] transition-opacity duration-300 ${
+                      title={cell.tooltip}
+                      className={`flex flex-col items-center group ${
+                        cell.isTuple ? "min-w-[76px]" : "min-w-[58px]"
+                      } transition-opacity duration-300 ${
                         isBeyondStackTop && !isHighlighted
                           ? "opacity-45"
                           : "opacity-100"
@@ -302,8 +376,12 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
 
                       {/* Vertical Magnitude Bar Container */}
                       <div
-                        className={`h-36 w-12 bg-slate-950/80 rounded-t-lg border border-b-0 flex items-end p-1 overflow-hidden transition-colors ${
-                          isTopCell || matchesSearchTarget
+                        className={`h-32 ${
+                          cell.isTuple ? "w-14" : "w-12"
+                        } bg-slate-950/80 rounded-t-lg border border-b-0 flex items-end p-1 overflow-hidden transition-colors ${
+                          isMinRoot
+                            ? "border-amber-500/80"
+                            : isTopCell || matchesSearchTarget
                             ? "border-emerald-500/80"
                             : "border-slate-800/90"
                         }`}
@@ -311,23 +389,25 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                         <div
                           style={{ height: `${heightPct}%` }}
                           className={`w-full rounded-t transition-all duration-300 ease-out ${
-                            isTopCell
+                            isMinRoot
+                              ? "bg-gradient-to-t from-amber-600 to-amber-400 shadow-[0_0_14px_rgba(251,191,36,0.5)]"
+                              : isTopCell
                               ? "bg-gradient-to-t from-emerald-600 to-emerald-400 shadow-[0_0_14px_rgba(52,211,153,0.55)]"
                               : isMiddleActive
                               ? "bg-gradient-to-t from-fuchsia-600 to-fuchsia-400 shadow-[0_0_14px_rgba(217,70,239,0.55)]"
                               : isHighlighted
                               ? "bg-gradient-to-t from-sky-600 to-sky-400 shadow-[0_0_12px_rgba(56,189,248,0.45)]"
-                              : matchesSearchTarget
-                              ? "bg-gradient-to-t from-emerald-700 to-emerald-500"
                               : "bg-gradient-to-t from-slate-700 to-slate-500"
                           }`}
                         />
                       </div>
 
-                      {/* Numerical Value Card */}
+                      {/* Value Card (Single Scalar OR Two-Tier Tuple Card for Priority Queue) */}
                       <div
-                        className={`w-full py-2 px-2 text-center font-mono text-sm font-bold border transition-all duration-300 ${
-                          isTopCell
+                        className={`w-full py-1.5 px-2 text-center font-mono border transition-all duration-300 ${
+                          isMinRoot
+                            ? "bg-amber-950/90 border-amber-400 text-amber-100 shadow-md scale-105 z-10"
+                            : isTopCell
                             ? "bg-emerald-950 border-emerald-400 text-emerald-100 shadow-md scale-105 z-10"
                             : isMiddleActive
                             ? "bg-fuchsia-950 border-fuchsia-400 text-fuchsia-100 shadow-md scale-105 z-10"
@@ -338,13 +418,28 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                             : "bg-slate-950 border-slate-800 text-slate-200"
                         }`}
                       >
-                        {String(rawVal)}
+                        {cell.isTuple && cell.secondaryKey ? (
+                          <div className="flex flex-col items-center leading-tight">
+                            <span className="text-[10px] font-bold px-1.5 py-0.2 rounded bg-slate-900/90 text-sky-300 border border-slate-700/80 mb-0.5">
+                              {cell.secondaryKey}
+                            </span>
+                            <span className="text-xs font-extrabold">
+                              {cell.primaryText}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="text-sm font-bold">
+                            {cell.primaryText}
+                          </span>
+                        )}
                       </div>
 
                       {/* Array Index Footer `[idx]` */}
                       <div
                         className={`mt-1.5 text-[11px] font-mono ${
-                          isTopCell
+                          isMinRoot
+                            ? "text-amber-400 font-bold"
+                            : isTopCell
                             ? "text-emerald-400 font-bold"
                             : isMiddleActive
                             ? "text-fuchsia-400 font-bold"

@@ -3,6 +3,7 @@
  * Manages the WebSocket lifecycle (`ws://localhost:8080/ws/trace`),
  * time-travel frame history buffer, auto-play interval timer,
  * and REST Valgrind audit execution (`POST http://localhost:8080/api/analyze/memory`).
+ * Guarantees zero stale state across runs.
  */
 
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
@@ -19,6 +20,7 @@ const REST_VALGRIND_URL =
   "http://localhost:8080/api/analyze/memory";
 
 export interface UseDebugSessionReturn {
+  sessionId: number;
   frames: DebugFrame[];
   stepIndex: number;
   totalSteps: number;
@@ -40,6 +42,7 @@ export interface UseDebugSessionReturn {
   setPlaybackSpeedMs: (speedMs: number) => void;
   runValgrindAudit: (code: string, stdin?: string) => Promise<ValgrindAuditResponse | null>;
   clearValgrindData: () => void;
+  resetSession: () => void;
   clearError: () => void;
 }
 
@@ -89,6 +92,7 @@ function normalizeFrame(raw: Record<string, unknown>, fallbackStep: number): Deb
 }
 
 export function useDebugSession(): UseDebugSessionReturn {
+  const [sessionId, setSessionId] = useState<number>(1);
   const [frames, setFrames] = useState<DebugFrame[]>([]);
   const [stepIndex, setStepIndex] = useState<number>(0);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
@@ -162,14 +166,24 @@ export function useDebugSession(): UseDebugSessionReturn {
     setValgrindData(null);
   }, []);
 
+  const resetSession = useCallback(() => {
+    stop();
+    setSessionId((prev) => prev + 1);
+    setFrames([]);
+    setStepIndex(0);
+    setValgrindData(null);
+    setError(null);
+  }, [stop]);
+
   const startTrace = useCallback(
     (code: string, stdin: string = "") => {
       stop();
-      // Immediately clear stale Valgrind audit report and previous errors on new GDB trace
-      setValgrindData(null);
-      setError(null);
+      // Hard flush of all state from any prior run
+      setSessionId((prev) => prev + 1);
       setFrames([]);
       setStepIndex(0);
+      setValgrindData(null);
+      setError(null);
       setIsConnecting(true);
 
       try {
@@ -283,6 +297,7 @@ export function useDebugSession(): UseDebugSessionReturn {
 
   const runValgrindAudit = useCallback(
     async (code: string, stdin: string = ""): Promise<ValgrindAuditResponse | null> => {
+      // Immediately clear previous Valgrind report before sending HTTP request
       setIsAuditingValgrind(true);
       setValgrindData(null);
       setError(null);
@@ -334,6 +349,7 @@ export function useDebugSession(): UseDebugSessionReturn {
   }, [frames, stepIndex]);
 
   return {
+    sessionId,
     frames,
     stepIndex,
     totalSteps: frames.length,
@@ -355,6 +371,7 @@ export function useDebugSession(): UseDebugSessionReturn {
     setPlaybackSpeedMs,
     runValgrindAudit,
     clearValgrindData,
+    resetSession,
     clearError,
   };
 }

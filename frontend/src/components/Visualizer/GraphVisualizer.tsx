@@ -1,14 +1,6 @@
 /**
  * frontend/src/components/Visualizer/GraphVisualizer.tsx
- * Dual-Mode Cytoscape.js Visualizer:
- * 1. Mathematical Graph Mode (`mode === "abstract_graph"` / `node.type === "Vertex"`):
- *    - Renders circular vertex nodes (`0, 1, ..., V-1`) arranged in a clean geometric polygon/circle
- *    - Displays live shortest-path distance (`dist: 0`, `dist: ∞`) and PQ status (`IN_PQ` vs `SETTLED`)
- *    - Renders weighted undirected/directed edges (`w: 9`) with active relaxation highlighting
- *    - Floating algorithm pointer badges (`u ↓`, `v ↓`, `src ↓`)
- * 2. Raw Pointer Mesh Mode (`mode === "pointer_mesh"`):
- *    - Renders compact memory card nodes (`132x52px`), ADT backing buffers (`int[capacity]`),
- *      and `[FREED / DANGLING]` heap chunks in a left-to-right directed rank layout.
+ * Dual-Mode Cytoscape.js Visualizer with Immediate Canvas Flush on Session Reset.
  */
 
 import React, {
@@ -20,11 +12,12 @@ import React, {
 } from "react";
 import cytoscape, { type Core, type ElementDefinition } from "cytoscape";
 import { type GraphData, type GraphNode } from "../../types/debug";
-import { Share2, RotateCcw, Info, X, AlertOctagon, Network } from "lucide-react";
+import { Share2, RotateCcw, Info, X, AlertOctagon, Network, Loader2 } from "lucide-react";
 
 export interface GraphVisualizerProps {
   graph: GraphData;
   locals?: Record<string, number | string>;
+  isConnecting?: boolean;
 }
 
 interface BadgeOverlayItem {
@@ -39,8 +32,11 @@ interface BadgeOverlayItem {
 const POINTER_PILL_COLORS: Record<string, string> = {
   u: "bg-amber-400 text-slate-950 border-amber-200 shadow-[0_0_12px_rgba(251,191,36,0.6)]",
   v: "bg-fuchsia-500 text-white border-fuchsia-300 shadow-[0_0_12px_rgba(217,70,239,0.55)]",
+  k: "bg-purple-500 text-white border-purple-300",
+  i: "bg-sky-400 text-slate-950 border-sky-200",
+  j: "bg-amber-400 text-slate-950 border-amber-200",
   src: "bg-emerald-400 text-slate-950 border-emerald-200 shadow-[0_0_10px_rgba(52,211,153,0.5)]",
-  "crawl->dest": "bg-cyan-400 text-slate-950 border-cyan-200",
+  target: "bg-cyan-400 text-slate-950 border-cyan-200",
   s: "bg-emerald-500 text-slate-950 border-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.45)]",
   q: "bg-emerald-500 text-slate-950 border-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.45)]",
   head: "bg-emerald-500 text-slate-950 border-emerald-300 shadow-[0_0_10px_rgba(16,185,129,0.45)]",
@@ -52,7 +48,7 @@ const POINTER_PILL_COLORS: Record<string, string> = {
 };
 
 function getPointerPillStyle(ptrName: string): string {
-  if (ptrName.includes("->") && ptrName !== "crawl->dest") {
+  if (ptrName.includes("->")) {
     return "bg-teal-950/95 text-teal-300 border-teal-500/70 shadow-sm";
   }
   const key = ptrName.toLowerCase();
@@ -69,10 +65,6 @@ function isArrayBufferNode(node: GraphNode): boolean {
   );
 }
 
-/**
- * Computes evenly spaced circular polygon coordinates for mathematical graphs (`0 .. V-1`)
- * so weighted edges never overlap behind colinear vertex boxes.
- */
 function computeCircularGraphPositions(
   nodes: GraphNode[]
 ): Record<string, { x: number; y: number }> {
@@ -85,7 +77,6 @@ function computeCircularGraphPositions(
   const radius = Math.max(135, count * 30);
 
   nodes.forEach((n, idx) => {
-    // Start Vertex 0 at top-left (-110 deg) and proceed clockwise
     const angleRad = ((-110 + (idx * 360) / count) * Math.PI) / 180;
     positions[n.id] = {
       x: Math.round(centerX + radius * Math.cos(angleRad)),
@@ -96,9 +87,6 @@ function computeCircularGraphPositions(
   return positions;
 }
 
-/**
- * Computes left-to-right directed rank coordinates for linked lists, trees, and ADT pointer meshes.
- */
 function computeDirectedPositions(
   nodes: GraphNode[],
   edges: Array<{ source: string; target: string; label: string }>
@@ -194,7 +182,10 @@ function computeDirectedPositions(
   return positions;
 }
 
-export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
+export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
+  graph,
+  isConnecting = false,
+}) => {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
   const prevTopologyKeyRef = useRef<string>("");
@@ -257,6 +248,7 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
   }, []);
 
   const topologyKey = useMemo(() => {
+    if (nodes.length === 0) return "";
     const nKeys = nodes
       .map((n) => n.id)
       .sort()
@@ -438,9 +430,19 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
     };
   }, [syncBadgePositions]);
 
+  // Synchronize or hard-flush Cytoscape elements when `nodes`, `edges`, or `isConnecting` changes
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
+
+    // Immediate hard flush when connecting or when graph has 0 nodes
+    if (isConnecting || nodes.length === 0) {
+      cy.elements().remove();
+      prevTopologyKeyRef.current = "";
+      setBadgeOverlays([]);
+      setSelectedNode(null);
+      return;
+    }
 
     const validNodeIds = new Set(nodes.map((n) => n.id));
     const normalizedEdges: Array<{
@@ -460,7 +462,8 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
           target: tgt,
           label: e.label,
           isActive: Boolean(e.is_active),
-          isDirected: e.is_directed !== undefined ? Boolean(e.is_directed) : !isAbstractGraph,
+          isDirected:
+            e.is_directed !== undefined ? Boolean(e.is_directed) : !isAbstractGraph,
         });
       }
     });
@@ -481,7 +484,8 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
       const isFreed = Boolean(n.is_freed);
       const isBuffer = isArrayBufferNode(n);
       const isVertex = n.type === "Vertex" || isAbstractGraph;
-      const isSettled = n.fields?.status === "SETTLED";
+      const isSettled =
+        n.fields?.status === "SETTLED" || n.fields?.status === "REACHED";
       const ptrs = nodePointerMap[n.id] || [];
 
       let displayLabel = "";
@@ -580,6 +584,7 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
     nodePointerMap,
     selectedNode,
     isAbstractGraph,
+    isConnecting,
     syncBadgePositions,
   ]);
 
@@ -638,7 +643,7 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
               <div className="flex items-center gap-1.5">
                 <span className="w-3 h-3 rounded-full bg-emerald-950 border-2 border-emerald-500 inline-block" />
                 <span className="text-emerald-300 font-mono text-[11px]">
-                  Settled Shortest Path
+                  Reached / Settled
                 </span>
               </div>
             </>
@@ -679,17 +684,29 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({ graph }) => {
         </button>
       </div>
 
+      {/* Connecting / Compiling State Overlay */}
+      {isConnecting && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-slate-950/90 z-10 text-slate-300 p-8 text-center">
+          <Loader2 className="w-10 h-10 text-sky-400 animate-spin mb-3" />
+          <p className="text-sm font-mono font-semibold">
+            Compiling &amp; Launching Fresh GDB Session...
+          </p>
+          <p className="text-xs text-slate-500 mt-1">
+            Flushing previous memory mesh and initializing DWARF symbols
+          </p>
+        </div>
+      )}
+
       {/* Empty State */}
-      {nodes.length === 0 && (
+      {!isConnecting && nodes.length === 0 && (
         <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400 p-8 text-center z-0">
           <Share2 className="w-12 h-12 text-slate-600 mb-3 stroke-[1.5]" />
           <p className="text-sm font-medium text-slate-300">
             No Active Graph or Struct Pointers in Scope
           </p>
           <p className="text-xs text-slate-500 max-w-md mt-1">
-            Step through code that allocates a Graph (e.g.{" "}
-            <code className="text-sky-400">Graph *g = create_graph(V)</code>) or
-            struct pointers to visualize vertices, edges, and heap containers.
+            Step through code that defines an Adjacency List, 2D Adjacency Matrix,
+            Edge List, or Heap Struct Pointers to visualize the live topology.
           </p>
         </div>
       )}

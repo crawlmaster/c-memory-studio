@@ -2,10 +2,16 @@
  * frontend/src/types/debug.ts
  */
 
+export interface ArrayTupleElement {
+  label: string;
+  value: number | string;
+  secondary?: string;
+}
+
 export interface ArrayData {
   name: string;
   type?: string;
-  elements: Array<number | string>;
+  elements: Array<number | string | ArrayTupleElement>;
   active_indices: Record<string, number>;
 }
 

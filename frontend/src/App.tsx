@@ -1,9 +1,10 @@
 /**
  * frontend/src/App.tsx
  * Master 50/50 split-pane layout for C-Memory-Studio.
- * - Immediately invalidates stale Valgrind reports when code is edited or a new GDB trace starts.
- * - Passes `graphNodes` to `ArrayVisualizer` so struct-embedded buffers (`s->data`) display
- *   sister container fields (`capacity`, `top`, struct address).
+ * - Immediately flushes stale GDB trace frames, Cytoscape graph nodes, and Valgrind reports
+ *   whenever the user edits code in Monaco or starts a new trace (`resetSession` + `sessionId`).
+ * - Passes `graphNodes` to `ArrayVisualizer` so struct-embedded buffers (`s->data`, `h->array`)
+ *   display sister container fields (`capacity`, `top`, `size`, struct address).
  */
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
@@ -81,6 +82,7 @@ export const App: React.FC = () => {
   const userOverrodeTabRef = useRef<boolean>(false);
 
   const {
+    sessionId,
     stepIndex,
     totalSteps,
     currentFrame,
@@ -100,7 +102,7 @@ export const App: React.FC = () => {
     seekTo,
     setPlaybackSpeedMs,
     runValgrindAudit,
-    clearValgrindData,
+    resetSession,
     clearError,
   } = useDebugSession();
 
@@ -126,18 +128,18 @@ export const App: React.FC = () => {
     }
   }, [currentFrame]);
 
-  // Invalidate stale Valgrind data whenever user edits C code in Monaco
+  // Immediately flush stale GDB frames, graph nodes, and Valgrind reports when code is edited
   const handleCodeChange = useCallback(
     (nextCode: string) => {
       setCode(nextCode);
-      if (valgrindData !== null) {
-        clearValgrindData();
+      if (totalSteps > 0 || valgrindData !== null || isRunning || isConnecting) {
+        resetSession();
       }
       if (highlightedLine !== null) {
         setHighlightedLine(null);
       }
     },
-    [valgrindData, clearValgrindData, highlightedLine]
+    [totalSteps, valgrindData, isRunning, isConnecting, resetSession, highlightedLine]
   );
 
   const handleManualTabSelect = useCallback((tab: StudioTab) => {
@@ -173,8 +175,7 @@ export const App: React.FC = () => {
   }, [code, runValgrindAudit]);
 
   const handleResetDemoCode = useCallback(() => {
-    stop();
-    clearValgrindData();
+    resetSession();
     setHighlightedLine(null);
     setCode(DEFAULT_DEMO_C_CODE);
     try {
@@ -182,7 +183,7 @@ export const App: React.FC = () => {
     } catch {
       // Ignore
     }
-  }, [stop, clearValgrindData]);
+  }, [resetSession]);
 
   const arrayCount = currentFrame?.arrays?.length || 0;
   const graphNodeCount = currentFrame?.graph?.nodes?.length || 0;
@@ -348,6 +349,7 @@ export const App: React.FC = () => {
           <div className="flex-1 min-h-0 relative">
             {activeTab === "arrays" && (
               <ArrayVisualizer
+                key={`arrays-${sessionId}`}
                 arrays={currentFrame?.arrays || []}
                 locals={currentFrame?.stack_frames?.locals}
                 graphNodes={currentFrame?.graph?.nodes || []}
@@ -356,13 +358,16 @@ export const App: React.FC = () => {
 
             {activeTab === "graph" && (
               <GraphVisualizer
+                key={`graph-${sessionId}`}
                 graph={currentFrame?.graph || { nodes: [], edges: [] }}
                 locals={currentFrame?.stack_frames?.locals}
+                isConnecting={isConnecting}
               />
             )}
 
             {activeTab === "valgrind" && (
               <HeapVisualizer
+                key={`valgrind-${sessionId}`}
                 valgrindData={valgrindData}
                 isAuditing={isAuditingValgrind}
                 onRunAudit={handleRunValgrind}
