@@ -2,25 +2,26 @@
 """
 backend/src/debugger/gdb_engine.py
 
-Purely Structural DWARF/GDB-MI Introspection Engine for C-Memory-Studio.
+High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memory-Studio.
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
-Core Capabilities:
-  1. Multi-Frame Call Stack Harvesting: Inspects variables across all active user frames
-     (from leaf function up to `main()`) so caller data structures never vanish during helper calls.
-  2. Algorithmic Complexity Step Filter:
-     - Straight-line O(1) helpers (no `for`/`while`/`do` loops and no recursion) execute atomically via `-exec-next`.
-     - Iterative or recursive functions are stepped into via `-exec-step`.
-  3. Pure DWARF Pointer-Mesh Crawler:
-     - Every allocated struct is keyed by its canonical hex address (`0x...`).
-     - All scalar members are serialized in exact DWARF declaration order (`ptype`).
-     - Struct pointer fields (`T*`), inline pointer arrays (`children[26]`), and dynamic pointer tables
-       (`adj[V]`, `buckets[M]`) emit directed edges (`source`, `target`, `label`) for all non-NULL slots.
-  4. Generic Compound Struct-Array & Primitive Buffer Inspector:
-     - Non-linked struct arrays (`Type[N]`, `Type*`, `Type**`) emit compound element records containing
-       all scalar DWARF fields in declaration order without synthetic labels or fake indices.
-  5. Syntactic Subscript & Induction Proof Engine:
-     - Binds integer variables to `active_indices` strictly via syntactic subscript/induction proof in `target.c`.
+Resolved Capabilities:
+  1. Session-Level DWARF Struct Schema Caching (`_type_cache` with `ptype /o`):
+     - Queries GDB at most once per unique C type per session.
+  2. Multi-Level Pointer & Stack Matrix Introspection:
+     - Top-level `T**` struct pointer tables (e.g. `UFNode **nodes`) are dereferenced safely
+       and seeded into the pointer-mesh crawler (`nodes[0] .. nodes[N-1]`).
+     - Multi-dimensional stack arrays (`T [N][M]`) and heap row-pointer matrices (`T **mat`)
+       are extracted into structured 2D matrix rows (`mat[0] .. mat[N-1]`).
+  3. Non-Shadowed Recursive Root Retention:
+     - Preserves non-NULL struct roots from outer frames (`main`) even when inner recursive
+       frames (`insert(root, ...)`, `free_tree(root)`) shadow the same parameter name with `NULL`
+       or a child pointer, completely eliminating recursion canvas wipes.
+  4. Agnostic Forest / Disjoint-Set Index Buffer Detection:
+     - Detects 1D integer buffers (`[0, size - 1]`) that exhibit syntactic self-indexing
+       (`buf[buf[...]]` or `x = buf[x]`) and emits directed forest edges `i -> buf[i]`
+       when no pointer-based graph nodes exist.
+  5. Step Budget: `MAX_STEPS = 1500`.
 """
 
 import asyncio
@@ -28,6 +29,7 @@ import os
 import re
 import subprocess
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -39,10 +41,11 @@ from pygdbmi.gdbcontroller import GdbController
 # ==============================================================================
 
 TMPFS_ROOT = Path(os.getenv("TMPFS_PATH", "/sandbox/workspace"))
-MAX_STEPS = 2000
-SESSION_TIMEOUT_SEC = 30.0
+MAX_STEPS = 1500
+SESSION_TIMEOUT_SEC = 45.0
 STEP_INACTIVITY_TIMEOUT_SEC = 3.0
 MAX_ARRAY_ELEMENTS = 256
+MAX_MATRIX_DIM = 16
 MAX_STRUCT_BUFFER_ELEMENTS = 64
 MAX_GRAPH_NODES = 48
 INF_SENTINEL_VALUES = {2147483647, 1061109567, 1000000000, 999999999, 999999, 99999, 65535}
@@ -97,6 +100,19 @@ USER_FUNC_CALL_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
 
 
 # ==============================================================================
+# Session-Level DWARF Type Cache Schema
+# ==============================================================================
+
+@dataclass
+class DwarfTypeEntry:
+    kind: str  # "primitive", "primitive_ptr", "primitive_ptr_array", "struct_val", "struct_ptr", "struct_ptr_array", "other"
+    target_type: str
+    fields: Dict[str, str] = field(default_factory=dict)
+    field_order: List[str] = field(default_factory=list)
+    has_struct_links: Optional[bool] = None
+
+
+# ==============================================================================
 # Clean Pydantic Data Contract
 # ==============================================================================
 
@@ -119,12 +135,14 @@ class GraphNode(BaseModel):
     is_active: bool
     is_freed: bool = False
     pointers: List[str] = Field(default_factory=list)
+    self_ref_order: List[str] = Field(default_factory=list)
 
 
 class GraphEdge(BaseModel):
     source: str
     target: str
     label: str
+    field_order_idx: int = 0
 
 
 class GraphSnapshot(BaseModel):
@@ -206,7 +224,6 @@ def format_scalar_val(val: Any) -> Any:
 
 
 def split_top_level_braces(inner: str) -> List[str]:
-    """Splits a comma-separated GDB string at brace depth 0."""
     tokens: List[str] = []
     current: List[str] = []
     depth = 0
@@ -274,7 +291,7 @@ def parse_gdb_struct_body(raw_val: str) -> Dict[str, str]:
 
 
 # ==============================================================================
-# Purely Structural DWARF/GDB-MI Session Controller (`GDBTracer`)
+# High-Throughput DWARF/GDB-MI Session Controller (`GDBTracer`)
 # ==============================================================================
 
 class GDBTracer:
@@ -299,21 +316,25 @@ class GDBTracer:
             self._source_lines.extend(raw_text.splitlines())
             self._full_clean_source = C_COMMENTS_AND_STRINGS_RE.sub(" ", raw_text)
 
-        self._type_resolution_cache: Dict[str, Tuple[str, str]] = {}
-        self._struct_field_types_cache: Dict[str, Dict[str, str]] = {}
-        self._struct_has_links_cache: Dict[str, bool] = {}
+        self._type_cache: Dict[str, DwarfTypeEntry] = {}
         self._freed_addresses: Set[str] = set()
         self._last_valid_node_fields: Dict[str, Dict[str, Any]] = {}
+
+        # Per-function variable snapshot cache for caller frames
+        self._frame_vars_by_func: Dict[str, List[Dict[str, str]]] = {}
+        self._active_call_stack: List[str] = ["main"]
 
         # Syntactic analysis caches
         self._syntactic_index_cache: Dict[Tuple[str, str], Set[str]] = {}
         self._func_body_cache: Dict[str, str] = {}
         self._func_complexity_cache: Dict[str, bool] = {}
         self._alloc_bound_expr_cache: Dict[str, List[str]] = {}
+        self._self_indexed_buffers_cache: Dict[str, bool] = {}
 
         self._current_line: int = 0
         self._current_file: str = ""
         self._current_func: str = "main"
+        self._token_counter: int = 100
 
     def start(self) -> bool:
         now = time.monotonic()
@@ -328,11 +349,11 @@ class GDBTracer:
                 "--interpreter=mi3",
                 str(self.binary_path),
             ],
-            time_to_check_for_additional_output_sec=0.003,
+            time_to_check_for_additional_output_sec=0.001,
         )
         self.gdb.get_gdb_response(timeout_sec=1.0, raise_error_on_timeout=False)
 
-        for cmd in (
+        startup_cmds = [
             "-gdb-set disable-randomization on",
             "-gdb-set print pretty off",
             "-gdb-set print address on",
@@ -341,13 +362,12 @@ class GDBTracer:
             "-gdb-set print repeats 0",
             "-gdb-set confirm off",
             "-gdb-set pagination off",
-        ):
-            self._cmd(cmd)
-
+        ]
         if self.stdin_path and self.stdin_path.exists():
-            self._cmd(f'-gdb-set args < "{self.stdin_path}"')
+            startup_cmds.append(f'-gdb-set args < "{self.stdin_path}"')
+        startup_cmds.append("-break-insert main")
 
-        self._cmd("-break-insert main")
+        self._cmd("\n".join(startup_cmds))
         run_res = self._cmd("-exec-run", timeout=STEP_INACTIVITY_TIMEOUT_SEC)
         return not self._update_stop_state(run_res)
 
@@ -398,6 +418,44 @@ class GDBTracer:
                     return None
         return None
 
+    def _eval_expr_batch(self, exprs: List[str]) -> Dict[str, Optional[str]]:
+        if not exprs:
+            return {}
+        if len(exprs) == 1:
+            return {exprs[0]: self._eval_expr(exprs[0])}
+
+        unique_exprs = list(dict.fromkeys(exprs))
+        token_to_expr: Dict[int, str] = {}
+        batched_lines: List[str] = []
+
+        for expr in unique_exprs:
+            self._token_counter += 1
+            tok = self._token_counter
+            token_to_expr[tok] = expr
+            escaped = expr.replace('"', '\\"')
+            batched_lines.append(f'{tok}-data-evaluate-expression "{escaped}"')
+
+        responses = self._cmd("\n".join(batched_lines))
+        results: Dict[str, Optional[str]] = {e: None for e in unique_exprs}
+
+        for r in responses:
+            if r.get("type") == "result":
+                tok_val = r.get("token")
+                if tok_val is not None:
+                    try:
+                        tok_int = int(tok_val)
+                    except (ValueError, TypeError):
+                        continue
+                    expr_key = token_to_expr.get(tok_int)
+                    if expr_key is not None and r.get("message") == "done":
+                        payload = r.get("payload", {})
+                        if isinstance(payload, dict) and "value" in payload:
+                            val = str(payload["value"])
+                            if "Cannot access memory" not in val and "<optimized out>" not in val:
+                                results[expr_key] = val
+
+        return results
+
     def _update_stop_state(self, responses: List[Dict[str, Any]]) -> bool:
         for r in responses:
             if r.get("type") == "notify" and r.get("message") == "stopped":
@@ -428,24 +486,37 @@ class GDBTracer:
                     }:
                         return True
 
+                    prev_func = self._current_func
                     self._current_func = func or "main"
                     self._current_file = Path(file_raw).name if file_raw else ""
                     try:
                         self._current_line = int(line_raw)
                     except (ValueError, TypeError):
                         self._current_line = 0
+
+                    if self._current_func != prev_func:
+                        if self._current_func in self._active_call_stack:
+                            idx = self._active_call_stack.index(self._current_func)
+                            for popped_fn in self._active_call_stack[idx + 1 :]:
+                                self._frame_vars_by_func.pop(popped_fn, None)
+                            self._active_call_stack = self._active_call_stack[: idx + 1]
+                        else:
+                            self._active_call_stack.append(self._current_func)
                 return False
         return False
 
     def _record_pending_free_on_current_line(self) -> None:
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line].split("//")[0]
-            for match in FREE_CALL_RE.finditer(src_line):
-                ptr_expr = match.group(1).strip()
-                raw_addr = self._eval_expr(ptr_expr)
-                addr = extract_hex_address(raw_addr or "")
-                if addr and self._is_valid_heap_or_data_address(addr):
-                    self._freed_addresses.add(addr)
+            free_exprs = [
+                m.group(1).strip() for m in FREE_CALL_RE.finditer(src_line)
+            ]
+            if free_exprs:
+                eval_map = self._eval_expr_batch(free_exprs)
+                for raw_addr in eval_map.values():
+                    addr = extract_hex_address(raw_addr or "")
+                    if addr and self._is_valid_heap_or_data_address(addr):
+                        self._freed_addresses.add(addr)
 
     def _is_declared_on_current_line(self, var_name: str, line_num: int) -> bool:
         if not (1 <= line_num < len(self._source_lines)):
@@ -454,22 +525,18 @@ class GDBTracer:
         if src_line.startswith("for ") or src_line.startswith("for("):
             return False
         decl_pattern = (
-            rf"^(?:struct\s+[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*)\s*\*?\s*"
-            rf"\b{re.escape(var_name)}\s*="
+            rf"^(?:struct\s+[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*)\s*\*?\*?\s*"
+            rf"\b{re.escape(var_name)}\s*(?:\[[^\]]*\])*\s*="
         )
         return bool(re.search(decl_pattern, src_line))
 
     # ==========================================================================
-    # Algorithmic Complexity Step Filter (Replaces Hardcoded Function Names)
+    # Algorithmic Complexity Step Filter
     # ==========================================================================
 
     def _extract_function_body_by_name(
         self, func_name: str, anchor_line: Optional[int] = None
     ) -> str:
-        """
-        Extracts the brace-balanced C function body `{ ... }` for `func_name`
-        from `self._source_lines`, stripping comments and string literals.
-        """
         if func_name in self._func_body_cache:
             return self._func_body_cache[func_name]
 
@@ -491,7 +558,6 @@ class GDBTracer:
             for line_idx in range(1, total_lines):
                 line_clean = self._source_lines[line_idx].split("//")[0].strip()
                 if func_def_re.search(line_clean) and not line_clean.endswith(";"):
-                    # Verify this is a definition (followed by `{` on this or next line)
                     next_line = (
                         self._source_lines[line_idx + 1].split("//")[0].strip()
                         if line_idx + 1 < total_lines
@@ -524,20 +590,12 @@ class GDBTracer:
 
         raw_body = "\n".join(raw_chunk_lines)
         cleaned_body = C_COMMENTS_AND_STRINGS_RE.sub(" ", raw_body)
-        # Strip the function signature prior to the first `{` so self-call detection only checks the body
         first_brace = cleaned_body.find("{")
         inner_body = cleaned_body[first_brace:] if first_brace != -1 else cleaned_body
         self._func_body_cache[func_name] = inner_body
         return inner_body
 
     def _is_complex_user_function(self, func_name: str) -> bool:
-        """
-        Determines purely from the AST/token structure of `func_name` whether it should be
-        stepped into (`-exec-step`) vs stepped over atomically (`-exec-next`):
-          - Straight-line O(1) functions with NO loops (`for`, `while`, `do`) and NO recursive
-            self-calls return `False` (stepped over with `-exec-next`).
-          - Functions containing loops or recursion return `True` (stepped into with `-exec-step`).
-        """
         if func_name in self._func_complexity_cache:
             return self._func_complexity_cache[func_name]
 
@@ -546,10 +604,7 @@ class GDBTracer:
             self._func_complexity_cache[func_name] = False
             return False
 
-        # Check for iterative loops (`for`, `while`, `do`)
         has_loop = bool(C_LOOP_STATEMENT_RE.search(body))
-
-        # Check for recursive self-call inside body
         self_call_re = re.compile(rf"\b{re.escape(func_name)}\s*\(")
         has_recursion = bool(self_call_re.search(body))
 
@@ -612,7 +667,7 @@ class GDBTracer:
         )
 
     # ==========================================================================
-    # Syntactic Subscript, Loop Induction & Allocation Bound Proof Engine
+    # Syntactic Subscript, Loop Induction & Self-Indexed Forest Proof Engine
     # ==========================================================================
 
     @staticmethod
@@ -629,20 +684,44 @@ class GDBTracer:
             idents.add(token)
         return idents
 
+    def _is_syntactically_self_indexed_buffer(self, buf_leaf_name: str) -> bool:
+        """
+        Detects purely from the C grammar of `target.c` whether a 1D integer buffer
+        `buf_leaf_name` represents a parent/next-index forest (e.g. Disjoint Set Union
+        or static linked list) where elements are used as indices into the same buffer:
+          - Nested self-subscript: `buf[... buf[...] ...]`
+          - Transitive self-traversal: `x = ... buf[x] ...` inside a loop (`while`/`for`)
+          - Identity initialization: `buf[i] = i`
+        Zero variable names are hardcoded.
+        """
+        clean_leaf = buf_leaf_name.split("->")[-1].split(".")[-1].strip()
+        if clean_leaf in self._self_indexed_buffers_cache:
+            return self._self_indexed_buffers_cache[clean_leaf]
+
+        esc = re.escape(clean_leaf)
+        src = self._full_clean_source
+
+        # 1. Nested self-subscript: `buf[... buf[ ... ] ...]`
+        nested_re = re.compile(rf"\b{esc}\s*\[[^\]]*\b{esc}\s*\[")
+        # 2. Identity initialization: `buf[var] = var;`
+        ident_init_re = re.compile(rf"\b{esc}\s*\[\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\]\s*=\s*\1\s*;")
+        # 3. Self-traversal comparison: `var != ... buf[var]` or `var == ... buf[var]`
+        self_cmp_re = re.compile(rf"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:!=|==)\s*[^;]*\b{esc}\s*\[\s*\1\s*\]")
+
+        is_forest_buf = bool(
+            nested_re.search(src)
+            or ident_init_re.search(src)
+            or self_cmp_re.search(src)
+        )
+        self._self_indexed_buffers_cache[clean_leaf] = is_forest_buf
+        return is_forest_buf
+
     def _get_syntactically_proven_indices(
         self,
         func_name: str,
         anchor_line: int,
         array_name: str,
     ) -> Set[str]:
-        """
-        Returns the set of variable identifiers syntactically proven to act as indices
-        for `array_name` inside `func_name`:
-          1. Direct Subscript Access: `arr[expr]` or `s->data[expr]`
-          2. Pointer Offset Dereference: `*(arr + expr)` or `*(expr + arr)`
-          3. Loop Induction Header: `for (...; var < ...; ...var...)` when `arr` is accessed
-          4. Transitive Index Dataflow: `middle = low + (high - low) / 2`, `low = middle + 1`
-        """
         clean_arr_name = array_name.strip()
         cache_key = (func_name, clean_arr_name)
         if cache_key in self._syntactic_index_cache:
@@ -660,7 +739,6 @@ class GDBTracer:
         proven_indices: Set[str] = set()
         owner_tokens: Set[str] = set(clean_arr_name.replace("->", ".").split("."))
 
-        # Proof 1: Direct Subscript Access `arr[sub_expr]`
         subscript_pattern = re.compile(
             rf"(?:{escaped_full}|\b{escaped_leaf})\s*\[([^\]]+)\]"
         )
@@ -670,7 +748,6 @@ class GDBTracer:
                 if ident not in owner_tokens:
                     proven_indices.add(ident)
 
-        # Proof 2: Pointer Offset Dereference `*(arr + offset_expr)`
         ptr_arith_pattern = re.compile(
             rf"\*\s*\(\s*(?:(?:{escaped_full}|\b{escaped_leaf})\s*[\+\-]\s*([^\)]+)|([^\)]+?)\s*\+\s*(?:{escaped_full}|\b{escaped_leaf}))\s*\)"
         )
@@ -680,7 +757,6 @@ class GDBTracer:
                 if ident not in owner_tokens:
                     proven_indices.add(ident)
 
-        # Proof 3: Loop Induction Variable in `for (init; cond; step)` when `arr` is in scope
         if re.search(rf"(?:{escaped_full}|\b{escaped_leaf})\b", body):
             for match in FOR_HEADER_RE.finditer(body):
                 cond_part = match.group(2)
@@ -691,7 +767,6 @@ class GDBTracer:
                     if ind_var not in owner_tokens:
                         proven_indices.add(ind_var)
 
-        # Proof 4: Transitive Index Dataflow
         assignment_re = re.compile(
             r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\+|-|\*|/)?=(?!=)\s*([^;]+);"
         )
@@ -766,10 +841,6 @@ class GDBTracer:
         return active
 
     def _get_global_field_subscript_cursors(self, field_name: str) -> Set[str]:
-        """
-        Finds all struct member identifiers that appear inside `->field_name[...]` or `.field_name[...]`
-        across the entire C program (e.g. `s->data[s->top]` proves `top` is a cursor for `data`).
-        """
         global_cache_key = ("__GLOBAL_STRUCT_BUF__", field_name)
         if global_cache_key not in self._syntactic_index_cache:
             sub_re = re.compile(rf"(?:->|\.)\s*{re.escape(field_name)}\s*\[([^\]]+)\]")
@@ -813,29 +884,17 @@ class GDBTracer:
         sister_scalars: Dict[str, int],
         frame_scalars: Dict[str, int],
     ) -> Optional[int]:
-        """
-        Infers the element count of a dynamically allocated pointer (`ptr_leaf_name`)
-        purely from syntactic evidence and structural relationships (zero hardcoded names):
-          1. Syntactic `malloc`/`calloc`/`realloc` inspection: extracts the count identifier
-             from `ptr = malloc(COUNT * sizeof(...))` or `ptr = calloc(COUNT, sizeof(...))`.
-          2. Loop upper bound inspection: `var < BOUND` where `var` indexes `ptr[var]`.
-          3. Structural sister scalar fallback: for a struct-embedded buffer (`s->data`),
-             picks any positive sister integer field that is NOT a subscript cursor for `ptr_leaf_name`
-             (or if all sister fields are cursors, uses `cursor + 1`).
-        """
         if ptr_leaf_name not in self._alloc_bound_expr_cache:
             candidates: List[str] = []
             esc = re.escape(ptr_leaf_name)
-            # Match `ptr = (cast)malloc(EXPR * sizeof...)` or `calloc(EXPR, ...)`
             alloc_re = re.compile(
-                rf"\b{esc}\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(\s*([^,\)\*]+)"
+                rf"\b{esc}\s*(?:\[[^\]]+\])?\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(\s*([^,\)\*]+)"
             )
             for m in alloc_re.finditer(self._full_clean_source):
                 for ident in self._extract_identifiers_from_expr(m.group(1)):
                     if ident not in candidates:
                         candidates.append(ident)
 
-            # Also check `< BOUND` in loops that subscript `ptr_leaf_name`
             bound_re = re.compile(rf"<\s*([a-zA-Z_][a-zA-Z0-9_]*)\b")
             for m in bound_re.finditer(self._full_clean_source):
                 ident = m.group(1)
@@ -847,25 +906,20 @@ class GDBTracer:
         bound_candidates = self._alloc_bound_expr_cache[ptr_leaf_name]
         proven_cursors = self._get_global_field_subscript_cursors(ptr_leaf_name)
 
-        # 1. Check sister scalars in the same struct that match syntactic bound expressions
         for cand in bound_candidates:
             if cand in sister_scalars and cand not in proven_cursors:
                 val = sister_scalars[cand]
                 if 1 <= val <= 4096:
                     return min(val, MAX_STRUCT_BUFFER_ELEMENTS)
 
-        # 2. Check non-cursor sister scalars in the same struct (e.g. `capacity` or `size` or `V`)
         non_cursor_sisters = [
             val
             for k, val in sister_scalars.items()
             if k not in proven_cursors and 1 <= val <= 4096
         ]
         if non_cursor_sisters:
-            # Prefer the smallest positive bound (active size) if multiple non-cursor bounds exist,
-            # or the sole positive bound (capacity).
             return min(min(non_cursor_sisters), MAX_STRUCT_BUFFER_ELEMENTS)
 
-        # 3. Check frame scalars matching syntactic allocation/loop bounds
         local_proven_cursors = self._get_syntactically_proven_indices(
             self._current_func, self._current_line, ptr_leaf_name
         )
@@ -875,13 +929,11 @@ class GDBTracer:
                 if 1 <= val <= MAX_ARRAY_ELEMENTS:
                     return val
 
-        # 4. Fallback to any non-cursor positive integer in frame scope (if top-level pointer)
         if not sister_scalars:
             for k, val in frame_scalars.items():
                 if k not in local_proven_cursors and 1 <= val <= MAX_ARRAY_ELEMENTS:
                     return val
 
-        # 5. Last resort for struct buffers: if only a cursor sister field is >= 0, read up to `cursor + 1`
         for k, val in sister_scalars.items():
             if k in proven_cursors and 0 <= val < MAX_STRUCT_BUFFER_ELEMENTS:
                 return val + 1
@@ -889,72 +941,68 @@ class GDBTracer:
         return None
 
     # ==========================================================================
-    # DWARF Type & Struct Topology Classification
+    # Session-Level DWARF Type Cache (`ptype /o`)
     # ==========================================================================
 
     def _resolve_type_info(self, raw_type: str) -> Tuple[str, str]:
-        """
-        Resolves any C type via DWARF `ptype` into `(category, target_c_type)`:
-          - `("struct_ptr_array", "struct Node")` -> for `Node **` or `struct Node **`
-          - `("primitive_ptr_array", "int")`      -> for `int **`
-          - `("struct_ptr", "struct stack_t")`    -> for `struct Node *` or pointer-typedef
-          - `("struct_val", "struct stack_t")`    -> for `struct Node` by value
-          - `("primitive_ptr", "int")`            -> for `int *`, `double *`
-          - `("primitive", "int")`                -> for `int`, `size_t`, etc.
-          - `("other", raw_type)`
-        """
         clean = raw_type.replace("const", "").replace("volatile", "").strip()
-        if clean in self._type_resolution_cache:
-            return self._type_resolution_cache[clean]
+        if clean in self._type_cache:
+            entry = self._type_cache[clean]
+            return (entry.kind, entry.target_type)
 
         if clean in PRIMITIVE_TYPES:
-            res = ("primitive", clean)
-            self._type_resolution_cache[clean] = res
-            return res
+            entry = DwarfTypeEntry(kind="primitive", target_type=clean)
+            self._type_cache[clean] = entry
+            return (entry.kind, entry.target_type)
 
         if clean.endswith("**"):
             base_no_stars = clean.rstrip("*").strip()
             if base_no_stars in PRIMITIVE_TYPES:
-                res = ("primitive_ptr_array", base_no_stars)
-                self._type_resolution_cache[clean] = res
-                return res
+                entry = DwarfTypeEntry(kind="primitive_ptr_array", target_type=base_no_stars)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
             base_kind, base_resolved = self._resolve_type_info(base_no_stars)
             if base_kind == "struct_val":
-                res = ("struct_ptr_array", base_resolved)
-                self._type_resolution_cache[clean] = res
-                return res
+                entry = DwarfTypeEntry(kind="struct_ptr_array", target_type=base_resolved)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
 
         ptr_match = PTR_TYPE_RE.match(clean)
         if ptr_match:
             base = ptr_match.group(1).strip()
             if base in PRIMITIVE_TYPES:
-                res = ("primitive_ptr", base)
-                self._type_resolution_cache[clean] = res
-                return res
+                entry = DwarfTypeEntry(kind="primitive_ptr", target_type=base)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
             if base.startswith("struct ") and not base.endswith("*"):
                 self._ensure_struct_field_types(base)
-                res = ("struct_ptr", base)
-                self._type_resolution_cache[clean] = res
-                return res
+                entry = DwarfTypeEntry(kind="struct_ptr", target_type=base)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
             base_kind, base_resolved = self._resolve_type_info(base)
             if base_kind == "struct_val":
-                res = ("struct_ptr", base_resolved)
-                self._type_resolution_cache[clean] = res
-                return res
+                entry = DwarfTypeEntry(kind="struct_ptr", target_type=base_resolved)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
             if base_kind == "struct_ptr":
-                res = ("struct_ptr_array", base_resolved)
-                self._type_resolution_cache[clean] = res
-                return res
+                entry = DwarfTypeEntry(kind="struct_ptr_array", target_type=base_resolved)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
             if base_kind == "primitive_ptr":
-                res = ("primitive_ptr_array", base_resolved)
-                self._type_resolution_cache[clean] = res
-                return res
+                entry = DwarfTypeEntry(kind="primitive_ptr_array", target_type=base_resolved)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
 
         if clean.startswith("struct ") and not clean.endswith("*"):
-            self._ensure_struct_field_types(clean)
-            res = ("struct_val", clean)
-            self._type_resolution_cache[clean] = res
-            return res
+            fields = self._ensure_struct_field_types(clean)
+            entry = DwarfTypeEntry(
+                kind="struct_val",
+                target_type=clean,
+                fields=fields,
+                field_order=list(fields.keys()),
+            )
+            self._type_cache[clean] = entry
+            return (entry.kind, entry.target_type)
 
         responses = self._cmd(f"ptype {clean}")
         full_console = "".join(
@@ -968,39 +1016,91 @@ class GDBTracer:
             canonical_struct = (
                 header_match.group(1).strip() if header_match else f"struct {clean}"
             )
-            self._parse_and_cache_ptype_fields(canonical_struct, full_console)
-            if canonical_struct != clean:
-                self._struct_field_types_cache[clean] = (
-                    self._struct_field_types_cache[canonical_struct]
+            parsed_fields = self._parse_ptype_fields(full_console)
+
+            if canonical_struct not in self._type_cache:
+                self._type_cache[canonical_struct] = DwarfTypeEntry(
+                    kind="struct_val",
+                    target_type=canonical_struct,
+                    fields=parsed_fields,
+                    field_order=list(parsed_fields.keys()),
                 )
+            else:
+                self._type_cache[canonical_struct].fields = parsed_fields
+                self._type_cache[canonical_struct].field_order = list(parsed_fields.keys())
 
             brace_end = full_console.rfind("}")
             tail = full_console[brace_end + 1 :].strip() if brace_end != -1 else ""
             if "**" in tail:
-                res = ("struct_ptr_array", canonical_struct)
+                kind = "struct_ptr_array"
             elif "*" in tail:
-                res = ("struct_ptr", canonical_struct)
+                kind = "struct_ptr"
             else:
-                res = ("struct_val", canonical_struct)
-            self._type_resolution_cache[clean] = res
-            return res
+                kind = "struct_val"
 
-        res = ("other", clean)
-        self._type_resolution_cache[clean] = res
-        return res
+            entry = DwarfTypeEntry(
+                kind=kind,
+                target_type=canonical_struct,
+                fields=parsed_fields,
+                field_order=list(parsed_fields.keys()),
+            )
+            self._type_cache[clean] = entry
+            return (entry.kind, entry.target_type)
+
+        entry = DwarfTypeEntry(kind="other", target_type=clean)
+        self._type_cache[clean] = entry
+        return (entry.kind, entry.target_type)
+
+    def _ensure_struct_field_types(self, struct_type: str) -> Dict[str, str]:
+        clean = struct_type.replace("const", "").replace("volatile", "").strip()
+        if clean in self._type_cache and self._type_cache[clean].fields:
+            return self._type_cache[clean].fields
+
+        responses = self._cmd(f"ptype {clean}")
+        full_console = "".join(
+            r.get("payload", "") for r in responses if r.get("type") == "console"
+        )
+        parsed_fields = self._parse_ptype_fields(full_console)
+        if clean in self._type_cache:
+            self._type_cache[clean].fields = parsed_fields
+            self._type_cache[clean].field_order = list(parsed_fields.keys())
+        else:
+            self._type_cache[clean] = DwarfTypeEntry(
+                kind="struct_val",
+                target_type=clean,
+                fields=parsed_fields,
+                field_order=list(parsed_fields.keys()),
+            )
+        return parsed_fields
+
+    @staticmethod
+    def _parse_ptype_fields(ptype_output: str) -> Dict[str, str]:
+        field_map: Dict[str, str] = {}
+        brace_start = ptype_output.find("{")
+        brace_end = ptype_output.rfind("}")
+        if brace_start != -1 and brace_end > brace_start:
+            body = ptype_output[brace_start + 1 : brace_end]
+            for raw_line in body.splitlines():
+                # Strip ptype /o offset comments `/* 0 | 4 */` if present
+                clean_line = re.sub(r"/\*.*?\*/", "", raw_line).strip().rstrip(";")
+                if not clean_line:
+                    continue
+                m = re.match(
+                    r"^(.+?[\s\*]+)([a-zA-Z_][a-zA-Z0-9_]*)(\[\d+\])?$", clean_line
+                )
+                if m:
+                    f_type = m.group(1).strip()
+                    f_name = m.group(2).strip()
+                    arr_suffix = m.group(3) or ""
+                    field_map[f_name] = f"{f_type}{arr_suffix}"
+        return field_map
 
     def _has_struct_pointer_links(self, struct_type: str) -> bool:
-        """
-        Pure DWARF structural check: returns True if `struct_type` contains at least one
-        pointer or pointer-array member targeting a struct (e.g. linked list node, tree node,
-        trie node with `children[26]`, or graph container).
-        Returns False if `struct_type` consists purely of scalar primitives (e.g. a tuple
-        `{int v; int dist;}` or `{int u; int v; int w;}`).
-        """
-        if struct_type in self._struct_has_links_cache:
-            return self._struct_has_links_cache[struct_type]
+        clean = struct_type.replace("const", "").replace("volatile", "").strip()
+        if clean in self._type_cache and self._type_cache[clean].has_struct_links is not None:
+            return bool(self._type_cache[clean].has_struct_links)
 
-        f_types = self._ensure_struct_field_types(struct_type)
+        f_types = self._ensure_struct_field_types(clean)
         has_links = False
         for f_decl in f_types.values():
             arr_m = FIXED_ARR_RE.match(f_decl)
@@ -1010,7 +1110,8 @@ class GDBTracer:
                 has_links = True
                 break
 
-        self._struct_has_links_cache[struct_type] = has_links
+        if clean in self._type_cache:
+            self._type_cache[clean].has_struct_links = has_links
         return has_links
 
     def _is_field_pointer_type(
@@ -1037,65 +1138,74 @@ class GDBTracer:
 
         return (False, "primitive", clean_type or "int")
 
-    def _collect_all_frame_variables(self) -> Tuple[List[str], List[Dict[str, Any]]]:
-        frame_res = self._cmd("-stack-list-frames")
-        user_frames: List[Tuple[int, str, int]] = []
-        call_stack: List[str] = []
-
-        for r in frame_res:
+    def _collect_fast_frame_variables(self) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """
+        Queries the active leaf frame via `-stack-list-variables --simple-values` and
+        merges caller-frame variables from `self._frame_vars_by_func`.
+        CRITICAL FIX FOR RECURSION (Snippet 3):
+        When a recursive function (`insert(BSTNode *root, int data)`) has a parameter with
+        the SAME name (`root`) as `main`'s root pointer, `seen_var_names` previously dropped
+        `main`'s `root`! When the recursive call hit `root == NULL`, the entire tree vanished!
+        Now, non-NULL caller pointer variables with colliding names are preserved under
+        `caller_fn:var_name` (e.g. `main:root`), keeping the full tree anchored at all times.
+        """
+        var_res = self._cmd("-stack-list-variables --simple-values")
+        current_frame_vars: List[Dict[str, str]] = []
+        for r in var_res:
             if r.get("type") == "result" and r.get("message") == "done":
-                stack_payload = r.get("payload", {}).get("stack", [])
-                for f_entry in stack_payload:
-                    f = f_entry.get("frame", f_entry) if isinstance(f_entry, dict) else {}
-                    func = f.get("func", "")
-                    file_raw = f.get("file") or f.get("fullname") or ""
-                    level = int(f.get("level", 0))
-                    line = int(f.get("line", 0)) if "line" in f else 0
-                    if func in {"__libc_start_call_main", "__libc_start_main", "_start"}:
-                        continue
-                    if Path(file_raw).name == self.source_path.name:
-                        user_frames.append((level, func, line))
+                current_frame_vars = r.get("payload", {}).get("variables", [])
                 break
 
-        if not user_frames:
-            user_frames = [(0, self._current_func, self._current_line)]
+        filtered_leaf_vars: List[Dict[str, str]] = []
+        for v in current_frame_vars:
+            v_name = v.get("name", "")
+            if not v_name or self._is_declared_on_current_line(v_name, self._current_line):
+                continue
+            filtered_leaf_vars.append(v)
 
-        call_stack = [fn for _, fn, _ in reversed(user_frames)]
+        self._frame_vars_by_func[self._current_func] = filtered_leaf_vars
+
         merged_vars: List[Dict[str, Any]] = []
         seen_var_names: Set[str] = set()
+        seen_pointer_addrs: Set[str] = set()
 
-        for level, _, frame_line in user_frames:
-            if level != 0:
-                self._cmd(f"-stack-select-frame {level}")
+        for v in filtered_leaf_vars:
+            v_name = v.get("name", "")
+            seen_var_names.add(v_name)
+            addr = extract_hex_address(v.get("value", ""))
+            if addr:
+                seen_pointer_addrs.add(addr)
+            v_copy: Dict[str, Any] = dict(v)
+            v_copy["frame_level"] = 0
+            merged_vars.append(v_copy)
 
-            var_res = self._cmd("-stack-list-variables --simple-values")
-            for r in var_res:
-                if r.get("type") == "result" and r.get("message") == "done":
-                    for v in r.get("payload", {}).get("variables", []):
-                        v_name = v.get("name", "")
-                        if not v_name or v_name in seen_var_names:
-                            continue
-                        if self._is_declared_on_current_line(v_name, frame_line):
-                            continue
-                        seen_var_names.add(v_name)
-                        v_copy = dict(v)
-                        v_copy["frame_level"] = level
-                        merged_vars.append(v_copy)
-                    break
+        for caller_fn in reversed(self._active_call_stack[:-1]):
+            caller_vars = self._frame_vars_by_func.get(caller_fn, [])
+            for v in caller_vars:
+                v_name = v.get("name", "")
+                if not v_name:
+                    continue
+                addr = extract_hex_address(v.get("value", ""))
+                if v_name not in seen_var_names:
+                    seen_var_names.add(v_name)
+                    if addr:
+                        seen_pointer_addrs.add(addr)
+                    v_copy = dict(v)
+                    v_copy["frame_level"] = 1
+                    merged_vars.append(v_copy)
+                elif addr and addr not in seen_pointer_addrs:
+                    # Preserve shadowed caller root pointer (e.g. `main`'s `root` while `insert`'s `root` is a child or NULL)
+                    seen_pointer_addrs.add(addr)
+                    v_copy = dict(v)
+                    v_copy["name"] = f"{caller_fn}:{v_name}"
+                    v_copy["frame_level"] = 1
+                    merged_vars.append(v_copy)
 
-        if len(user_frames) > 1:
-            self._cmd("-stack-select-frame 0")
-
-        return (call_stack, merged_vars)
+        return (list(self._active_call_stack), merged_vars)
 
     def _serialize_compound_struct_element(
         self, raw_struct_str: str, addr: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
-        """
-        Serializes a non-linked struct instance into a generic compound element record
-        containing all scalar DWARF fields in declaration order (`fields`), plus
-        generic `label`, `value`, and `secondary` keys derived strictly from declaration order.
-        """
         ef = parse_gdb_struct_body(raw_struct_str)
         if not ef:
             return None
@@ -1135,14 +1245,17 @@ class GDBTracer:
         ):
             return None
 
-        call_stack, raw_vars = self._collect_all_frame_variables()
+        call_stack, raw_vars = self._collect_fast_frame_variables()
 
         locals_out: Dict[str, Any] = {}
         scalar_ints: Dict[str, int] = {}
         leaf_scalar_ints: Dict[str, int] = {}
         active_struct_ptrs: Dict[str, Tuple[str, str]] = {}
         raw_array_vars: List[Tuple[str, str, int, int]] = []
+        raw_2d_array_vars: List[Tuple[str, str, int, int, int]] = []
         raw_ptr_vars: List[Tuple[str, str, str, int]] = []
+        raw_2d_ptr_vars: List[Tuple[str, str, str, int]] = []
+        raw_struct_ptr_array_vars: List[Tuple[str, str, str, int]] = []
 
         # ----------------------------------------------------------------------
         # Pass 1: Classify all variables across active call stack frames
@@ -1156,15 +1269,46 @@ class GDBTracer:
             if not v_name or not v_type:
                 continue
 
+            # 1A: Fixed 2D stack array (`int mat[10][10]` - Snippet 4)
+            arr_2d_match = FIXED_2D_ARR_RE.match(v_type)
+            if arr_2d_match:
+                elem_type = arr_2d_match.group(1).strip()
+                rows = min(int(arr_2d_match.group(2)), MAX_MATRIX_DIM)
+                cols = min(int(arr_2d_match.group(3)), MAX_MATRIX_DIM)
+                if f_level == 0:
+                    raw_2d_array_vars.append((v_name, elem_type, rows, cols, f_level))
+                continue
+
+            # 1B: Fixed 1D stack array (`int values[20]`)
             arr_match = FIXED_ARR_RE.match(v_type)
-            if arr_match and not FIXED_2D_ARR_RE.match(v_type):
+            if arr_match:
                 elem_type = arr_match.group(1).strip()
                 arr_len = min(int(arr_match.group(2)), MAX_ARRAY_ELEMENTS)
-                raw_array_vars.append((v_name, elem_type, arr_len, f_level))
+                if f_level == 0:
+                    raw_array_vars.append((v_name, elem_type, arr_len, f_level))
                 continue
 
             type_kind, resolved_target = self._resolve_type_info(v_type)
 
+            # 1C: Top-Level Struct Pointer Array (`UFNode **nodes` - Snippet 2)
+            if type_kind == "struct_ptr_array":
+                addr = extract_hex_address(v_val)
+                if f_level == 0:
+                    locals_out[v_name] = addr if addr else "0x0"
+                if addr and addr not in self._freed_addresses:
+                    raw_struct_ptr_array_vars.append((v_name, resolved_target, addr, f_level))
+                continue
+
+            # 1D: Top-Level 2D Primitive Pointer Matrix (`int **mat` - Snippet 5)
+            if type_kind == "primitive_ptr_array":
+                addr = extract_hex_address(v_val)
+                if f_level == 0:
+                    locals_out[v_name] = addr if addr else "0x0"
+                if addr and addr not in self._freed_addresses:
+                    raw_2d_ptr_vars.append((v_name, resolved_target, addr, f_level))
+                continue
+
+            # 1E: Single Struct Pointer (`BSTNode *root`, `union_find uf`)
             if type_kind == "struct_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
@@ -1178,7 +1322,7 @@ class GDBTracer:
                         if self._current_line - 1 < len(self._source_lines)
                         else ""
                     )
-                    if v_name in line_txt and (
+                    if v_name.split(":")[-1] in line_txt and (
                         "malloc" in line_txt
                         or "calloc" in line_txt
                         or "realloc" in line_txt
@@ -1189,6 +1333,7 @@ class GDBTracer:
                 active_struct_ptrs[v_name] = (addr, resolved_target)
                 continue
 
+            # 1F: 1D Primitive Pointer (`int *dist`, `int *arr`)
             if type_kind == "primitive_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
@@ -1197,19 +1342,16 @@ class GDBTracer:
                     raw_ptr_vars.append((v_name, resolved_target, addr, f_level))
                 continue
 
-            if type_kind == "struct_val":
-                if f_level != 0:
-                    self._cmd(f"-stack-select-frame {f_level}")
+            # 1G: Struct by Value on Stack
+            if type_kind == "struct_val" and f_level == 0:
                 addr_raw = self._eval_expr(f"&{v_name}")
-                if f_level != 0:
-                    self._cmd("-stack-select-frame 0")
                 addr = extract_hex_address(addr_raw or "")
                 if addr:
                     active_struct_ptrs[v_name] = (addr, resolved_target)
-                    if f_level == 0:
-                        locals_out[v_name] = addr
+                    locals_out[v_name] = addr
                 continue
 
+            # 1H: Scalar Primitives
             parsed_val = parse_scalar(v_val)
             if isinstance(parsed_val, int):
                 scalar_ints[v_name] = parsed_val
@@ -1220,61 +1362,63 @@ class GDBTracer:
                 locals_out[v_name] = parsed_val
 
         # ----------------------------------------------------------------------
-        # Pass 2: Top-Level 1D Arrays (Primitive Arrays & Compound Struct Arrays)
+        # Pass 1.5: Expand Top-Level `T**` Struct Pointer Tables (`UFNode **nodes`)
         # ----------------------------------------------------------------------
         arrays_snapshot: List[ArraySnapshot] = []
 
-        for arr_name, elem_type, arr_len, f_level in raw_array_vars:
-            if f_level != 0:
-                self._cmd(f"-stack-select-frame {f_level}")
-            expr_val = self._eval_expr(arr_name)
-            if f_level != 0:
-                self._cmd("-stack-select-frame 0")
-
-            if not expr_val:
+        for tbl_name, target_s_type, tbl_addr, _ in raw_struct_ptr_array_vars:
+            if not self._is_valid_heap_or_data_address(tbl_addr):
+                continue
+            clean_tbl_name = tbl_name.split(":")[-1]
+            tbl_len = self._infer_pointer_buffer_length(
+                ptr_leaf_name=clean_tbl_name,
+                sister_scalars={},
+                frame_scalars=scalar_ints,
+            )
+            if not tbl_len or not (1 <= tbl_len <= MAX_STRUCT_BUFFER_ELEMENTS):
                 continue
 
-            elem_kind, elem_resolved = self._resolve_type_info(elem_type)
-            raw_items = parse_gdb_array(expr_val, max_elems=arr_len)
-
-            if elem_kind == "struct_val" and not self._has_struct_pointer_links(elem_resolved):
-                compound_elems: List[Dict[str, Any]] = []
-                for item_str in raw_items:
-                    if isinstance(item_str, str) and item_str.startswith("{"):
-                        rec = self._serialize_compound_struct_element(item_str)
-                        if rec:
-                            compound_elems.append(rec)
-                if compound_elems:
-                    active_idx = self._collect_active_indices(
-                        leaf_scalar_ints, len(compound_elems), array_name=arr_name
-                    )
-                    arrays_snapshot.append(
-                        ArraySnapshot(
-                            name=arr_name,
-                            type=elem_type,
-                            element_type=elem_resolved,
-                            is_compound=True,
-                            capacity=arr_len,
-                            elements=compound_elems,
-                            active_indices=active_idx,
-                        )
-                    )
+            if self._has_struct_pointer_links(target_s_type):
+                ptr_slice_raw = self._eval_expr(f"*(void *[{tbl_len}]*)({tbl_addr})")
+                if ptr_slice_raw:
+                    elem_ptrs = parse_gdb_array(ptr_slice_raw, max_elems=tbl_len)
+                    for idx, raw_ep in enumerate(elem_ptrs):
+                        ep_addr = extract_hex_address(str(raw_ep))
+                        if (
+                            ep_addr
+                            and self._is_valid_heap_or_data_address(ep_addr)
+                            and ep_addr not in self._freed_addresses
+                        ):
+                            active_struct_ptrs[f"{clean_tbl_name}[{idx}]"] = (
+                                ep_addr,
+                                target_s_type,
+                            )
             else:
-                elements = [format_scalar_val(x) for x in raw_items]
-                active_idx = self._collect_active_indices(
-                    leaf_scalar_ints, len(elements), array_name=arr_name
+                comp_snap = self._extract_struct_array_field(
+                    owner_name=clean_tbl_name,
+                    field_name="",
+                    array_base_addr=tbl_addr,
+                    elem_struct_type=target_s_type,
+                    is_pointer_array=True,
+                    sister_scalars={},
+                    leaf_scalar_ints=leaf_scalar_ints,
+                    all_scalar_ints=scalar_ints,
                 )
-                arrays_snapshot.append(
-                    ArraySnapshot(
-                        name=arr_name,
-                        type=elem_type,
-                        element_type=elem_type,
-                        is_compound=False,
-                        capacity=arr_len,
-                        elements=elements,
-                        active_indices=active_idx,
-                    )
-                )
+                if comp_snap is not None:
+                    comp_snap.name = clean_tbl_name
+                    arrays_snapshot.append(comp_snap)
+
+        # ----------------------------------------------------------------------
+        # Pass 2: Batch-Evaluate Top-Level 1D & 2D Arrays (Stack & Heap Matrices)
+        # ----------------------------------------------------------------------
+        array_eval_specs: List[Tuple[str, str, str, int, bool, str]] = []
+
+        for arr_name, elem_type, arr_len, _ in raw_array_vars:
+            elem_kind, elem_resolved = self._resolve_type_info(elem_type)
+            is_comp = elem_kind == "struct_val" and not self._has_struct_pointer_links(elem_resolved)
+            array_eval_specs.append(
+                (arr_name, arr_name, elem_type, arr_len, is_comp, elem_resolved if is_comp else elem_type)
+            )
 
         for ptr_name, elem_type, addr, _ in raw_ptr_vars:
             if (
@@ -1282,45 +1426,172 @@ class GDBTracer:
                 or not self._is_valid_heap_or_data_address(addr)
             ):
                 continue
-
             inferred_len = self._infer_pointer_buffer_length(
-                ptr_leaf_name=ptr_name,
+                ptr_leaf_name=ptr_name.split(":")[-1],
                 sister_scalars={},
                 frame_scalars=scalar_ints,
             )
             if inferred_len and 1 <= inferred_len <= MAX_ARRAY_ELEMENTS:
                 deref_expr = f"*({elem_type}[{inferred_len}]*)({addr})"
-                expr_val = self._eval_expr(deref_expr)
-                if expr_val:
-                    raw_elements = parse_gdb_array(expr_val, max_elems=inferred_len)
-                    if raw_elements:
-                        formatted_elements = [
-                            format_scalar_val(x) for x in raw_elements
-                        ]
+                array_eval_specs.append(
+                    (ptr_name, deref_expr, elem_type, inferred_len, False, elem_type)
+                )
+
+        if array_eval_specs:
+            batch_exprs = [spec[1] for spec in array_eval_specs]
+            batch_results = self._eval_expr_batch(batch_exprs)
+
+            for arr_name, expr_key, elem_type, cap_len, is_comp, resolved_el_type in array_eval_specs:
+                expr_val = batch_results.get(expr_key)
+                if not expr_val:
+                    continue
+                raw_items = parse_gdb_array(expr_val, max_elems=cap_len)
+                if is_comp:
+                    compound_elems: List[Dict[str, Any]] = []
+                    for item_str in raw_items:
+                        if isinstance(item_str, str) and item_str.startswith("{"):
+                            rec = self._serialize_compound_struct_element(item_str)
+                            if rec:
+                                compound_elems.append(rec)
+                    if compound_elems:
                         active_idx = self._collect_active_indices(
-                            leaf_scalar_ints,
-                            len(formatted_elements),
-                            array_name=ptr_name,
+                            leaf_scalar_ints, len(compound_elems), array_name=arr_name
                         )
                         arrays_snapshot.append(
                             ArraySnapshot(
-                                name=ptr_name,
+                                name=arr_name,
                                 type=elem_type,
+                                element_type=resolved_el_type,
+                                is_compound=True,
+                                capacity=cap_len,
+                                elements=compound_elems,
+                                active_indices=active_idx,
+                            )
+                        )
+                else:
+                    elements = [format_scalar_val(x) for x in raw_items]
+                    if elements:
+                        active_idx = self._collect_active_indices(
+                            leaf_scalar_ints, len(elements), array_name=arr_name
+                        )
+                        arrays_snapshot.append(
+                            ArraySnapshot(
+                                name=arr_name,
+                                type=elem_type,
+                                element_type=resolved_el_type,
+                                is_compound=False,
+                                capacity=cap_len,
+                                elements=elements,
+                                active_indices=active_idx,
+                            )
+                        )
+
+        # 2B: Fixed 2D Stack Matrices (`int mat[10][10]` - Snippet 4)
+        for mat_name, elem_type, rows, cols, _ in raw_2d_array_vars:
+            mat_val = self._eval_expr(mat_name)
+            if not mat_val:
+                continue
+            row_strings = parse_gdb_array(mat_val, max_elems=rows)
+            active_idx = self._collect_active_indices(
+                leaf_scalar_ints, rows, array_name=mat_name
+            )
+            for r_idx, r_str in enumerate(row_strings):
+                if isinstance(r_str, str) and r_str.startswith("{"):
+                    row_elems = [
+                        format_scalar_val(x)
+                        for x in parse_gdb_array(r_str, max_elems=cols)
+                    ]
+                    arrays_snapshot.append(
+                        ArraySnapshot(
+                            name=f"{mat_name}[{r_idx}]",
+                            type=f"{elem_type}[{cols}]",
+                            element_type=elem_type,
+                            is_compound=False,
+                            capacity=cols,
+                            elements=row_elems,
+                            active_indices=active_idx,
+                        )
+                    )
+
+        # 2C: Heap 2D Pointer Matrices (`int **mat` - Snippet 5)
+        for mat_name, elem_type, mat_addr, _ in raw_2d_ptr_vars:
+            if not self._is_valid_heap_or_data_address(mat_addr):
+                continue
+            clean_mat = mat_name.split(":")[-1]
+            rows_len = self._infer_pointer_buffer_length(
+                ptr_leaf_name=clean_mat,
+                sister_scalars={},
+                frame_scalars=scalar_ints,
+            )
+            if not rows_len or not (1 <= rows_len <= MAX_MATRIX_DIM):
+                continue
+            # Infer column count from non-cursor frame integers or default to rows_len
+            non_cursor_ints = [
+                v
+                for k, v in scalar_ints.items()
+                if k not in self._get_syntactically_proven_indices(self._current_func, self._current_line, clean_mat)
+                and 1 <= v <= MAX_MATRIX_DIM
+            ]
+            cols_len = non_cursor_ints[-1] if non_cursor_ints else rows_len
+
+            row_ptrs_raw = self._eval_expr(f"*(void *[{rows_len}]*)({mat_addr})")
+            if not row_ptrs_raw:
+                continue
+            row_ptrs = parse_gdb_array(row_ptrs_raw, max_elems=rows_len)
+            row_expr_map: Dict[int, str] = {}
+            for r_idx, rp in enumerate(row_ptrs):
+                rp_addr = extract_hex_address(str(rp))
+                if (
+                    rp_addr
+                    and self._is_valid_heap_or_data_address(rp_addr)
+                    and rp_addr not in self._freed_addresses
+                ):
+                    row_expr_map[r_idx] = f"*({elem_type}[{cols_len}]*)({rp_addr})"
+
+            if row_expr_map:
+                batch_rows = self._eval_expr_batch(list(row_expr_map.values()))
+                active_idx = self._collect_active_indices(
+                    leaf_scalar_ints, cols_len, array_name=clean_mat
+                )
+                for r_idx, r_expr in row_expr_map.items():
+                    r_val_str = batch_rows.get(r_expr)
+                    if r_val_str:
+                        row_elems = [
+                            format_scalar_val(x)
+                            for x in parse_gdb_array(r_val_str, max_elems=cols_len)
+                        ]
+                        arrays_snapshot.append(
+                            ArraySnapshot(
+                                name=f"{clean_mat}[{r_idx}]",
+                                type=f"{elem_type}*",
                                 element_type=elem_type,
                                 is_compound=False,
-                                capacity=inferred_len,
-                                elements=formatted_elements,
+                                capacity=cols_len,
+                                elements=row_elems,
                                 active_indices=active_idx,
                             )
                         )
 
         # ----------------------------------------------------------------------
-        # Pass 3: Pure DWARF Pointer-Mesh Crawler & Embedded Struct Buffers
+        # Pass 3: Pipelined DWARF Pointer-Mesh Crawler & Embedded Struct Buffers
         # ----------------------------------------------------------------------
         graph_snapshot, embedded_arrays = self._crawl_pointer_graph(
             active_struct_ptrs, leaf_scalar_ints, scalar_ints
         )
         arrays_snapshot.extend(embedded_arrays)
+
+        # ----------------------------------------------------------------------
+        # Pass 4: Agnostic Forest / Index-Buffer Graph Projection (Snippet 1)
+        # ----------------------------------------------------------------------
+        # If the pointer mesh has no pointer-linked edges (e.g. a single container struct
+        # holding an index buffer `int *parent` where `i -> buf[i]`), project the self-indexed
+        # integer buffer into `graph_snapshot` so both Array and Graph tabs visualize the forest!
+        if len(graph_snapshot.edges) == 0:
+            forest_graph = self._try_project_index_forest_graph(
+                arrays_snapshot, leaf_scalar_ints
+            )
+            if forest_graph is not None:
+                graph_snapshot = forest_graph
 
         self.step_count += 1
         return ExecutionSnapshot(
@@ -1334,8 +1605,97 @@ class GDBTracer:
             status="running",
         )
 
+    def _try_project_index_forest_graph(
+        self,
+        arrays_snapshot: List[ArraySnapshot],
+        leaf_scalar_ints: Dict[str, int],
+    ) -> Optional[GraphSnapshot]:
+        """
+        Agnostic Forest / DSU Projection:
+        Checks if any 1D integer array in `arrays_snapshot` is:
+          1. Syntactically self-indexed (`buf[buf[...]]`, `buf[i] = i`, or `x != buf[x]`)
+          2. Domain-closed: all integer elements fall within `[0, N - 1]` (with $2 \le N \le 48$)
+        When both conditions hold, constructs a directed forest graph of nodes `0 .. N - 1`
+        with directed edges `i -> buf[i]` (for `buf[i] != i`).
+        """
+        for arr in arrays_snapshot:
+            if arr.is_compound:
+                continue
+            N = len(arr.elements)
+            if not (2 <= N <= MAX_GRAPH_NODES):
+                continue
+            if not self._is_syntactically_self_indexed_buffer(arr.name):
+                continue
+
+            # Verify domain closure: every element is an integer in [0, N - 1]
+            int_elems: List[int] = []
+            valid_domain = True
+            for el in arr.elements:
+                if isinstance(el, int) and 0 <= el < N:
+                    int_elems.append(el)
+                else:
+                    valid_domain = False
+                    break
+
+            if not valid_domain:
+                continue
+
+            # Map active index cursors onto forest nodes
+            idx_to_ptrs: Dict[int, List[str]] = {}
+            for ptr_name, idx_val in (arr.active_indices or {}).items():
+                if 0 <= idx_val < N:
+                    idx_to_ptrs.setdefault(idx_val, []).append(ptr_name)
+
+            # Also check leaf integer locals referenced in current function
+            proven_vars = self._get_syntactically_proven_indices(
+                self._current_func, self._current_line, arr.name
+            )
+            for v_name in proven_vars:
+                if v_name in leaf_scalar_ints:
+                    v_val = leaf_scalar_ints[v_name]
+                    if 0 <= v_val < N and v_name not in idx_to_ptrs.get(v_val, []):
+                        idx_to_ptrs.setdefault(v_val, []).append(v_name)
+
+            forest_nodes: List[GraphNode] = []
+            forest_edges: List[GraphEdge] = []
+            leaf_field_name = arr.name.split("->")[-1].split(".")[-1]
+
+            for i, target_idx in enumerate(int_elems):
+                node_id = f"idx-{i}"
+                ptrs = idx_to_ptrs.get(i, [])
+                is_root = target_idx == i
+                forest_nodes.append(
+                    GraphNode(
+                        id=node_id,
+                        type="IndexNode",
+                        c_type=f"Index [{i}]",
+                        label=f"[{i}] → {target_idx}",
+                        fields={
+                            "index": i,
+                            leaf_field_name: target_idx,
+                            "role": "root" if is_root else "child",
+                        },
+                        is_active=bool(ptrs),
+                        is_freed=False,
+                        pointers=ptrs,
+                    )
+                )
+                if target_idx != i:
+                    forest_edges.append(
+                        GraphEdge(
+                            source=node_id,
+                            target=f"idx-{target_idx}",
+                            label=leaf_field_name,
+                            field_order_idx=0,
+                        )
+                    )
+
+            return GraphSnapshot(nodes=forest_nodes, edges=forest_edges)
+
+        return None
+
     # ==========================================================================
-    # Pure DWARF Pointer-Mesh & Struct Buffer Crawler
+    # Pipelined DWARF Pointer-Mesh & Struct Buffer Crawler
     # ==========================================================================
 
     def _extract_struct_array_field(
@@ -1349,12 +1709,9 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Optional[ArraySnapshot]:
-        """
-        Extracts a dynamic array of non-linked structs (`Type *arr` or `Type **arr`)
-        as a generic compound tuple array without synthetic titles or fake indices.
-        """
+        lookup_name = field_name if field_name else owner_name
         buf_len = self._infer_pointer_buffer_length(
-            ptr_leaf_name=field_name,
+            ptr_leaf_name=lookup_name,
             sister_scalars=sister_scalars,
             frame_scalars=all_scalar_ints,
         )
@@ -1368,20 +1725,28 @@ class GDBTracer:
             if not ptr_slice_raw:
                 return None
             elem_addrs = parse_gdb_array(ptr_slice_raw, max_elems=buf_len)
+
+            valid_elem_addrs: List[str] = []
             for raw_elem_ptr in elem_addrs:
                 elem_addr = extract_hex_address(str(raw_elem_ptr))
                 if (
-                    not elem_addr
-                    or not self._is_valid_heap_or_data_address(elem_addr)
-                    or elem_addr in self._freed_addresses
+                    elem_addr
+                    and self._is_valid_heap_or_data_address(elem_addr)
+                    and elem_addr not in self._freed_addresses
                 ):
-                    continue
-                elem_deref = self._eval_expr(f"*(({elem_struct_type} *){elem_addr})")
-                if not elem_deref:
-                    continue
-                rec = self._serialize_compound_struct_element(elem_deref, addr=elem_addr)
-                if rec:
-                    compound_elements.append(rec)
+                    valid_elem_addrs.append(elem_addr)
+
+            if valid_elem_addrs:
+                deref_exprs = [
+                    f"*(({elem_struct_type} *){e_addr})" for e_addr in valid_elem_addrs
+                ]
+                batch_derefs = self._eval_expr_batch(deref_exprs)
+                for e_addr, d_expr in zip(valid_elem_addrs, deref_exprs):
+                    elem_deref = batch_derefs.get(d_expr)
+                    if elem_deref:
+                        rec = self._serialize_compound_struct_element(elem_deref, addr=e_addr)
+                        if rec:
+                            compound_elements.append(rec)
         else:
             val_slice_raw = self._eval_expr(
                 f"*({elem_struct_type}[{buf_len}]*)({array_base_addr})"
@@ -1400,7 +1765,7 @@ class GDBTracer:
 
         active_idx = self._collect_struct_buffer_indices(
             owner_name=owner_name,
-            field_name=field_name,
+            field_name=lookup_name,
             sister_scalars=sister_scalars,
             frame_scalar_ints=leaf_scalar_ints,
             array_len=len(compound_elements),
@@ -1409,8 +1774,9 @@ class GDBTracer:
         short_type = elem_struct_type.replace("struct ", "").strip() + (
             "*" if is_pointer_array else ""
         )
+        full_name = f"{owner_name}->{field_name}" if field_name else owner_name
         return ArraySnapshot(
-            name=f"{owner_name}->{field_name}",
+            name=full_name,
             type=short_type,
             element_type=elem_struct_type,
             is_compound=True,
@@ -1425,361 +1791,374 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
-        """
-        Pure DWARF BFS Pointer-Mesh Crawler:
-          - Crawls all reachable structs starting from stack frame struct pointers.
-          - Serializes all scalar fields in exact DWARF declaration order (`ptype`).
-          - Follows single struct pointers (`T*`), inline fixed pointer arrays (`children[26]`),
-            and dynamic pointer tables (`T**` where `T` is a linked struct, e.g. `adj[V]`),
-            emitting directed edges (`source`, `target`, `label`) for all non-NULL slots.
-        """
-        visited_addrs: Set[str] = set()
+        seen_addresses: Set[str] = set()
         nodes: List[GraphNode] = []
         edges: List[GraphEdge] = []
         embedded_arrays: List[ArraySnapshot] = []
         seen_edges: Set[Tuple[str, str, str]] = set()
 
         addr_to_ptr_names: Dict[str, List[str]] = {}
-        valid_seeds: List[Tuple[str, str, str]] = []
+        frontier: List[Tuple[str, str, str]] = []
 
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_valid_heap_or_data_address(addr):
                 addr_to_ptr_names.setdefault(addr, []).append(ptr_name)
-                valid_seeds.append((addr, s_type, ptr_name))
+                if addr not in seen_addresses:
+                    seen_addresses.add(addr)
+                    frontier.append((addr, s_type, ptr_name.split(":")[-1]))
 
-        queue: List[Tuple[str, str, str]] = list(valid_seeds)
+        while frontier and len(nodes) < MAX_GRAPH_NODES:
+            current_batch = frontier[: MAX_GRAPH_NODES - len(nodes)]
+            frontier = frontier[MAX_GRAPH_NODES - len(nodes) :]
 
-        while queue and len(visited_addrs) < MAX_GRAPH_NODES:
-            addr, struct_type, owner_name = queue.pop(0)
-            if not addr or addr in visited_addrs:
-                continue
+            batch_expr_map: Dict[str, str] = {
+                addr: f"*(({struct_type} *){addr})"
+                for addr, struct_type, _ in current_batch
+            }
+            batch_deref_results = self._eval_expr_batch(list(batch_expr_map.values()))
 
-            deref_str = self._eval_expr(f"*(({struct_type} *){addr})")
-            if not deref_str:
-                continue
+            next_frontier: List[Tuple[str, str, str]] = []
 
-            raw_fields = parse_gdb_struct_body(deref_str)
-            if not raw_fields:
-                continue
+            for addr, struct_type, owner_name in current_batch:
+                deref_str = batch_deref_results.get(batch_expr_map[addr])
+                if not deref_str:
+                    continue
 
-            visited_addrs.add(addr)
-            field_types = self._ensure_struct_field_types(struct_type)
-            is_freed = self._is_tcache_poisoned(addr, raw_fields)
-            pointing_vars = addr_to_ptr_names.get(addr, [])
+                raw_fields = parse_gdb_struct_body(deref_str)
+                if not raw_fields:
+                    continue
 
-            if is_freed:
-                last_known = self._last_valid_node_fields.get(addr, {})
-                freed_fields: Dict[str, Any] = (
-                    dict(last_known) if last_known else {"status": "FREED"}
+                field_types = self._ensure_struct_field_types(struct_type)
+                field_order_list = list(field_types.keys())
+                is_freed = self._is_tcache_poisoned(addr, raw_fields)
+                pointing_vars = addr_to_ptr_names.get(addr, [])
+
+                if is_freed:
+                    last_known = self._last_valid_node_fields.get(addr, {})
+                    freed_fields: Dict[str, Any] = (
+                        dict(last_known) if last_known else {"status": "FREED"}
+                    )
+                    nodes.append(
+                        GraphNode(
+                            id=addr,
+                            type=struct_type,
+                            c_type=struct_type,
+                            label="FREED",
+                            fields=freed_fields,
+                            is_active=bool(pointing_vars),
+                            is_freed=True,
+                            pointers=pointing_vars,
+                        )
+                    )
+                    continue
+
+                sister_scalars: Dict[str, int] = {}
+                for f_name, f_val in raw_fields.items():
+                    declared_f_type = field_types.get(f_name, "").strip()
+                    is_ptr, _, _ = self._is_field_pointer_type(
+                        declared_f_type, f_name, f_val
+                    )
+                    if not is_ptr and not f_val.startswith("{"):
+                        parsed = parse_scalar(f_val)
+                        if isinstance(parsed, int):
+                            sister_scalars[f_name] = parsed
+
+                node_fields: Dict[str, Any] = {}
+                scalar_summary_parts: List[str] = []
+                self_ref_fields_ordered: List[str] = []
+
+                for f_name, f_val in raw_fields.items():
+                    declared_f_type = field_types.get(f_name, "").strip()
+                    f_order_idx = (
+                        field_order_list.index(f_name)
+                        if f_name in field_order_list
+                        else 0
+                    )
+
+                    # Case 1: Inline fixed array member inside struct
+                    if f_val.startswith("{") and f_val.endswith("}"):
+                        sub_items = parse_gdb_array(
+                            f_val, max_elems=MAX_STRUCT_BUFFER_ELEMENTS
+                        )
+                        arr_decl_match = FIXED_ARR_RE.match(declared_f_type)
+                        elem_decl_type = (
+                            arr_decl_match.group(1).strip()
+                            if arr_decl_match
+                            else declared_f_type.rstrip("*").strip()
+                        )
+                        elem_kind, elem_target = self._resolve_type_info(elem_decl_type)
+
+                        if elem_kind == "struct_ptr" or "*" in elem_decl_type:
+                            target_s_type = (
+                                elem_target
+                                if elem_kind == "struct_ptr"
+                                else elem_decl_type.rstrip("*").strip() or struct_type
+                            )
+                            non_null_count = 0
+                            for idx, item in enumerate(sub_items):
+                                sub_addr = extract_hex_address(str(item))
+                                if sub_addr and self._is_valid_heap_or_data_address(
+                                    sub_addr
+                                ):
+                                    non_null_count += 1
+                                    edge_label = f"{f_name}[{idx}]"
+                                    edge_key = (addr, sub_addr, edge_label)
+                                    if edge_key not in seen_edges:
+                                        seen_edges.add(edge_key)
+                                        edges.append(
+                                            GraphEdge(
+                                                source=addr,
+                                                target=sub_addr,
+                                                label=edge_label,
+                                                field_order_idx=idx,
+                                            )
+                                        )
+                                    if sub_addr not in seen_addresses:
+                                        seen_addresses.add(sub_addr)
+                                        next_frontier.append(
+                                            (
+                                                sub_addr,
+                                                target_s_type,
+                                                f"{owner_name}->{f_name}[{idx}]",
+                                            )
+                                        )
+                            node_fields[f_name] = f"ptr[{len(sub_items)}] ({non_null_count} active)"
+                        elif sub_items:
+                            formatted_sub = [format_scalar_val(x) for x in sub_items]
+                            node_fields[f_name] = formatted_sub
+                            active_idx = self._collect_struct_buffer_indices(
+                                owner_name=owner_name,
+                                field_name=f_name,
+                                sister_scalars=sister_scalars,
+                                frame_scalar_ints=leaf_scalar_ints,
+                                array_len=len(formatted_sub),
+                            )
+                            embedded_arrays.append(
+                                ArraySnapshot(
+                                    name=f"{owner_name}->{f_name}",
+                                    type=elem_decl_type or "int",
+                                    element_type=elem_decl_type or "int",
+                                    is_compound=False,
+                                    capacity=len(formatted_sub),
+                                    elements=formatted_sub,
+                                    active_indices=active_idx,
+                                )
+                            )
+                        continue
+
+                    is_ptr_field, f_kind, f_target_type = self._is_field_pointer_type(
+                        declared_f_type, f_name, f_val
+                    )
+
+                    # Case 2: Pointer or Pointer-Array member
+                    if is_ptr_field:
+                        if f_kind == "struct_ptr" and f_target_type == struct_type:
+                            self_ref_fields_ordered.append(f_name)
+
+                        target_addr = extract_hex_address(f_val)
+                        if is_explicit_null(f_val, is_known_pointer=True) or not target_addr:
+                            node_fields[f_name] = "NULL"
+                            continue
+
+                        node_fields[f_name] = target_addr
+                        if not self._is_valid_heap_or_data_address(target_addr):
+                            continue
+
+                        # Subcase 2A: Dynamic Pointer-to-Pointer Array (`Type **adj` or `Type **array`)
+                        if (
+                            (f_kind == "struct_ptr_array" or "**" in declared_f_type)
+                            and target_addr not in self._freed_addresses
+                        ):
+                            elem_struct = (
+                                f_target_type
+                                if f_kind == "struct_ptr_array"
+                                else declared_f_type.replace("*", "").strip()
+                            )
+                            if not elem_struct.startswith("struct "):
+                                _, res_s = self._resolve_type_info(elem_struct)
+                                elem_struct = res_s or f"struct {elem_struct}"
+
+                            if self._has_struct_pointer_links(elem_struct):
+                                table_len = self._infer_pointer_buffer_length(
+                                    ptr_leaf_name=f_name,
+                                    sister_scalars=sister_scalars,
+                                    frame_scalars=all_scalar_ints,
+                                )
+                                if table_len and 1 <= table_len <= MAX_STRUCT_BUFFER_ELEMENTS:
+                                    ptr_table_raw = self._eval_expr(
+                                        f"*(void *[{table_len}]*)({target_addr})"
+                                    )
+                                    if ptr_table_raw:
+                                        head_ptrs = parse_gdb_array(
+                                            ptr_table_raw, max_elems=table_len
+                                        )
+                                        for idx, raw_hp in enumerate(head_ptrs):
+                                            hp_addr = extract_hex_address(str(raw_hp))
+                                            if (
+                                                hp_addr
+                                                and self._is_valid_heap_or_data_address(hp_addr)
+                                                and hp_addr not in self._freed_addresses
+                                            ):
+                                                edge_label = f"{f_name}[{idx}]"
+                                                edge_key = (addr, hp_addr, edge_label)
+                                                if edge_key not in seen_edges:
+                                                    seen_edges.add(edge_key)
+                                                    edges.append(
+                                                        GraphEdge(
+                                                            source=addr,
+                                                            target=hp_addr,
+                                                            label=edge_label,
+                                                            field_order_idx=idx,
+                                                        )
+                                                    )
+                                                if hp_addr not in seen_addresses:
+                                                    seen_addresses.add(hp_addr)
+                                                    next_frontier.append(
+                                                        (
+                                                            hp_addr,
+                                                            elem_struct,
+                                                            f"{owner_name}->{f_name}[{idx}]",
+                                                        )
+                                                    )
+                            else:
+                                comp_snap = self._extract_struct_array_field(
+                                    owner_name=owner_name,
+                                    field_name=f_name,
+                                    array_base_addr=target_addr,
+                                    elem_struct_type=elem_struct,
+                                    is_pointer_array=True,
+                                    sister_scalars=sister_scalars,
+                                    leaf_scalar_ints=leaf_scalar_ints,
+                                    all_scalar_ints=all_scalar_ints,
+                                )
+                                if comp_snap is not None:
+                                    embedded_arrays.append(comp_snap)
+                            continue
+
+                        # Subcase 2B: Dynamic Primitive Buffer (`int *parent`, `int *data`)
+                        if (
+                            f_kind == "primitive_ptr"
+                            and "**" not in declared_f_type
+                            and target_addr not in self._freed_addresses
+                        ):
+                            elem_c_type = f_target_type
+                            buf_len = self._infer_pointer_buffer_length(
+                                ptr_leaf_name=f_name,
+                                sister_scalars=sister_scalars,
+                                frame_scalars=all_scalar_ints,
+                            )
+                            if buf_len and 1 <= buf_len <= MAX_STRUCT_BUFFER_ELEMENTS:
+                                deref_buf_expr = (
+                                    f"*({elem_c_type}[{buf_len}]*)({target_addr})"
+                                )
+                                buf_val_str = self._eval_expr(deref_buf_expr)
+                                if buf_val_str:
+                                    elements = [
+                                        format_scalar_val(x)
+                                        for x in parse_gdb_array(
+                                            buf_val_str,
+                                            max_elems=MAX_STRUCT_BUFFER_ELEMENTS,
+                                        )
+                                    ]
+                                    if elements:
+                                        active_idx = self._collect_struct_buffer_indices(
+                                            owner_name=owner_name,
+                                            field_name=f_name,
+                                            sister_scalars=sister_scalars,
+                                            frame_scalar_ints=leaf_scalar_ints,
+                                            array_len=len(elements),
+                                        )
+                                        embedded_arrays.append(
+                                            ArraySnapshot(
+                                                name=f"{owner_name}->{f_name}",
+                                                type=elem_c_type,
+                                                element_type=elem_c_type,
+                                                is_compound=False,
+                                                capacity=buf_len,
+                                                elements=elements,
+                                                active_indices=active_idx,
+                                            )
+                                        )
+                            continue
+
+                        # Subcase 2C: Single Struct Pointer (`struct Node *next`, `left`, `right`, `parent`)
+                        target_s_type = (
+                            f_target_type
+                            if f_kind == "struct_ptr"
+                            else (
+                                declared_f_type.rstrip("*").strip()
+                                if "*" in declared_f_type
+                                else struct_type
+                            )
+                        )
+                        if not target_s_type.startswith("struct "):
+                            _, res_s = self._resolve_type_info(target_s_type)
+                            target_s_type = res_s or f"struct {target_s_type}"
+
+                        if not self._has_struct_pointer_links(target_s_type) and sister_scalars:
+                            comp_snap = self._extract_struct_array_field(
+                                owner_name=owner_name,
+                                field_name=f_name,
+                                array_base_addr=target_addr,
+                                elem_struct_type=target_s_type,
+                                is_pointer_array=False,
+                                sister_scalars=sister_scalars,
+                                leaf_scalar_ints=leaf_scalar_ints,
+                                all_scalar_ints=all_scalar_ints,
+                            )
+                            if comp_snap is not None and len(comp_snap.elements) > 1:
+                                embedded_arrays.append(comp_snap)
+                                continue
+
+                        # Ignore self-looping pointers (`node->parent = node` in make_set) from emitting self-edges
+                        # so DSU roots have out-degree 0 / clean tree hierarchy, while still showing the address in `node_fields`.
+                        if target_addr != addr:
+                            edge_key = (addr, target_addr, f_name)
+                            if edge_key not in seen_edges:
+                                seen_edges.add(edge_key)
+                                edges.append(
+                                    GraphEdge(
+                                        source=addr,
+                                        target=target_addr,
+                                        label=f_name,
+                                        field_order_idx=f_order_idx,
+                                    )
+                                )
+                        if target_addr not in seen_addresses:
+                            seen_addresses.add(target_addr)
+                            next_frontier.append(
+                                (target_addr, target_s_type, f"{owner_name}->{f_name}")
+                            )
+                        continue
+
+                    # Case 3: Scalar value field
+                    parsed_scalar = format_scalar_val(parse_scalar(f_val))
+                    node_fields[f_name] = parsed_scalar
+                    scalar_summary_parts.append(f"{f_name}: {parsed_scalar}")
+
+                node_label = (
+                    " · ".join(scalar_summary_parts[:2])
+                    if scalar_summary_parts
+                    else struct_type.replace("struct ", "")
                 )
+
+                self._last_valid_node_fields[addr] = dict(node_fields)
+
                 nodes.append(
                     GraphNode(
                         id=addr,
                         type=struct_type,
                         c_type=struct_type,
-                        label="FREED",
-                        fields=freed_fields,
+                        label=node_label,
+                        fields=node_fields,
                         is_active=bool(pointing_vars),
-                        is_freed=True,
+                        is_freed=False,
                         pointers=pointing_vars,
+                        self_ref_order=self_ref_fields_ordered,
                     )
                 )
-                continue
 
-            # Pre-pass: collect all sister integer scalars in this struct
-            sister_scalars: Dict[str, int] = {}
-            for f_name, f_val in raw_fields.items():
-                declared_f_type = field_types.get(f_name, "").strip()
-                is_ptr, _, _ = self._is_field_pointer_type(
-                    declared_f_type, f_name, f_val
-                )
-                if not is_ptr and not f_val.startswith("{"):
-                    parsed = parse_scalar(f_val)
-                    if isinstance(parsed, int):
-                        sister_scalars[f_name] = parsed
-
-            node_fields: Dict[str, Any] = {}
-            scalar_summary_parts: List[str] = []
-
-            for f_name, f_val in raw_fields.items():
-                declared_f_type = field_types.get(f_name, "").strip()
-
-                # Case 1: Inline fixed array member inside struct (e.g. `struct TrieNode *children[26]` or `int data[16]`)
-                if f_val.startswith("{") and f_val.endswith("}"):
-                    sub_items = parse_gdb_array(
-                        f_val, max_elems=MAX_STRUCT_BUFFER_ELEMENTS
-                    )
-                    arr_decl_match = FIXED_ARR_RE.match(declared_f_type)
-                    elem_decl_type = (
-                        arr_decl_match.group(1).strip()
-                        if arr_decl_match
-                        else declared_f_type.rstrip("*").strip()
-                    )
-                    elem_kind, elem_target = self._resolve_type_info(elem_decl_type)
-
-                    if elem_kind == "struct_ptr" or "*" in elem_decl_type:
-                        target_s_type = (
-                            elem_target
-                            if elem_kind == "struct_ptr"
-                            else elem_decl_type.rstrip("*").strip() or struct_type
-                        )
-                        non_null_count = 0
-                        for idx, item in enumerate(sub_items):
-                            sub_addr = extract_hex_address(str(item))
-                            if sub_addr and self._is_valid_heap_or_data_address(
-                                sub_addr
-                            ):
-                                non_null_count += 1
-                                edge_label = f"{f_name}[{idx}]"
-                                edge_key = (addr, sub_addr, edge_label)
-                                if edge_key not in seen_edges:
-                                    seen_edges.add(edge_key)
-                                    edges.append(
-                                        GraphEdge(
-                                            source=addr,
-                                            target=sub_addr,
-                                            label=edge_label,
-                                        )
-                                    )
-                                if sub_addr not in visited_addrs:
-                                    queue.append(
-                                        (
-                                            sub_addr,
-                                            target_s_type,
-                                            f"{owner_name}->{f_name}[{idx}]",
-                                        )
-                                    )
-                        node_fields[f_name] = f"ptr[{len(sub_items)}] ({non_null_count} active)"
-                    elif sub_items:
-                        formatted_sub = [format_scalar_val(x) for x in sub_items]
-                        node_fields[f_name] = formatted_sub
-                        active_idx = self._collect_struct_buffer_indices(
-                            owner_name=owner_name,
-                            field_name=f_name,
-                            sister_scalars=sister_scalars,
-                            frame_scalar_ints=leaf_scalar_ints,
-                            array_len=len(formatted_sub),
-                        )
-                        embedded_arrays.append(
-                            ArraySnapshot(
-                                name=f"{owner_name}->{f_name}",
-                                type=elem_decl_type or "int",
-                                element_type=elem_decl_type or "int",
-                                is_compound=False,
-                                capacity=len(formatted_sub),
-                                elements=formatted_sub,
-                                active_indices=active_idx,
-                            )
-                        )
-                    continue
-
-                is_ptr_field, f_kind, f_target_type = self._is_field_pointer_type(
-                    declared_f_type, f_name, f_val
-                )
-
-                # Case 2: Pointer or Pointer-Array member
-                if is_ptr_field:
-                    target_addr = extract_hex_address(f_val)
-                    if is_explicit_null(f_val, is_known_pointer=True) or not target_addr:
-                        node_fields[f_name] = "NULL"
-                        continue
-
-                    node_fields[f_name] = target_addr
-                    if not self._is_valid_heap_or_data_address(target_addr):
-                        continue
-
-                    # Subcase 2A: Dynamic Pointer-to-Pointer Array (`Type **adj` or `Type **array`)
-                    if (
-                        (f_kind == "struct_ptr_array" or "**" in declared_f_type)
-                        and target_addr not in self._freed_addresses
-                    ):
-                        elem_struct = (
-                            f_target_type
-                            if f_kind == "struct_ptr_array"
-                            else declared_f_type.replace("*", "").strip()
-                        )
-                        if not elem_struct.startswith("struct "):
-                            _, res_s = self._resolve_type_info(elem_struct)
-                            elem_struct = res_s or f"struct {elem_struct}"
-
-                        # Pure DWARF distinction:
-                        # - If `elem_struct` has struct pointer links (e.g. `AdjListNode` with `next`),
-                        #   follow non-NULL entries `field[0 .. N-1]` as edges in the pointer mesh!
-                        # - If `elem_struct` has NO struct pointer links (e.g. `MinHeapNode {v, dist}`),
-                        #   emit it as a compound tuple array in `embedded_arrays`!
-                        if self._has_struct_pointer_links(elem_struct):
-                            table_len = self._infer_pointer_buffer_length(
-                                ptr_leaf_name=f_name,
-                                sister_scalars=sister_scalars,
-                                frame_scalars=all_scalar_ints,
-                            )
-                            if table_len and 1 <= table_len <= MAX_STRUCT_BUFFER_ELEMENTS:
-                                ptr_table_raw = self._eval_expr(
-                                    f"*(void *[{table_len}]*)({target_addr})"
-                                )
-                                if ptr_table_raw:
-                                    head_ptrs = parse_gdb_array(
-                                        ptr_table_raw, max_elems=table_len
-                                    )
-                                    for idx, raw_hp in enumerate(head_ptrs):
-                                        hp_addr = extract_hex_address(str(raw_hp))
-                                        if (
-                                            hp_addr
-                                            and self._is_valid_heap_or_data_address(hp_addr)
-                                            and hp_addr not in self._freed_addresses
-                                        ):
-                                            edge_label = f"{f_name}[{idx}]"
-                                            edge_key = (addr, hp_addr, edge_label)
-                                            if edge_key not in seen_edges:
-                                                seen_edges.add(edge_key)
-                                                edges.append(
-                                                    GraphEdge(
-                                                        source=addr,
-                                                        target=hp_addr,
-                                                        label=edge_label,
-                                                    )
-                                                )
-                                            if hp_addr not in visited_addrs:
-                                                queue.append(
-                                                    (
-                                                        hp_addr,
-                                                        elem_struct,
-                                                        f"{owner_name}->{f_name}[{idx}]",
-                                                    )
-                                                )
-                        else:
-                            comp_snap = self._extract_struct_array_field(
-                                owner_name=owner_name,
-                                field_name=f_name,
-                                array_base_addr=target_addr,
-                                elem_struct_type=elem_struct,
-                                is_pointer_array=True,
-                                sister_scalars=sister_scalars,
-                                leaf_scalar_ints=leaf_scalar_ints,
-                                all_scalar_ints=all_scalar_ints,
-                            )
-                            if comp_snap is not None:
-                                embedded_arrays.append(comp_snap)
-                        continue
-
-                    # Subcase 2B: Dynamic Primitive Buffer (`int *data`, `int *pos`, `double *arr`)
-                    if (
-                        f_kind == "primitive_ptr"
-                        and "**" not in declared_f_type
-                        and target_addr not in self._freed_addresses
-                    ):
-                        elem_c_type = f_target_type
-                        buf_len = self._infer_pointer_buffer_length(
-                            ptr_leaf_name=f_name,
-                            sister_scalars=sister_scalars,
-                            frame_scalars=all_scalar_ints,
-                        )
-                        if buf_len and 1 <= buf_len <= MAX_STRUCT_BUFFER_ELEMENTS:
-                            deref_buf_expr = (
-                                f"*({elem_c_type}[{buf_len}]*)({target_addr})"
-                            )
-                            buf_val_str = self._eval_expr(deref_buf_expr)
-                            if buf_val_str:
-                                elements = [
-                                    format_scalar_val(x)
-                                    for x in parse_gdb_array(
-                                        buf_val_str,
-                                        max_elems=MAX_STRUCT_BUFFER_ELEMENTS,
-                                    )
-                                ]
-                                if elements:
-                                    active_idx = self._collect_struct_buffer_indices(
-                                        owner_name=owner_name,
-                                        field_name=f_name,
-                                        sister_scalars=sister_scalars,
-                                        frame_scalar_ints=leaf_scalar_ints,
-                                        array_len=len(elements),
-                                    )
-                                    embedded_arrays.append(
-                                        ArraySnapshot(
-                                            name=f"{owner_name}->{f_name}",
-                                            type=elem_c_type,
-                                            element_type=elem_c_type,
-                                            is_compound=False,
-                                            capacity=buf_len,
-                                            elements=elements,
-                                            active_indices=active_idx,
-                                        )
-                                    )
-                        continue
-
-                    # Subcase 2C: Single Struct Pointer (`struct Node *next`, `left`, `right`, or `Edge *edge`)
-                    target_s_type = (
-                        f_target_type
-                        if f_kind == "struct_ptr"
-                        else (
-                            declared_f_type.rstrip("*").strip()
-                            if "*" in declared_f_type
-                            else struct_type
-                        )
-                    )
-                    if not target_s_type.startswith("struct "):
-                        _, res_s = self._resolve_type_info(target_s_type)
-                        target_s_type = res_s or f"struct {target_s_type}"
-
-                    # If `target_s_type` has NO pointer links and `sister_scalars` has a size bound > 1,
-                    # check if this pointer was allocated as a contiguous array of structs (e.g. `Edge *edge`)
-                    if not self._has_struct_pointer_links(target_s_type) and sister_scalars:
-                        comp_snap = self._extract_struct_array_field(
-                            owner_name=owner_name,
-                            field_name=f_name,
-                            array_base_addr=target_addr,
-                            elem_struct_type=target_s_type,
-                            is_pointer_array=False,
-                            sister_scalars=sister_scalars,
-                            leaf_scalar_ints=leaf_scalar_ints,
-                            all_scalar_ints=all_scalar_ints,
-                        )
-                        if comp_snap is not None and len(comp_snap.elements) > 1:
-                            embedded_arrays.append(comp_snap)
-                            continue
-
-                    edge_key = (addr, target_addr, f_name)
-                    if edge_key not in seen_edges:
-                        seen_edges.add(edge_key)
-                        edges.append(
-                            GraphEdge(
-                                source=addr,
-                                target=target_addr,
-                                label=f_name,
-                            )
-                        )
-                    if target_addr not in visited_addrs:
-                        queue.append(
-                            (target_addr, target_s_type, f"{owner_name}->{f_name}")
-                        )
-                    continue
-
-                # Case 3: Scalar value field (preserved in exact DWARF declaration order)
-                parsed_scalar = format_scalar_val(parse_scalar(f_val))
-                node_fields[f_name] = parsed_scalar
-                scalar_summary_parts.append(f"{f_name}: {parsed_scalar}")
-
-            node_label = (
-                " · ".join(scalar_summary_parts[:2])
-                if scalar_summary_parts
-                else struct_type.replace("struct ", "")
-            )
-
-            self._last_valid_node_fields[addr] = dict(node_fields)
-
-            nodes.append(
-                GraphNode(
-                    id=addr,
-                    type=struct_type,
-                    c_type=struct_type,
-                    label=node_label,
-                    fields=node_fields,
-                    is_active=bool(pointing_vars),
-                    is_freed=False,
-                    pointers=pointing_vars,
-                )
-            )
+            frontier.extend(next_frontier)
 
         return (
             GraphSnapshot(
@@ -1788,40 +2167,6 @@ class GDBTracer:
             ),
             embedded_arrays,
         )
-
-    def _ensure_struct_field_types(self, struct_type: str) -> Dict[str, str]:
-        if struct_type in self._struct_field_types_cache:
-            return self._struct_field_types_cache[struct_type]
-
-        responses = self._cmd(f"ptype {struct_type}")
-        full_console = "".join(
-            r.get("payload", "") for r in responses if r.get("type") == "console"
-        )
-        return self._parse_and_cache_ptype_fields(struct_type, full_console)
-
-    def _parse_and_cache_ptype_fields(
-        self, struct_type: str, ptype_output: str
-    ) -> Dict[str, str]:
-        field_map: Dict[str, str] = {}
-        brace_start = ptype_output.find("{")
-        brace_end = ptype_output.rfind("}")
-        if brace_start != -1 and brace_end > brace_start:
-            body = ptype_output[brace_start + 1 : brace_end]
-            for raw_line in body.splitlines():
-                line = raw_line.strip().rstrip(";")
-                if not line:
-                    continue
-                m = re.match(
-                    r"^(.+?[\s\*]+)([a-zA-Z_][a-zA-Z0-9_]*)(\[\d+\])?$", line
-                )
-                if m:
-                    f_type = m.group(1).strip()
-                    f_name = m.group(2).strip()
-                    arr_suffix = m.group(3) or ""
-                    field_map[f_name] = f"{f_type}{arr_suffix}"
-
-        self._struct_field_types_cache[struct_type] = field_map
-        return field_map
 
     @staticmethod
     def _is_valid_heap_or_data_address(addr: str) -> bool:
