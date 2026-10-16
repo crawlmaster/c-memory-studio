@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""
+r"""
 backend/src/debugger/gdb_engine.py
 
 High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memory-Studio.
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`):
-     - Records the base memory address (`&arr[0]`) and exact DWARF element count `N` of every
-       stack array (`DW_TAG_array_type` `T[N]`) and heap allocation across all frames.
-     - When a stack or heap array decays to a pointer (`const int *arr`) inside a callee
-       function (`binary_search`), resolves `arr`'s exact address in `_address_bounds_ledger`
-       (or walks caller frames) to bind the length strictly to `N = 10`, preventing stack
-       over-reads and garbage slots.
-  2. Strict Distinction Between Index Cursors and Upper-Bound Parameters:
-     - Read-only bound parameters (used in `right = bound - 1` or `< bound` but never mutated
-       and never subscripting `arr[bound]`) are never emitted as active index pointers.
-  3. Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
-  4. Monotonic Cumulative Heap Block Ledger (`self.heap_blocks`).
+  1. Three-Stage Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`):
+     - `ALLOCATED` (`status="active"`): Tracked in `self.heap_blocks[addr]` with live DWARF fields.
+     - `FREED` (`status="freed"`, `is_freed=True`, `is_dangling=True`): Triggered by `free(addr)`
+       or glibc safe-linking tcache detection (`fd = next_chunk ^ (addr >> 12)`). Freezes last known
+       valid struct fields so tcache metadata (`4331233` / `0x4216e1`) never pollutes the UI.
+       Status is immutable against dangling pointer traversal.
+     - `PURGED` (`status="purged"`): On every step snapshot, any `"freed"` block with `references == 0`
+       (unreachable from all live stack pointers and active heap pointers) is purged from the snapshot.
+  2. Depth-Keyed Call Stack Variable Retention (`_frame_vars_by_depth`):
+     - Preserves caller frame variables per stack depth level so recursive functions never overwrite
+       outer frames of the same function.
+  3. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`).
+  4. Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
   5. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
 """
 
@@ -168,6 +169,7 @@ class GraphNode(BaseModel):
     fields: Dict[str, Any]
     is_active: bool
     is_freed: bool = False
+    is_dangling: bool = False
     pointers: List[str] = Field(default_factory=list)
     self_ref_order: List[str] = Field(default_factory=list)
 
@@ -361,18 +363,26 @@ class GDBTracer:
 
         self._type_cache: Dict[str, DwarfTypeEntry] = {}
 
-        # Authoritative, Monotonic Cumulative Heap Block Ledger
+        # Cumulative Session Heap Block Ledger:
+        # Maps canonical hex address -> {
+        #   "address": str,
+        #   "status": "active" | "freed" | "purged",
+        #   "type": str,
+        #   "fields": Dict[str, Any],      # Frozen last-known valid fields once freed
+        #   "label": str,
+        #   "self_ref_order": List[str],
+        #   "edges": List[GraphEdge],      # Frozen outgoing edges at time of free
+        #   "freed_at_step": Optional[int],
+        # }
         self.heap_blocks: Dict[str, Dict[str, Any]] = {}
         self._freed_addresses: Set[str] = set()
 
-        # Caller-Frame & Heap Array Base Address -> Validated Element Count Ledger:
-        # Maps canonical hex address (`&arr[0]`) -> element_count `N` so when an array
-        # decays to a pointer (`const int *arr`) in a callee frame, we know its exact bound `N`.
+        # Caller-Frame & Heap Array Base Address -> Validated Element Count Ledger
         self._address_bounds_ledger: Dict[str, int] = {}
         self._stack_var_addr_cache: Dict[Tuple[str, str], str] = {}
 
-        # Per-function variable snapshot cache for user caller frames
-        self._frame_vars_by_func: Dict[str, List[Dict[str, str]]] = {}
+        # Depth-keyed call stack variable cache: depth_idx -> (func_name, vars_list)
+        self._frame_vars_by_depth: Dict[int, Tuple[str, List[Dict[str, str]]]] = {}
         self._active_call_stack: List[str] = ["main"]
 
         # Syntactic analysis caches
@@ -415,10 +425,15 @@ class GDBTracer:
         return True
 
     def _mark_address_freed(self, addr: str) -> None:
+        r"""
+        Transitions `addr` to `"status": "freed"` in `self.heap_blocks` and freezes
+        its last known valid struct fields so tcache poison values are never displayed.
+        """
         self._freed_addresses.add(addr)
         self._address_bounds_ledger.pop(addr, None)
         if addr in self.heap_blocks:
-            self.heap_blocks[addr]["status"] = "freed"
+            if self.heap_blocks[addr].get("status") != "purged":
+                self.heap_blocks[addr]["status"] = "freed"
             if self.heap_blocks[addr].get("freed_at_step") is None:
                 self.heap_blocks[addr]["freed_at_step"] = self.step_count
         else:
@@ -437,7 +452,7 @@ class GDBTracer:
         if addr in self._freed_addresses:
             return True
         blk = self.heap_blocks.get(addr)
-        return bool(blk and blk.get("status") == "freed")
+        return bool(blk and blk.get("status") in {"freed", "purged"})
 
     def start(self) -> bool:
         now = time.monotonic()
@@ -646,6 +661,7 @@ class GDBTracer:
                         return True
 
                     prev_func = self._current_func
+                    prev_line = self._current_line
                     self._current_func = func or "main"
                     self._current_file = Path(file_raw).name if file_raw else ""
                     try:
@@ -653,18 +669,47 @@ class GDBTracer:
                     except (ValueError, TypeError):
                         self._current_line = 0
 
+                    # Maintain call stack depth accurately including recursive calls
                     if self._current_func != prev_func:
-                        if self._current_func in self._active_call_stack:
+                        if (
+                            len(self._active_call_stack) >= 2
+                            and self._active_call_stack[-2] == self._current_func
+                        ):
+                            # Returned to immediate caller frame
+                            popped_depth = len(self._active_call_stack) - 1
+                            self._frame_vars_by_depth.pop(popped_depth, None)
+                            self._active_call_stack.pop()
+                        elif self._current_func in self._active_call_stack:
                             idx = self._active_call_stack.index(self._current_func)
-                            for popped_fn in self._active_call_stack[idx + 1 :]:
-                                self._frame_vars_by_func.pop(popped_fn, None)
+                            for d in range(idx + 1, len(self._active_call_stack)):
+                                self._frame_vars_by_depth.pop(d, None)
                             self._active_call_stack = self._active_call_stack[: idx + 1]
                         else:
+                            self._active_call_stack.append(self._current_func)
+                    else:
+                        # Same function name: check if we just entered or exited a recursive self-call
+                        start_l, _ = self._get_function_line_span(
+                            self._current_func, self._current_line
+                        )
+                        if (
+                            prev_line > start_l + 1
+                            and self._current_line <= start_l + 2
+                            and 1 <= prev_line < len(self._source_lines)
+                            and re.search(
+                                rf"\b{re.escape(self._current_func)}\s*\(",
+                                self._source_lines[prev_line],
+                            )
+                        ):
                             self._active_call_stack.append(self._current_func)
                 return False
         return False
 
     def _record_pending_free_on_current_line(self) -> None:
+        r"""
+        Intercepts `free(expr)` on `self._current_line` BEFORE GDB steps over it,
+        evaluates the target pointer address, and permanently marks the block as `"freed"`
+        in `self.heap_blocks` with its last valid fields frozen.
+        """
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line].split("//")[0]
             free_exprs = [
@@ -779,7 +824,7 @@ class GDBTracer:
         return False
 
     # ==========================================================================
-    # Algorithmic Complexity Step Filter
+    # Algorithmic Complexity & Deallocation Step Filter
     # ==========================================================================
 
     def _extract_function_body_by_name(
@@ -804,6 +849,14 @@ class GDBTracer:
         return inner_body
 
     def _is_complex_user_function(self, func_name: str) -> bool:
+        r"""
+        Determines purely from the AST/token structure of `func_name` whether it should be
+        stepped into (`-exec-step`) vs stepped over atomically (`-exec-next`):
+          - Functions containing loops (`for`, `while`, `do`), recursion, OR `free(...)`
+            deallocations return `True` (stepped into so `free()` is intercepted before
+            glibc tcache overwrites the struct's memory).
+          - Straight-line O(1) allocation/initialization helpers return `False`.
+        """
         if func_name in self._func_complexity_cache:
             return self._func_complexity_cache[func_name]
 
@@ -815,8 +868,9 @@ class GDBTracer:
         has_loop = bool(C_LOOP_STATEMENT_RE.search(body))
         self_call_re = re.compile(rf"\b{re.escape(func_name)}\s*\(")
         has_recursion = bool(self_call_re.search(body))
+        has_free_call = bool(FREE_CALL_RE.search(body))
 
-        is_complex = has_loop or has_recursion
+        is_complex = has_loop or has_recursion or has_free_call
         self._func_complexity_cache[func_name] = is_complex
         return is_complex
 
@@ -1151,8 +1205,6 @@ class GDBTracer:
         for var_name, val in scalar_ints.items():
             if var_name not in proven_index_names:
                 continue
-            # Strictly restrict active indices to valid slot range [-1, array_len - 1]
-            # (or array_len ONLY if the variable itself is mutated as a loop induction variable)
             if -1 <= val < array_len:
                 active[var_name] = val
 
@@ -1203,28 +1255,12 @@ class GDBTracer:
         frame_scalars: Dict[str, int],
         ptr_addr: Optional[str] = None,
     ) -> Optional[int]:
-        """
-        Determines the exact element count `N` of a pointer buffer (`ptr_leaf_name` at `ptr_addr`)
-        using a 4-tier structural & caller-frame hierarchy (zero hardcoded names):
-          1. Caller Frame / Address Bounds Ledger (`self._address_bounds_ledger[ptr_addr]`):
-             If `ptr_addr` matches the base address of a known caller-frame `DW_TAG_array_type`
-             (e.g. `int arr[10]` in `main` passed as `const int *arr` to `binary_search`),
-             returns the exact DWARF bound `10` immediately!
-          2. Syntactic Allocation / Upper-Bound Expression Proof (`malloc(N * ...)`, `var < N`,
-             or `idx = N - 1` where `idx` subscripts `ptr_leaf_name`):
-             Matches companion integer parameters that act as syntactic bounds (never arbitrary
-             comparison values like `target = 23`).
-          3. Structural Sister Scalars (for struct-embedded buffers `s->data`, `uf->parent`).
-          4. Caller Frame Integer Bound Fallback.
-        """
-        # Tier 1: Exact Address Match in Caller-Frame / Allocation Ledger
         if ptr_addr and ptr_addr in self._address_bounds_ledger:
             return self._address_bounds_ledger[ptr_addr]
 
         if ptr_leaf_name not in self._alloc_bound_expr_cache:
             candidates: List[str] = []
             esc = re.escape(ptr_leaf_name)
-            # 1A: `ptr = malloc(BOUND * sizeof...)`
             alloc_re = re.compile(
                 rf"\b{esc}\s*(?:\[[^\]]+\])?\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(\s*([^,\)\*]+)"
             )
@@ -1233,14 +1269,12 @@ class GDBTracer:
                     if ident not in candidates:
                         candidates.append(ident)
 
-            # 1B: `< BOUND` or `<= BOUND - 1` in loops
             bound_re = re.compile(rf"<\s*([a-zA-Z_][a-zA-Z0-9_]*)\b")
             for m in bound_re.finditer(self._full_clean_source):
                 ident = m.group(1)
                 if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
                     candidates.append(ident)
 
-            # 1C: `cursor = BOUND - 1` (e.g. `int right = n - 1;` in binary search / quicksort)
             minus_one_re = re.compile(
                 r"\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*-\s*1\b"
             )
@@ -1254,7 +1288,6 @@ class GDBTracer:
         bound_candidates = self._alloc_bound_expr_cache[ptr_leaf_name]
         proven_cursors = self._get_global_field_subscript_cursors(ptr_leaf_name)
 
-        # Tier 2: Sister scalars in the same struct matching syntactic bound expressions
         for cand in bound_candidates:
             if cand in sister_scalars and cand not in proven_cursors:
                 val = sister_scalars[cand]
@@ -1274,7 +1307,6 @@ class GDBTracer:
                 self._address_bounds_ledger[ptr_addr] = resolved_len
             return resolved_len
 
-        # Tier 3: Frame scalars that match syntactic bound expressions (`< BOUND`, `BOUND - 1`, `malloc(BOUND)`)
         local_proven_cursors = self._get_syntactically_proven_indices(
             self._current_func, self._current_line, ptr_leaf_name
         )
@@ -1286,7 +1318,6 @@ class GDBTracer:
                         self._address_bounds_ledger[ptr_addr] = val
                     return val
 
-        # Tier 4: If only a cursor sister field is >= 0, read up to `cursor + 1`
         for k, val in sister_scalars.items():
             if k in proven_cursors and 0 <= val < MAX_STRUCT_BUFFER_ELEMENTS:
                 return val + 1
@@ -1563,8 +1594,12 @@ class GDBTracer:
                 continue
             filtered_leaf_vars.append(v)
 
+        curr_depth = max(0, len(self._active_call_stack) - 1)
         if self._current_func not in SYSTEM_ENTRY_FUNCTIONS:
-            self._frame_vars_by_func[self._current_func] = filtered_leaf_vars
+            self._frame_vars_by_depth[curr_depth] = (
+                self._current_func,
+                filtered_leaf_vars,
+            )
 
         merged_vars: List[Dict[str, Any]] = []
         seen_var_names: Set[str] = set()
@@ -1580,10 +1615,13 @@ class GDBTracer:
             v_copy["frame_level"] = 0
             merged_vars.append(v_copy)
 
-        for caller_fn in reversed(self._active_call_stack[:-1]):
+        for depth_idx in range(curr_depth - 1, -1, -1):
+            entry = self._frame_vars_by_depth.get(depth_idx)
+            if not entry:
+                continue
+            caller_fn, caller_vars = entry
             if caller_fn in SYSTEM_ENTRY_FUNCTIONS:
                 continue
-            caller_vars = self._frame_vars_by_func.get(caller_fn, [])
             for v in caller_vars:
                 v_name = v.get("name", "")
                 v_type = v.get("type", "")
@@ -1595,13 +1633,13 @@ class GDBTracer:
                     if addr:
                         seen_pointer_addrs.add(addr)
                     v_copy = dict(v)
-                    v_copy["frame_level"] = 1
+                    v_copy["frame_level"] = curr_depth - depth_idx
                     merged_vars.append(v_copy)
                 elif addr and addr not in seen_pointer_addrs:
                     seen_pointer_addrs.add(addr)
                     v_copy = dict(v)
                     v_copy["name"] = f"{caller_fn}:{v_name}"
-                    v_copy["frame_level"] = 1
+                    v_copy["frame_level"] = curr_depth - depth_idx
                     merged_vars.append(v_copy)
 
         return (list(self._active_call_stack), merged_vars)
@@ -1643,6 +1681,11 @@ class GDBTracer:
     def _check_explicit_reallocation_on_last_line(
         self, var_name: str, addr: str, resolved_type: str
     ) -> None:
+        r"""
+        A previously freed/purged address `addr` can ONLY transition back to `"active"`
+        if the immediately preceding executed line explicitly invoked `malloc`, `calloc`,
+        or `realloc` into `var_name`. Dangling pointers never resurrect freed blocks.
+        """
         if not self._is_address_freed(addr):
             return
         if not (1 <= self._last_executed_line < len(self._source_lines)):
@@ -1712,9 +1755,6 @@ class GDBTracer:
                 arr_len = min(int(arr_match.group(2)), MAX_ARRAY_ELEMENTS)
                 if f_level == 0:
                     raw_array_vars.append((v_name, elem_type, arr_len, f_level))
-                    # Record the base stack address `&arr[0]` in `_address_bounds_ledger`
-                    # so if `arr` is passed to a callee (`const int *arr` in `binary_search`),
-                    # its exact DWARF bound `arr_len` is known by address!
                     addr_cache_key = (self._current_func, v_name)
                     if addr_cache_key not in self._stack_var_addr_cache:
                         base_addr_raw = self._eval_expr(f"&{v_name}[0]")
@@ -1880,7 +1920,6 @@ class GDBTracer:
                 or not self._is_valid_memory_buffer_address(addr)
             ):
                 continue
-            # Only visualize top-level pointers that belong to the active frame (or are unique)
             if f_level != 0 and clean_ptr_name in locals_out:
                 continue
 
@@ -1905,7 +1944,6 @@ class GDBTracer:
                 expr_val = batch_results.get(expr_key)
                 if not expr_val:
                     continue
-                # Strictly clip to `cap_len` so stack memory beyond `cap_len` is never emitted
                 raw_items = parse_gdb_array(expr_val, max_elems=cap_len)[:cap_len]
                 if is_comp:
                     compound_elems: List[Dict[str, Any]] = []
@@ -2059,7 +2097,7 @@ class GDBTracer:
                     )
 
         # ----------------------------------------------------------------------
-        # Pass 3: Monotonic Heap Block Ledger & Pointer-Mesh Crawler
+        # Pass 3: Three-Stage Heap Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`)
         # ----------------------------------------------------------------------
         graph_snapshot, embedded_arrays = self._crawl_pointer_graph(
             active_struct_ptrs, leaf_scalar_ints, scalar_ints
@@ -2150,6 +2188,7 @@ class GDBTracer:
                         },
                         is_active=bool(ptrs),
                         is_freed=False,
+                        is_dangling=False,
                         pointers=ptrs,
                     )
                 )
@@ -2168,7 +2207,7 @@ class GDBTracer:
         return None
 
     # ==========================================================================
-    # Pipelined DWARF Pointer-Mesh & Cumulative Heap Ledger Crawler
+    # Pipelined DWARF Pointer-Mesh & Reference-Counted Heap Lifecycle Crawler
     # ==========================================================================
 
     def _extract_struct_array_field(
@@ -2267,8 +2306,20 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
+        r"""
+        Crawls all reachable struct nodes starting from `active_struct_ptrs` and enforces
+        the 3-stage `ALLOCATED` -> `FREED` -> `PURGED` lifecycle:
+          - Seeds `frontier` ONLY from live stack pointers (`active_struct_ptrs`).
+          - Tracks `reference_counts[addr]` across live stack pointers and live heap pointer fields.
+          - If a block is `"freed"` and `reference_counts[addr] > 0`, emits it with
+            `status="freed"`, `is_freed=True`, `is_dangling=True`, and its frozen pre-free `fields`.
+          - If a block is `"freed"` and `reference_counts[addr] == 0` (unreachable from all
+            live stack and active heap pointers), transitions it to `"purged"` and drops it
+            from the snapshot.
+        """
         emitted_node_ids: Set[str] = set()
         queued_addresses: Set[str] = set()
+        reference_counts: Dict[str, int] = {}
         nodes: List[GraphNode] = []
         edges: List[GraphEdge] = []
         embedded_arrays: List[ArraySnapshot] = []
@@ -2277,22 +2328,16 @@ class GDBTracer:
         addr_to_ptr_names: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, str, str]] = []
 
+        # Seed strictly from live stack pointers across active call stack frames
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
             if self._is_valid_heap_or_data_address(addr):
                 addr_to_ptr_names.setdefault(addr, []).append(ptr_name)
+                reference_counts[addr] = reference_counts.get(addr, 0) + 1
                 if addr not in queued_addresses:
                     queued_addresses.add(addr)
                     frontier.append((addr, s_type, ptr_name.split(":")[-1]))
-
-        for blk_addr, blk_info in list(self.heap_blocks.items()):
-            if (
-                blk_addr not in queued_addresses
-                and self._is_valid_heap_or_data_address(blk_addr)
-            ):
-                queued_addresses.add(blk_addr)
-                frontier.append((blk_addr, blk_info.get("type", "struct"), "heap"))
 
         while frontier and len(nodes) < MAX_GRAPH_NODES:
             current_batch = frontier[: MAX_GRAPH_NODES - len(nodes)]
@@ -2319,10 +2364,33 @@ class GDBTracer:
                             fields=dict(saved_fields),
                             is_active=bool(pointing_vars),
                             is_freed=True,
+                            is_dangling=True,
                             pointers=pointing_vars,
                             self_ref_order=list(saved_order),
                         )
                     )
+                    # If this freed block was reached via a dangling pointer, only follow its
+                    # frozen edges to child blocks that are ALSO freed (and not yet purged),
+                    # preserving post-order freed subtrees (`cleanup(root)`) without pulling
+                    # already-purged nodes back.
+                    for saved_edge in blk.get("edges", []):
+                        tgt = saved_edge.target
+                        tgt_blk = self.heap_blocks.get(tgt)
+                        if (
+                            tgt_blk
+                            and tgt_blk.get("status") == "freed"
+                            and (tgt_blk.get("freed_at_step") or 0) <= (blk.get("freed_at_step") or self.step_count)
+                        ):
+                            reference_counts[tgt] = reference_counts.get(tgt, 0) + 1
+                            edge_key = (saved_edge.source, tgt, saved_edge.label)
+                            if edge_key not in seen_edges:
+                                seen_edges.add(edge_key)
+                                edges.append(saved_edge)
+                            if tgt not in queued_addresses and tgt not in emitted_node_ids:
+                                queued_addresses.add(tgt)
+                                frontier.append(
+                                    (tgt, tgt_blk.get("type", saved_type), f"{owner_name}->{saved_edge.label}")
+                                )
                 else:
                     active_candidates.append((addr, struct_type, owner_name))
 
@@ -2356,7 +2424,8 @@ class GDBTracer:
                 field_order_list = list(field_types.keys())
                 pointing_vars = addr_to_ptr_names.get(addr, [])
 
-                if self._is_tcache_poisoned(addr, raw_fields):
+                # Check if glibc tcache poisoned this chunk (supports 1st, 2nd, ..., k-th chunk safe-linking)
+                if self._is_tcache_poisoned(addr, raw_fields, field_types):
                     self._mark_address_freed(addr)
                     blk = self.heap_blocks.get(addr, {})
                     saved_fields = blk.get("fields") or {"status": "FREED"}
@@ -2371,6 +2440,7 @@ class GDBTracer:
                             fields=dict(saved_fields),
                             is_active=bool(pointing_vars),
                             is_freed=True,
+                            is_dangling=True,
                             pointers=pointing_vars,
                             self_ref_order=list(saved_order),
                         )
@@ -2427,6 +2497,9 @@ class GDBTracer:
                                     sub_addr
                                 ):
                                     non_null_count += 1
+                                    reference_counts[sub_addr] = (
+                                        reference_counts.get(sub_addr, 0) + 1
+                                    )
                                     edge_label = f"{f_name}[{idx}]"
                                     edge_obj = GraphEdge(
                                         source=addr,
@@ -2523,6 +2596,9 @@ class GDBTracer:
                                         for idx, raw_hp in enumerate(head_ptrs):
                                             hp_addr = extract_hex_address(str(raw_hp))
                                             if hp_addr and self._is_valid_heap_or_data_address(hp_addr):
+                                                reference_counts[hp_addr] = (
+                                                    reference_counts.get(hp_addr, 0) + 1
+                                                )
                                                 edge_label = f"{f_name}[{idx}]"
                                                 edge_obj = GraphEdge(
                                                     source=addr,
@@ -2637,6 +2713,9 @@ class GDBTracer:
                                 continue
 
                         if target_addr != addr:
+                            reference_counts[target_addr] = (
+                                reference_counts.get(target_addr, 0) + 1
+                            )
                             edge_obj = GraphEdge(
                                 source=addr,
                                 target=target_addr,
@@ -2700,6 +2779,7 @@ class GDBTracer:
                         fields=node_fields,
                         is_active=bool(pointing_vars),
                         is_freed=False,
+                        is_dangling=False,
                         pointers=pointing_vars,
                         self_ref_order=self_ref_fields_ordered,
                     )
@@ -2707,14 +2787,11 @@ class GDBTracer:
 
             frontier.extend(next_frontier)
 
+        # Transition any `"freed"` block in `self.heap_blocks` with 0 references to `"purged"`
         for blk_addr, blk_info in self.heap_blocks.items():
-            if blk_info.get("status") == "freed" and blk_addr in emitted_node_ids:
-                for saved_edge in blk_info.get("edges", []):
-                    if saved_edge.target in emitted_node_ids:
-                        edge_key = (saved_edge.source, saved_edge.target, saved_edge.label)
-                        if edge_key not in seen_edges:
-                            seen_edges.add(edge_key)
-                            edges.append(saved_edge)
+            if blk_info.get("status") == "freed":
+                if reference_counts.get(blk_addr, 0) == 0:
+                    blk_info["status"] = "purged"
 
         return (
             GraphSnapshot(
@@ -2738,11 +2815,6 @@ class GDBTracer:
 
     @staticmethod
     def _is_valid_memory_buffer_address(addr: str) -> bool:
-        """
-        Permits both valid heap/data addresses AND user stack addresses (`>= 0x7ffffff00000`
-        on x86_64) so stack arrays decayed to pointers (`const int *arr`) can be dereferenced.
-        Excludes shared library `mmap` regions (`0x7f0000000000 .. 0x7fffffefffff`).
-        """
         try:
             val = int(addr, 16)
         except ValueError:
@@ -2753,17 +2825,82 @@ class GDBTracer:
             return False
         return True
 
-    def _is_tcache_poisoned(self, addr: str, raw_fields: Dict[str, str]) -> bool:
+    def _is_tcache_poisoned(
+        self,
+        addr: str,
+        raw_fields: Dict[str, str],
+        field_types: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        r"""
+        Detects glibc `ptmalloc2` tcache deallocation poison across ALL chunks in a tcache bin:
+          1. 1st chunk in bin (`next == NULL`):
+             `first_val == (addr_int >> 12)`
+          2. 2nd..k-th chunk in bin (glibc 2.32+ Safe-Linking XOR):
+             `fd = prev_chunk_addr ^ (addr_int >> 12)` (e.g. `4331233 = 0x4216e1`).
+             XORing `first_val` with `(addr_int >> 12)` recovers `prev_chunk_addr` in the same
+             4KB heap page (`(decoded >> 12) == (addr_int >> 12)` and 16-byte aligned) or in
+             `self.heap_blocks` / `self._freed_addresses`.
+          3. Offset 8 `tcache_key` corruption:
+             Pointer member overwritten with an unaligned cookie (`addr & 0x7 != 0`) or
+             `tcache_perthread_struct` base (`(addr & 0xfff) == 0x010`).
+        """
         if self._is_address_freed(addr):
             return True
         try:
             addr_int = int(addr, 16)
-            expected_safe_link_base = addr_int >> 12
+            safe_link_key = addr_int >> 12
             first_val_str = next(iter(raw_fields.values()), "")
             first_val = parse_scalar(first_val_str)
-            if isinstance(first_val, int) and first_val == expected_safe_link_base:
-                self._mark_address_freed(addr)
-                return True
+
+            if isinstance(first_val, str) and first_val.startswith("0x"):
+                first_val = int(first_val, 16)
+
+            if isinstance(first_val, int) and first_val > 0:
+                low32_val = first_val & 0xFFFFFFFF
+                low32_key = safe_link_key & 0xFFFFFFFF
+
+                # Check 1: 1st chunk in tcache bin (`next == NULL`)
+                if first_val == safe_link_key or low32_val == low32_key:
+                    self._mark_address_freed(addr)
+                    return True
+
+                # Check 2: Safe-linked 2nd..k-th chunk in tcache bin (`fd = next_chunk ^ (addr >> 12)`)
+                decoded_low32 = low32_val ^ low32_key
+                decoded_full_addr = (addr_int & ~0xFFFFFFFF) | decoded_low32
+                decoded_hex = hex(decoded_full_addr)
+
+                if (
+                    decoded_hex in self.heap_blocks
+                    or decoded_hex in self._freed_addresses
+                ):
+                    self._mark_address_freed(addr)
+                    return True
+
+                # Same 4KB heap page & 16-byte chunk alignment check (catches `4331233` = `0x4216e1`)
+                if (
+                    decoded_full_addr != addr_int
+                    and (decoded_full_addr >> 12) == safe_link_key
+                    and (decoded_full_addr & 0xF) == 0
+                ):
+                    self._mark_address_freed(addr)
+                    return True
+
+            # Check 3: Pointer field overwritten by `tcache_key`
+            if field_types:
+                for f_name, f_val_str in raw_fields.items():
+                    decl_t = field_types.get(f_name, "")
+                    if "*" in decl_t:
+                        p_addr = extract_hex_address(f_val_str)
+                        if p_addr:
+                            p_int = int(p_addr, 16)
+                            # Struct pointers on 64-bit heap are always 8-byte aligned;
+                            # an unaligned pointer or `tcache_perthread_struct` (`0x...010`) indicates tcache_key
+                            if (p_int & 0x7) != 0 or (
+                                (p_int & 0xFFF) == 0x010
+                                and p_addr not in self.heap_blocks
+                            ):
+                                self._mark_address_freed(addr)
+                                return True
         except Exception:
             pass
         return False
