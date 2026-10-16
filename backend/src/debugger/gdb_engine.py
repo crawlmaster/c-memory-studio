@@ -6,19 +6,20 @@ High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memor
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Dedicated Logical Graph Builder (`_build_logical_graph_snapshot`) with Immediate Edge Pruning:
-     - Constructs the mathematical graph G = (V, E) (`logical_graph`) directly from DWARF
-       adjacency-list containers or index-buffer forests.
-     - When an adjacency wrapper struct (e.g. `Edge *tmp`) is freed via `free(tmp)`, its
-       directed edge `(u -> v)` is IMMEDIATELY pruned from `logical_graph.edges`, while
-       traversal continues across `tmp`'s pre-free `next` link so remaining active edges
-       in the same bucket (`curr`) stay visible until freed.
-     - Never emits freed physical blocks as active topological nodes in `logical_graph`.
-     - Preserves the original vertex set `V` (even when vertices reach degree 0).
-  2. Three-Stage Physical Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`).
-  3. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`).
-  4. Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
-  5. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
+  1. Deterministic Step-Into for All User Functions (`_should_step_into_current_line`):
+     - Automatically steps into (`-exec-step`) any function call `foo(...)` defined in the
+       user's source code (`self._user_source_identifiers`) that is not a C keyword or
+       standard library routine (`STDLIB_FUNCTIONS`).
+     - If GDB enters a libc/runtime routine on a compound line, `step_next_user_line()`
+       automatically issues `-exec-finish` to return to the user frame.
+  2. Exact Pipelined Call-Stack & Recursive Frame Tracking (`_collect_fast_frame_variables`):
+     - Pipelines `-stack-list-frames` and `-stack-list-variables --simple-values` in a
+       single GDB-MI write cycle to track recursive depth changes (`quick_sort`, `insert`,
+       `cleanup`) accurately without extra IPC round-trips.
+  3. Dedicated Logical Graph Builder (`_build_logical_graph_snapshot`) with Immediate Edge Pruning.
+  4. Three-Stage Physical Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`).
+  5. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`) &
+     Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
 """
 
 import asyncio
@@ -93,8 +94,21 @@ SYSTEM_ENTRY_FUNCTIONS = {
     "_dl_fini",
 }
 
-C_CONTROL_KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "typeof", "else", "case"}
-C_LOOP_STATEMENT_RE = re.compile(r"\b(for|while|do)\b")
+C_CONTROL_KEYWORDS = {
+    "if", "for", "while", "switch", "return", "sizeof", "typeof", "else", "case"
+}
+
+STDLIB_FUNCTIONS = {
+    "malloc", "calloc", "realloc", "free",
+    "printf", "fprintf", "sprintf", "snprintf", "vprintf", "vfprintf",
+    "scanf", "fscanf", "sscanf",
+    "puts", "fputs", "putchar", "putc", "fputc", "getchar", "getc", "fgetc", "fgets",
+    "memcpy", "memmove", "memset", "memcmp", "memchr",
+    "strlen", "strcpy", "strncpy", "strcat", "strncat", "strcmp", "strncmp", "strchr", "strstr",
+    "atoi", "atol", "atof", "strtol", "strtoul", "strtod",
+    "abs", "labs", "llabs", "rand", "srand", "time", "clock",
+    "exit", "abort", "assert", "__assert_fail", "perror", "qsort", "bsearch",
+}
 
 C_IDENT_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b")
 C_COMMENTS_AND_STRINGS_RE = re.compile(
@@ -113,9 +127,6 @@ PRIMITIVE_TYPES = {
     "size_t", "ssize_t", "ptrdiff_t", "bool", "_Bool"
 }
 
-STDLIB_CALL_RE = re.compile(
-    r"\b(malloc|calloc|realloc|free|printf|fprintf|sprintf|snprintf|scanf|fscanf|puts|putchar|getchar|memcpy|memmove|memset|memcmp|strlen|strcpy|strncpy|strcmp|exit|abort)\s*\("
-)
 USER_FUNC_CALL_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
 
 
@@ -374,9 +385,7 @@ class GDBTracer:
         self.heap_blocks: Dict[str, Dict[str, Any]] = {}
         self._freed_addresses: Set[str] = set()
 
-        # Persistent Logical Graph Metadata across the session so isolated vertices V
-        # remain visible even when adjacency lists are being deallocated:
-        # Maps container_addr -> {"num_vertices": int, "head_addrs": List[Optional[str]], "elem_type": str}
+        # Persistent Logical Graph Metadata across the session
         self._logical_adj_containers: Dict[str, Dict[str, Any]] = {}
         self._logical_vertex_count: Optional[int] = None
 
@@ -394,7 +403,6 @@ class GDBTracer:
         self._func_body_cache: Dict[str, str] = {}
         self._func_line_span_cache: Dict[str, Tuple[int, int]] = {}
         self._var_decl_line_cache: Dict[Tuple[str, str], Optional[Tuple[int, bool]]] = {}
-        self._func_complexity_cache: Dict[str, bool] = {}
         self._alloc_bound_expr_cache: Dict[str, List[str]] = {}
         self._self_indexed_buffers_cache: Dict[str, bool] = {}
 
@@ -552,6 +560,63 @@ class GDBTracer:
 
         return responses
 
+    def _cmd_batch_tokenized(
+        self, mi_commands: List[str], timeout: float = STEP_INACTIVITY_TIMEOUT_SEC
+    ) -> Dict[int, Dict[str, Any]]:
+        r"""
+        Pipelines multiple arbitrary GDB-MI commands in a single pipe write and waits
+        until every dispatched token returns its `result` record.
+        """
+        self._check_budget()
+        if not self.gdb or not mi_commands:
+            return {}
+
+        pending_tokens: Set[int] = set()
+        lines: List[str] = []
+        ordered_tokens: List[int] = []
+
+        for cmd in mi_commands:
+            self._token_counter += 1
+            tok = self._token_counter
+            pending_tokens.add(tok)
+            ordered_tokens.append(tok)
+            lines.append(f"{tok}{cmd}")
+
+        deadline = time.monotonic() + timeout
+        self.last_step_time = time.monotonic()
+
+        responses = self.gdb.write(
+            "\n".join(lines),
+            timeout_sec=0.05,
+            raise_error_on_timeout=False,
+        )
+
+        result_by_token: Dict[int, Dict[str, Any]] = {}
+
+        def harvest(resp_list: List[Dict[str, Any]]) -> None:
+            for r in resp_list:
+                if r.get("type") == "result":
+                    tok_val = r.get("token")
+                    if tok_val is not None:
+                        try:
+                            t_int = int(tok_val)
+                        except (ValueError, TypeError):
+                            continue
+                        if t_int in pending_tokens:
+                            pending_tokens.discard(t_int)
+                            result_by_token[t_int] = r
+
+        harvest(responses)
+
+        while pending_tokens and time.monotonic() < deadline:
+            more = self.gdb.get_gdb_response(
+                timeout_sec=0.015, raise_error_on_timeout=False
+            )
+            if more:
+                harvest(more)
+
+        return {idx: result_by_token.get(tok, {}) for idx, tok in enumerate(ordered_tokens)}
+
     def _eval_expr(self, expr: str) -> Optional[str]:
         escaped = expr.replace('"', '\\"')
         responses = self._cmd_tokenized(f'-data-evaluate-expression "{escaped}"')
@@ -659,44 +724,12 @@ class GDBTracer:
                     if func in SYSTEM_ENTRY_FUNCTIONS or func.startswith("_"):
                         return True
 
-                    prev_func = self._current_func
-                    prev_line = self._current_line
                     self._current_func = func or "main"
                     self._current_file = Path(file_raw).name if file_raw else ""
                     try:
                         self._current_line = int(line_raw)
                     except (ValueError, TypeError):
                         self._current_line = 0
-
-                    if self._current_func != prev_func:
-                        if (
-                            len(self._active_call_stack) >= 2
-                            and self._active_call_stack[-2] == self._current_func
-                        ):
-                            popped_depth = len(self._active_call_stack) - 1
-                            self._frame_vars_by_depth.pop(popped_depth, None)
-                            self._active_call_stack.pop()
-                        elif self._current_func in self._active_call_stack:
-                            idx = self._active_call_stack.index(self._current_func)
-                            for d in range(idx + 1, len(self._active_call_stack)):
-                                self._frame_vars_by_depth.pop(d, None)
-                            self._active_call_stack = self._active_call_stack[: idx + 1]
-                        else:
-                            self._active_call_stack.append(self._current_func)
-                    else:
-                        start_l, _ = self._get_function_line_span(
-                            self._current_func, self._current_line
-                        )
-                        if (
-                            prev_line > start_l + 1
-                            and self._current_line <= start_l + 2
-                            and 1 <= prev_line < len(self._source_lines)
-                            and re.search(
-                                rf"\b{re.escape(self._current_func)}\s*\(",
-                                self._source_lines[prev_line],
-                            )
-                        ):
-                            self._active_call_stack.append(self._current_func)
                 return False
         return False
 
@@ -716,6 +749,12 @@ class GDBTracer:
     def _get_function_line_span(
         self, func_name: str, anchor_line: int
     ) -> Tuple[int, int]:
+        r"""
+        Locates `(header_line, end_line)` for `func_name` in `self._source_lines`.
+        Searches backwards from `anchor_line` first, and if not found, searches forwards
+        across the entire source file (`1 .. total_lines - 1`) so functions defined anywhere
+        in `target.c` are always resolved.
+        """
         if func_name in self._func_line_span_cache:
             return self._func_line_span_cache[func_name]
 
@@ -724,7 +763,7 @@ class GDBTracer:
             return (1, 1)
 
         func_def_re = re.compile(rf"\b{re.escape(func_name)}\s*\([^\)]*\)\s*\{{?")
-        header_line = 1
+        header_line: Optional[int] = None
 
         search_from = min(max(1, anchor_line), total_lines - 1)
         for line_idx in range(search_from, 0, -1):
@@ -732,6 +771,22 @@ class GDBTracer:
             if func_def_re.search(line_clean) and not line_clean.endswith(";"):
                 header_line = line_idx
                 break
+
+        if header_line is None:
+            for line_idx in range(1, total_lines):
+                line_clean = self._source_lines[line_idx].split("//")[0].strip()
+                if func_def_re.search(line_clean) and not line_clean.endswith(";"):
+                    next_line = (
+                        self._source_lines[line_idx + 1].split("//")[0].strip()
+                        if line_idx + 1 < total_lines
+                        else ""
+                    )
+                    if "{" in line_clean or next_line.startswith("{"):
+                        header_line = line_idx
+                        break
+
+        if header_line is None:
+            header_line = 1
 
         brace_depth = 0
         saw_open = False
@@ -815,7 +870,7 @@ class GDBTracer:
         return False
 
     # ==========================================================================
-    # Algorithmic Complexity & Deallocation Step Filter
+    # Deterministic Step-Into for All User Functions
     # ==========================================================================
 
     def _extract_function_body_by_name(
@@ -839,39 +894,33 @@ class GDBTracer:
         self._func_body_cache[func_name] = inner_body
         return inner_body
 
-    def _is_complex_user_function(self, func_name: str) -> bool:
-        if func_name in self._func_complexity_cache:
-            return self._func_complexity_cache[func_name]
-
-        body = self._extract_function_body_by_name(func_name)
-        if not body:
-            self._func_complexity_cache[func_name] = False
-            return False
-
-        has_loop = bool(C_LOOP_STATEMENT_RE.search(body))
-        self_call_re = re.compile(rf"\b{re.escape(func_name)}\s*\(")
-        has_recursion = bool(self_call_re.search(body))
-        has_free_call = bool(FREE_CALL_RE.search(body))
-
-        is_complex = has_loop or has_recursion or has_free_call
-        self._func_complexity_cache[func_name] = is_complex
-        return is_complex
-
     def _should_step_into_current_line(self) -> bool:
+        r"""
+        Deterministic Step-Into Rule:
+        Inspects the current source line (with comments and string literals stripped).
+        If it contains ANY function call `foo(...)` where `foo` is:
+          1. NOT a C control/syntax keyword (`if`, `for`, `while`, `sizeof`, etc.),
+          2. NOT a standard library routine (`malloc`, `free`, `printf`, etc.), and
+          3. Defined in the user's source code (`self._user_source_identifiers`),
+        ALWAYS returns `True` to trigger `-exec-step`.
+        """
         if not (1 <= self._current_line < len(self._source_lines)):
             return False
-        src_line = self._source_lines[self._current_line].split("//")[0].strip()
-        if not src_line:
+
+        raw_line = self._source_lines[self._current_line]
+        clean_line = C_COMMENTS_AND_STRINGS_RE.sub(" ", raw_line).strip()
+        if not clean_line:
             return False
 
-        if STDLIB_CALL_RE.search(src_line):
-            return False
-
-        for match in USER_FUNC_CALL_RE.finditer(src_line):
+        for match in USER_FUNC_CALL_RE.finditer(clean_line):
             fn_name = match.group(1)
-            if fn_name in C_CONTROL_KEYWORDS or fn_name in C_SYNTAX_KEYWORDS:
+            if (
+                fn_name in C_CONTROL_KEYWORDS
+                or fn_name in C_SYNTAX_KEYWORDS
+                or fn_name in STDLIB_FUNCTIONS
+            ):
                 continue
-            if self._is_complex_user_function(fn_name):
+            if not self._user_source_identifiers or fn_name in self._user_source_identifiers:
                 return True
 
         return False
@@ -888,7 +937,7 @@ class GDBTracer:
         if self._update_stop_state(responses):
             return False
 
-        for _ in range(4):
+        for _ in range(6):
             if (
                 self._current_file == self.source_path.name
                 and self._current_line > 0
@@ -1266,6 +1315,14 @@ class GDBTracer:
                 if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
                     candidates.append(ident)
 
+            plus_one_re = re.compile(
+            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\+\s*1\b"
+            )
+            for m in plus_one_re.finditer(self._full_clean_source):
+                ident = m.group(1)
+                if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
+                    candidates.append(ident)
+
             self._alloc_bound_expr_cache[ptr_leaf_name] = candidates
 
         bound_candidates = self._alloc_bound_expr_cache[ptr_leaf_name]
@@ -1558,12 +1615,46 @@ class GDBTracer:
         return (False, "primitive", clean_type or "int")
 
     def _collect_fast_frame_variables(self) -> Tuple[List[str], List[Dict[str, Any]]]:
-        var_res = self._cmd_tokenized("-stack-list-variables --simple-values")
-        current_frame_vars: List[Dict[str, str]] = []
-        for r in var_res:
-            if r.get("type") == "result" and r.get("message") == "done":
-                current_frame_vars = r.get("payload", {}).get("variables", [])
-                break
+        r"""
+        Pipelines `-stack-list-frames` and `-stack-list-variables --simple-values`
+        in a single GDB-MI write to obtain the exact recursive call stack and active
+        frame variables without extra pipe round-trips.
+        """
+        batch_res = self._cmd_batch_tokenized(
+            ["-stack-list-frames", "-stack-list-variables --simple-values"]
+        )
+
+        # 1. Reconstruct exact user call stack from `-stack-list-frames`
+        frames_record = batch_res.get(0, {})
+        raw_stack = frames_record.get("payload", {}).get("stack", []) if isinstance(frames_record.get("payload"), dict) else []
+        user_call_stack: List[str] = []
+
+        for f_entry in reversed(raw_stack):
+            f_dict = f_entry.get("frame", f_entry) if isinstance(f_entry, dict) else {}
+            fn = f_dict.get("func", "")
+            f_file = f_dict.get("file") or f_dict.get("fullname") or ""
+            if not fn or fn in SYSTEM_ENTRY_FUNCTIONS or fn.startswith("_"):
+                continue
+            if not f_file or Path(f_file).name == self.source_path.name:
+                user_call_stack.append(fn)
+
+        if not user_call_stack:
+            user_call_stack = [self._current_func]
+
+        self._active_call_stack = user_call_stack
+        curr_depth = len(self._active_call_stack) - 1
+
+        # Purge any cached frame variables from deeper recursive levels that have already returned
+        for stale_depth in [d for d in self._frame_vars_by_depth if d > curr_depth]:
+            self._frame_vars_by_depth.pop(stale_depth, None)
+
+        # 2. Extract leaf frame variables from `-stack-list-variables --simple-values`
+        vars_record = batch_res.get(1, {})
+        current_frame_vars: List[Dict[str, str]] = (
+            vars_record.get("payload", {}).get("variables", [])
+            if isinstance(vars_record.get("payload"), dict)
+            else []
+        )
 
         filtered_leaf_vars: List[Dict[str, str]] = []
         for v in current_frame_vars:
@@ -1577,7 +1668,6 @@ class GDBTracer:
                 continue
             filtered_leaf_vars.append(v)
 
-        curr_depth = max(0, len(self._active_call_stack) - 1)
         if self._current_func not in SYSTEM_ENTRY_FUNCTIONS:
             self._frame_vars_by_depth[curr_depth] = (
                 self._current_func,
@@ -1621,7 +1711,7 @@ class GDBTracer:
                 elif addr and addr not in seen_pointer_addrs:
                     seen_pointer_addrs.add(addr)
                     v_copy = dict(v)
-                    v_copy["name"] = f"{caller_fn}:{v_name}"
+                    v_copy["name"] = f"{caller_fn}#{depth_idx}:{v_name}"
                     v_copy["frame_level"] = curr_depth - depth_idx
                     merged_vars.append(v_copy)
 
@@ -1791,7 +1881,7 @@ class GDBTracer:
                     }
                 continue
 
-            # 1F: 1D Primitive Pointer (`const int *arr` in `binary_search`, `int *dist`)
+            # 1F: 1D Primitive Pointer (`const int *arr` in `binary_search`, `int *arr` in `quick_sort`)
             if type_kind == "primitive_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
@@ -2093,8 +2183,6 @@ class GDBTracer:
         )
         graph_snapshot.logical_graph = logical_payload
 
-        # If the physical pointer mesh has no edges of its own (e.g. an index-buffer DSU forest),
-        # populate `graph_snapshot.nodes/edges` from `logical_payload` as well.
         if (
             len(graph_snapshot.edges) == 0
             and logical_payload is not None
@@ -2122,21 +2210,8 @@ class GDBTracer:
         arrays_snapshot: List[ArraySnapshot],
         leaf_scalar_ints: Dict[str, int],
     ) -> Optional[LogicalGraphPayload]:
-        r"""
-        Builds the clean mathematical graph G = (V, E) (`LogicalGraphPayload`):
-          - Never emits freed physical blocks (`status == "freed"` or `is_freed == True`)
-            as active topological nodes.
-          - When an adjacency edge struct (`Edge *tmp`) is freed via `free(tmp)`, its
-            directed edge `(u -> v)` is IMMEDIATELY omitted from `logical_graph.edges`,
-            while traversal continues past `tmp` via its saved pre-free `next` link so
-            subsequent active edges in the same bucket (`curr`) remain in `logical_graph.edges`
-            until they are freed themselves.
-          - Retains isolated vertices (`vertex-0 .. vertex-(V-1)`) with degree 0 as part of `V`.
-        """
-        # 1. Check if we have a registered Adjacency-List Graph container
         if self._logical_adj_containers:
-            # Pick the most recent container
-            container_addr, container_meta = next(
+            _, container_meta = next(
                 reversed(list(self._logical_adj_containers.items()))
             )
             num_v = container_meta.get("num_vertices") or self._logical_vertex_count or 0
@@ -2150,7 +2225,6 @@ class GDBTracer:
                 for e in physical_graph.edges:
                     live_outgoing.setdefault(e.source, []).append(e)
 
-                # Overlay 1D metric array of length `num_v` (e.g. `dist[]`) if present
                 metric_arr = next(
                     (
                         a
@@ -2189,9 +2263,8 @@ class GDBTracer:
                         blk = self.heap_blocks.get(curr_addr, {})
 
                         if not is_freed_node and p_node and not p_node.is_freed:
-                            # Node is ACTIVE -> extract its `(u -> v, weight)` edge!
                             scalar_vals: List[Any] = []
-                            for f_k, f_v in (p_node.fields or {}).items():
+                            for _, f_v in (p_node.fields or {}).items():
                                 s_v = str(f_v)
                                 if (
                                     s_v != "NULL"
@@ -2210,15 +2283,11 @@ class GDBTracer:
                                         (u_idx, dest_v, weight_w, curr_addr)
                                     )
                                     for p_tag in p_node.pointers or []:
-                                        if not p_tag.includes("->") if hasattr(p_tag, "includes") else ("->" not in p_tag):
+                                        if "->" not in p_tag:
                                             tag_str = f"{p_tag}→"
                                             if tag_str not in vertex_ptrs.get(dest_v, []):
                                                 vertex_ptrs.setdefault(dest_v, []).append(tag_str)
 
-                        # Advance to the next node in the bucket chain:
-                        # Even if `curr_addr` was just FREED (`free(tmp)`), follow its saved
-                        # pre-free `next` link in `blk["edges"]` so unfreed nodes behind it
-                        # (`curr`) remain in the logical graph!
                         next_addr: Optional[str] = None
                         live_outs = live_outgoing.get(curr_addr, [])
                         if live_outs:
@@ -2274,7 +2343,6 @@ class GDBTracer:
                     is_forest=False,
                 )
 
-        # 2. Check if we have an Index-Buffer Forest (`int *parent` in DSU)
         forest_snap = self._try_project_index_forest_graph(
             arrays_snapshot, leaf_scalar_ints
         )
@@ -2482,11 +2550,13 @@ class GDBTracer:
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
             if self._is_valid_heap_or_data_address(addr):
-                addr_to_ptr_names.setdefault(addr, []).append(ptr_name)
+                display_ptr = ptr_name.split(":")[-1]
+                if display_ptr not in addr_to_ptr_names.get(addr, []):
+                    addr_to_ptr_names.setdefault(addr, []).append(display_ptr)
                 reference_counts[addr] = reference_counts.get(addr, 0) + 1
                 if addr not in queued_addresses:
                     queued_addresses.add(addr)
-                    frontier.append((addr, s_type, ptr_name.split(":")[-1]))
+                    frontier.append((addr, s_type, display_ptr))
 
         while frontier and len(nodes) < MAX_GRAPH_NODES:
             current_batch = frontier[: MAX_GRAPH_NODES - len(nodes)]
@@ -2746,8 +2816,6 @@ class GDBTracer:
                                 if table_len and 1 <= table_len <= MAX_STRUCT_BUFFER_ELEMENTS:
                                     self._logical_vertex_count = table_len
                                     if self._is_address_freed(target_addr):
-                                        # The bucket table itself (`g->adj`) was freed:
-                                        # retain the vertex count V with empty heads so V isolated vertices remain
                                         self._logical_adj_containers[addr] = {
                                             "num_vertices": table_len,
                                             "head_addrs": [None] * table_len,
