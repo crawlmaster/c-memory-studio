@@ -6,17 +6,18 @@ High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memor
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Strict User-Scope Variable & Type Filtering:
-     - Blocks all glibc/pthread/runtime internal symbols (`@entry`, `__*`, `unwind_buf`,
-       `cancel_jmp_buf`, `pthread_*`) and cross-checks variable identifiers against tokens
-       present in the user's `target.c` source file.
-  2. Unified 2D Matrix Schema (`kind: "matrix"`):
-     - Multi-dimensional stack arrays (`T[R][C]`) and heap pointer matrices (`T**`) emit
-       a single composite `ArraySnapshot` with `kind="matrix"`, `dimensions=[R, C]`, and `rows=[[...]]`.
-  3. Recursion & Memory Lifecycle Continuity (`_live_heap_structs`):
-     - Retains allocated heap structs across recursive base cases (`root == NULL`) and
-       preserves freed heap nodes (`is_freed=True`) even after stack pointers go out of scope.
-  4. GDB/MI Tokenized Command Pipelining (`_eval_expr_batch`) & Session `_type_cache`.
+  1. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`):
+     - Guarantees 100% of batched root dereferences (e.g. multiple independent pointers
+       `head`, `new_head`, `nodes[0..N-1]`) are read from the GDB pipe before returning,
+       eliminating dropped nodes and pipe desynchronization.
+  2. Generic Iterative Typedef-Pointer Resolution (`_resolve_type_info`):
+     - Unwraps `DW_TAG_typedef` aliases (e.g. `typedef struct node_t *node;`) down to their
+       underlying struct and pointer indirection levels.
+  3. Complete Local Root Discovery & Declaration Line Guard:
+     - Tracks the exact source line where each local variable is declared in the active function
+       so uninitialized future variables are ignored prior to declaration and immediately
+       registered as independent heap roots as soon as their initialization line completes.
+  4. Strict User-Scope Variable Filtering & Unified 2D Matrix Schema (`kind: "matrix"`).
   5. Step Budget: `MAX_STEPS = 1500`.
 """
 
@@ -69,7 +70,6 @@ C_SYNTAX_KEYWORDS = {
     "uint8_t", "uint16_t", "uint32_t", "uint64_t", "NULL", "true", "false"
 }
 
-# System / glibc / pthread runtime symbols that must never be surfaced as user variables
 SYSTEM_RUNTIME_SUBSTRINGS = (
     "unwind_buf",
     "cancel_jmp_buf",
@@ -126,6 +126,7 @@ USER_FUNC_CALL_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
 class DwarfTypeEntry:
     kind: str  # "primitive", "primitive_ptr", "primitive_ptr_array", "struct_val", "struct_ptr", "struct_ptr_array", "other"
     target_type: str
+    deref_cast_type: str = ""  # C type expression used to dereference a pointer to this struct: e.g. "struct node_t *" or "node"
     fields: Dict[str, str] = field(default_factory=dict)
     field_order: List[str] = field(default_factory=list)
     has_struct_links: Optional[bool] = None
@@ -360,6 +361,8 @@ class GDBTracer:
         # Syntactic analysis caches
         self._syntactic_index_cache: Dict[Tuple[str, str], Set[str]] = {}
         self._func_body_cache: Dict[str, str] = {}
+        self._func_line_span_cache: Dict[str, Tuple[int, int]] = {}
+        self._var_decl_line_cache: Dict[Tuple[str, str], Optional[Tuple[int, bool]]] = {}
         self._func_complexity_cache: Dict[str, bool] = {}
         self._alloc_bound_expr_cache: Dict[str, List[str]] = {}
         self._self_indexed_buffers_cache: Dict[str, bool] = {}
@@ -371,10 +374,6 @@ class GDBTracer:
 
     @staticmethod
     def _is_system_or_runtime_symbol(var_name: str, var_type: str = "") -> bool:
-        """
-        Strictly filters out internal C runtime, glibc, pthread, and DWARF `@entry`
-        pseudo-variables (`argv@entry`, `unwind_buf`, `cancel_jmp_buf`, `__libc_*`).
-        """
         if not var_name:
             return True
         base_name = var_name.split(":")[-1].strip()
@@ -389,10 +388,6 @@ class GDBTracer:
         return False
 
     def _is_valid_user_symbol(self, var_name: str, var_type: str = "") -> bool:
-        """
-        Returns True ONLY if `var_name` is a genuine user-declared variable in `target.c`
-        and not a compiler/glibc internal symbol.
-        """
         if self._is_system_or_runtime_symbol(var_name, var_type):
             return False
         base_name = var_name.split(":")[-1].split("[")[0].split("->")[0].split(".")[0].strip()
@@ -413,7 +408,7 @@ class GDBTracer:
                 "--interpreter=mi3",
                 str(self.binary_path),
             ],
-            time_to_check_for_additional_output_sec=0.001,
+            time_to_check_for_additional_output_sec=0.002,
         )
         self.gdb.get_gdb_response(timeout_sec=1.0, raise_error_on_timeout=False)
 
@@ -467,8 +462,46 @@ class GDBTracer:
             raise_error_on_timeout=False,
         )
 
+    def _cmd_tokenized(
+        self, mi_command: str, timeout: float = STEP_INACTIVITY_TIMEOUT_SEC
+    ) -> List[Dict[str, Any]]:
+        """
+        Executes a single GDB-MI command prefixed with a unique numeric token and
+        drains the GDB output pipe until that exact token's `result` record arrives.
+        Guarantees zero leftover packets in the pipe.
+        """
+        self._check_budget()
+        if not self.gdb:
+            raise RuntimeError("GDB controller is not initialized.")
+
+        self._token_counter += 1
+        tok = self._token_counter
+        deadline = time.monotonic() + timeout
+        self.last_step_time = time.monotonic()
+
+        responses = self.gdb.write(
+            f"{tok}{mi_command}",
+            timeout_sec=0.05,
+            raise_error_on_timeout=False,
+        )
+
+        while time.monotonic() < deadline:
+            if any(
+                r.get("type") == "result" and str(r.get("token")) == str(tok)
+                for r in responses
+            ):
+                break
+            more = self.gdb.get_gdb_response(
+                timeout_sec=0.015, raise_error_on_timeout=False
+            )
+            if more:
+                responses.extend(more)
+
+        return responses
+
     def _eval_expr(self, expr: str) -> Optional[str]:
-        responses = self._cmd(f'-data-evaluate-expression "{expr}"')
+        escaped = expr.replace('"', '\\"')
+        responses = self._cmd_tokenized(f'-data-evaluate-expression "{escaped}"')
         for r in responses:
             if r.get("type") == "result":
                 if r.get("message") == "done":
@@ -483,40 +516,75 @@ class GDBTracer:
         return None
 
     def _eval_expr_batch(self, exprs: List[str]) -> Dict[str, Optional[str]]:
+        """
+        Pipelines multiple `-data-evaluate-expression` queries in a single write AND
+        loops on `get_gdb_response()` until 100% of sent token IDs have returned their
+        `result` record (`done` or `error`).
+        Fixes the multi-root drop bug where `new_head` was lost when batched with `head`.
+        """
         if not exprs:
             return {}
         if len(exprs) == 1:
             return {exprs[0]: self._eval_expr(exprs[0])}
 
+        self._check_budget()
+        if not self.gdb:
+            raise RuntimeError("GDB controller is not initialized.")
+
         unique_exprs = list(dict.fromkeys(exprs))
         token_to_expr: Dict[int, str] = {}
+        pending_tokens: Set[int] = set()
         batched_lines: List[str] = []
 
         for expr in unique_exprs:
             self._token_counter += 1
             tok = self._token_counter
             token_to_expr[tok] = expr
+            pending_tokens.add(tok)
             escaped = expr.replace('"', '\\"')
             batched_lines.append(f'{tok}-data-evaluate-expression "{escaped}"')
 
-        responses = self._cmd("\n".join(batched_lines))
+        deadline = time.monotonic() + STEP_INACTIVITY_TIMEOUT_SEC
+        self.last_step_time = time.monotonic()
+
+        responses = self.gdb.write(
+            "\n".join(batched_lines),
+            timeout_sec=0.05,
+            raise_error_on_timeout=False,
+        )
+
         results: Dict[str, Optional[str]] = {e: None for e in unique_exprs}
 
-        for r in responses:
-            if r.get("type") == "result":
-                tok_val = r.get("token")
-                if tok_val is not None:
-                    try:
-                        tok_int = int(tok_val)
-                    except (ValueError, TypeError):
-                        continue
-                    expr_key = token_to_expr.get(tok_int)
-                    if expr_key is not None and r.get("message") == "done":
-                        payload = r.get("payload", {})
-                        if isinstance(payload, dict) and "value" in payload:
-                            val = str(payload["value"])
-                            if "Cannot access memory" not in val and "<optimized out>" not in val:
-                                results[expr_key] = val
+        def process_responses(resp_list: List[Dict[str, Any]]) -> None:
+            for r in resp_list:
+                if r.get("type") == "result":
+                    tok_val = r.get("token")
+                    if tok_val is not None:
+                        try:
+                            tok_int = int(tok_val)
+                        except (ValueError, TypeError):
+                            continue
+                        pending_tokens.discard(tok_int)
+                        expr_key = token_to_expr.get(tok_int)
+                        if expr_key is not None and r.get("message") == "done":
+                            payload = r.get("payload", {})
+                            if isinstance(payload, dict) and "value" in payload:
+                                val = str(payload["value"])
+                                if (
+                                    "Cannot access memory" not in val
+                                    and "<optimized out>" not in val
+                                ):
+                                    results[expr_key] = val
+
+        process_responses(responses)
+
+        # Drain any remaining tokenized responses from the OS pipe
+        while pending_tokens and time.monotonic() < deadline:
+            more = self.gdb.get_gdb_response(
+                timeout_sec=0.015, raise_error_on_timeout=False
+            )
+            if more:
+                process_responses(more)
 
         return results
 
@@ -579,29 +647,119 @@ class GDBTracer:
                         if addr in self._live_heap_structs:
                             self._freed_struct_types[addr] = self._live_heap_structs[addr]
 
-    def _is_declared_on_current_line(self, var_name: str, line_num: int) -> bool:
-        """
-        Returns True ONLY if `var_name` is being declared AND initialized with `=`
-        for the very first time on `line_num` (so its RHS has not executed yet).
-        Never matches uninitialized array declarations (`int mat[3][3];`) or
-        statements starting with `else`/`return`.
-        """
-        if not (1 <= line_num < len(self._source_lines)):
-            return False
-        src_line = self._source_lines[line_num].split("//")[0].strip()
-        if src_line.startswith(("for ", "for(", "while ", "while(", "if ", "if(", "else ", "return ")):
-            return False
+    def _get_function_line_span(
+        self, func_name: str, anchor_line: int
+    ) -> Tuple[int, int]:
+        """Returns `(start_line, end_line)` for `func_name` in `self._source_lines`."""
+        if func_name in self._func_line_span_cache:
+            return self._func_line_span_cache[func_name]
 
-        m = re.match(
-            rf"^(struct\s+[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*)(?:\s+|\s*\*+\s*)\b{re.escape(var_name)}\s*(?:\[[^\]]*\])*\s*=",
-            src_line,
+        total_lines = len(self._source_lines)
+        if total_lines <= 1:
+            return (1, 1)
+
+        func_def_re = re.compile(rf"\b{re.escape(func_name)}\s*\([^\)]*\)\s*\{{?")
+        header_line = 1
+
+        search_from = min(max(1, anchor_line), total_lines - 1)
+        for line_idx in range(search_from, 0, -1):
+            line_clean = self._source_lines[line_idx].split("//")[0].strip()
+            if func_def_re.search(line_clean) and not line_clean.endswith(";"):
+                header_line = line_idx
+                break
+
+        brace_depth = 0
+        saw_open = False
+        end_line = total_lines - 1
+
+        for line_idx in range(header_line, total_lines):
+            clean_line = C_COMMENTS_AND_STRINGS_RE.sub(" ", self._source_lines[line_idx])
+            for ch in clean_line:
+                if ch == "{":
+                    brace_depth += 1
+                    saw_open = True
+                elif ch == "}":
+                    brace_depth -= 1
+            if saw_open and brace_depth <= 0:
+                end_line = line_idx
+                break
+
+        span = (header_line, end_line)
+        self._func_line_span_cache[func_name] = span
+        return span
+
+    def _get_var_declaration_info(
+        self, func_name: str, var_name: str, anchor_line: int
+    ) -> Optional[Tuple[int, bool]]:
+        """
+        Finds the exact line number `(decl_line, has_initializer)` where local variable
+        `var_name` is declared inside `func_name`.
+        Returns `None` if `var_name` is a function parameter (declared in the signature).
+        """
+        cache_key = (func_name, var_name)
+        if cache_key in self._var_decl_line_cache:
+            return self._var_decl_line_cache[cache_key]
+
+        start_line, end_line = self._get_function_line_span(func_name, anchor_line)
+
+        # Check if `var_name` is a parameter in the function signature header
+        sig_text = " ".join(
+            self._source_lines[i].split("//")[0]
+            for i in range(start_line, min(end_line + 1, start_line + 3))
         )
-        if not m:
+        paren_start = sig_text.find("(")
+        paren_end = sig_text.find(")", paren_start + 1) if paren_start != -1 else -1
+        if paren_start != -1 and paren_end != -1:
+            params_str = sig_text[paren_start + 1 : paren_end]
+            if re.search(rf"\b{re.escape(var_name)}\b", params_str):
+                self._var_decl_line_cache[cache_key] = None
+                return None
+
+        decl_re = re.compile(
+            rf"^(?:const\s+|volatile\s+|unsigned\s+|signed\s+|struct\s+[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*)+(?:\s+|\s*\*+\s*)\b{re.escape(var_name)}\b\s*(?:\[[^\]]*\])*\s*(=)?"
+        )
+
+        for line_idx in range(start_line + 1, end_line + 1):
+            src_line = self._source_lines[line_idx].split("//")[0].strip()
+            if not src_line or src_line.startswith(("return ", "if ", "if(", "while ", "while(", "else")):
+                continue
+            if src_line.startswith(("for ", "for(")):
+                if re.search(rf"\b{re.escape(var_name)}\b", src_line):
+                    res = (line_idx, False)
+                    self._var_decl_line_cache[cache_key] = res
+                    return res
+                continue
+
+            m = decl_re.match(src_line)
+            if m:
+                first_tok = src_line.split()[0].rstrip("*")
+                if first_tok not in C_CONTROL_KEYWORDS:
+                    has_init = bool(m.group(1))
+                    res = (line_idx, has_init)
+                    self._var_decl_line_cache[cache_key] = res
+                    return res
+
+        self._var_decl_line_cache[cache_key] = None
+        return None
+
+    def _is_uninitialized_at_line(
+        self, func_name: str, var_name: str, current_line: int
+    ) -> bool:
+        """
+        Returns True if `var_name` in `func_name` is declared on a future line
+        (`current_line < decl_line`) OR is being declared-with-initializer on `current_line`
+        (`current_line == decl_line and has_init`), preventing uninitialized stack garbage
+        from being crawled before the declaration statement executes.
+        """
+        decl_info = self._get_var_declaration_info(func_name, var_name, current_line)
+        if decl_info is None:
             return False
-        type_tok = m.group(1).strip()
-        if type_tok in C_CONTROL_KEYWORDS:
-            return False
-        return True
+        decl_line, has_init = decl_info
+        if current_line < decl_line:
+            return True
+        if current_line == decl_line and has_init:
+            return True
+        return False
 
     # ==========================================================================
     # Algorithmic Complexity Step Filter
@@ -617,50 +775,10 @@ class GDBTracer:
         if total_lines <= 1:
             return ""
 
-        func_def_re = re.compile(rf"\b{re.escape(func_name)}\s*\([^\)]*\)\s*\{{?")
-        func_header_line: Optional[int] = None
-
-        if anchor_line is not None and 1 <= anchor_line < total_lines:
-            for line_idx in range(anchor_line, 0, -1):
-                line_clean = self._source_lines[line_idx].split("//")[0].strip()
-                if func_def_re.search(line_clean) and not line_clean.endswith(";"):
-                    func_header_line = line_idx
-                    break
-
-        if func_header_line is None:
-            for line_idx in range(1, total_lines):
-                line_clean = self._source_lines[line_idx].split("//")[0].strip()
-                if func_def_re.search(line_clean) and not line_clean.endswith(";"):
-                    next_line = (
-                        self._source_lines[line_idx + 1].split("//")[0].strip()
-                        if line_idx + 1 < total_lines
-                        else ""
-                    )
-                    if "{" in line_clean or next_line.startswith("{"):
-                        func_header_line = line_idx
-                        break
-
-        if func_header_line is None:
-            self._func_body_cache[func_name] = ""
-            return ""
-
-        raw_chunk_lines: List[str] = []
-        brace_depth = 0
-        saw_open_brace = False
-
-        for line_idx in range(func_header_line, total_lines):
-            raw_line = self._source_lines[line_idx]
-            raw_chunk_lines.append(raw_line)
-            clean_line = C_COMMENTS_AND_STRINGS_RE.sub(" ", raw_line)
-            for ch in clean_line:
-                if ch == "{":
-                    brace_depth += 1
-                    saw_open_brace = True
-                elif ch == "}":
-                    brace_depth -= 1
-            if saw_open_brace and brace_depth <= 0:
-                break
-
+        start_line, end_line = self._get_function_line_span(
+            func_name, anchor_line or 1
+        )
+        raw_chunk_lines = self._source_lines[start_line : end_line + 1]
         raw_body = "\n".join(raw_chunk_lines)
         cleaned_body = C_COMMENTS_AND_STRINGS_RE.sub(" ", raw_body)
         first_brace = cleaned_body.find("{")
@@ -797,7 +915,6 @@ class GDBTracer:
         proven_indices: Set[str] = set()
         owner_tokens: Set[str] = set(clean_arr_name.replace("->", ".").split("."))
 
-        # Proof 1: Direct 1D & Multi-Dimensional Subscript Access (`arr[i]` and `mat[i][j]`)
         subscript_chain_pattern = re.compile(
             rf"(?:{escaped_full}|\b{escaped_leaf})((?:\s*\[[^\]]+\])+)"
         )
@@ -809,7 +926,6 @@ class GDBTracer:
                     if ident not in owner_tokens:
                         proven_indices.add(ident)
 
-        # Proof 2: Pointer Offset Dereference `*(arr + offset_expr)`
         ptr_arith_pattern = re.compile(
             rf"\*\s*\(\s*(?:(?:{escaped_full}|\b{escaped_leaf})\s*[\+\-]\s*([^\)]+)|([^\)]+?)\s*\+\s*(?:{escaped_full}|\b{escaped_leaf}))\s*\)"
         )
@@ -819,7 +935,6 @@ class GDBTracer:
                 if ident not in owner_tokens:
                     proven_indices.add(ident)
 
-        # Proof 3: Loop Induction Variable in `for (init; cond; step)` when `arr` is in scope
         if re.search(rf"(?:{escaped_full}|\b{escaped_leaf})\b", body):
             for match in FOR_HEADER_RE.finditer(body):
                 cond_part = match.group(2)
@@ -830,7 +945,6 @@ class GDBTracer:
                     if ind_var not in owner_tokens:
                         proven_indices.add(ind_var)
 
-        # Proof 4: Transitive Index Dataflow
         assignment_re = re.compile(
             r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\+|-|\*|/)?=(?!=)\s*([^;]+);"
         )
@@ -1006,10 +1120,28 @@ class GDBTracer:
         return None
 
     # ==========================================================================
-    # Session-Level DWARF Type Cache (`_type_cache`)
+    # Iterative DWARF Typedef & Struct Schema Resolution (`_type_cache`)
     # ==========================================================================
 
+    def _query_ptype_console(self, type_expr: str) -> str:
+        """
+        Executes a token-synchronized `ptype` query via GDB-MI so 100% of the
+        DWARF type definition is captured without pipe truncation.
+        """
+        escaped = type_expr.replace('"', '\\"')
+        responses = self._cmd_tokenized(f'-interpreter-exec console "ptype {escaped}"')
+        return "".join(
+            r.get("payload", "") for r in responses if r.get("type") == "console"
+        ).strip()
+
     def _resolve_type_info(self, raw_type: str) -> Tuple[str, str]:
+        """
+        Iteratively unwraps C typedefs (`DW_TAG_typedef`) and pointers (`DW_TAG_pointer_type`)
+        down to their canonical DWARF category and underlying struct type:
+          - `typedef struct node_t *node;` -> `("struct_ptr", "struct node_t")`
+          - `typedef struct { ... } *anon_node;` -> `("struct_ptr", "anon_node")`
+          - `UFNode **` -> `("struct_ptr_array", "struct UFNode")`
+        """
         clean = raw_type.replace("const", "").replace("volatile", "").strip()
         if clean in self._type_cache:
             entry = self._type_cache[clean]
@@ -1033,7 +1165,11 @@ class GDBTracer:
                 return (entry.kind, entry.target_type)
             base_kind, base_resolved = self._resolve_type_info(base_no_stars)
             if base_kind == "struct_val":
-                entry = DwarfTypeEntry(kind="struct_ptr_array", target_type=base_resolved)
+                entry = DwarfTypeEntry(
+                    kind="struct_ptr_array",
+                    target_type=base_resolved,
+                    deref_cast_type=f"{base_resolved} *",
+                )
                 self._type_cache[clean] = entry
                 return (entry.kind, entry.target_type)
 
@@ -1046,16 +1182,28 @@ class GDBTracer:
                 return (entry.kind, entry.target_type)
             if base.startswith("struct ") and not base.endswith("*"):
                 self._ensure_struct_field_types(base)
-                entry = DwarfTypeEntry(kind="struct_ptr", target_type=base)
+                entry = DwarfTypeEntry(
+                    kind="struct_ptr",
+                    target_type=base,
+                    deref_cast_type=f"{base} *",
+                )
                 self._type_cache[clean] = entry
                 return (entry.kind, entry.target_type)
             base_kind, base_resolved = self._resolve_type_info(base)
             if base_kind == "struct_val":
-                entry = DwarfTypeEntry(kind="struct_ptr", target_type=base_resolved)
+                entry = DwarfTypeEntry(
+                    kind="struct_ptr",
+                    target_type=base_resolved,
+                    deref_cast_type=f"{base_resolved} *",
+                )
                 self._type_cache[clean] = entry
                 return (entry.kind, entry.target_type)
             if base_kind == "struct_ptr":
-                entry = DwarfTypeEntry(kind="struct_ptr_array", target_type=base_resolved)
+                entry = DwarfTypeEntry(
+                    kind="struct_ptr_array",
+                    target_type=base_resolved,
+                    deref_cast_type=f"{base_resolved} *",
+                )
                 self._type_cache[clean] = entry
                 return (entry.kind, entry.target_type)
             if base_kind == "primitive_ptr":
@@ -1068,24 +1216,31 @@ class GDBTracer:
             entry = DwarfTypeEntry(
                 kind="struct_val",
                 target_type=clean,
+                deref_cast_type=f"{clean} *",
                 fields=fields,
                 field_order=list(fields.keys()),
             )
             self._type_cache[clean] = entry
             return (entry.kind, entry.target_type)
 
-        responses = self._cmd(f"ptype {clean}")
-        full_console = "".join(
-            r.get("payload", "") for r in responses if r.get("type") == "console"
-        ).strip()
+        # Query GDB `ptype` with full token synchronization to unwrap `DW_TAG_typedef`
+        full_console = self._query_ptype_console(clean)
 
         if "type = struct" in full_console:
             header_match = re.search(
                 r"type\s*=\s*(struct\s+[a-zA-Z_][a-zA-Z0-9_]*)", full_console
             )
-            canonical_struct = (
-                header_match.group(1).strip() if header_match else f"struct {clean}"
-            )
+            brace_end = full_console.rfind("}")
+            tail = full_console[brace_end + 1 :].strip() if brace_end != -1 else ""
+
+            if header_match:
+                canonical_struct = header_match.group(1).strip()
+                deref_cast = f"{canonical_struct} *"
+            else:
+                # Anonymous struct typedef (`typedef struct { ... } *node;` or `typedef struct { ... } Node;`)
+                canonical_struct = clean
+                deref_cast = clean if "*" in tail else f"{clean} *"
+
             if self._is_system_or_runtime_symbol(canonical_struct, canonical_struct):
                 entry = DwarfTypeEntry(kind="other", target_type=clean)
                 self._type_cache[clean] = entry
@@ -1097,15 +1252,16 @@ class GDBTracer:
                 self._type_cache[canonical_struct] = DwarfTypeEntry(
                     kind="struct_val",
                     target_type=canonical_struct,
+                    deref_cast_type=deref_cast,
                     fields=parsed_fields,
                     field_order=list(parsed_fields.keys()),
                 )
             else:
                 self._type_cache[canonical_struct].fields = parsed_fields
                 self._type_cache[canonical_struct].field_order = list(parsed_fields.keys())
+                if not self._type_cache[canonical_struct].deref_cast_type:
+                    self._type_cache[canonical_struct].deref_cast_type = deref_cast
 
-            brace_end = full_console.rfind("}")
-            tail = full_console[brace_end + 1 :].strip() if brace_end != -1 else ""
             if "**" in tail:
                 kind = "struct_ptr_array"
             elif "*" in tail:
@@ -1116,25 +1272,44 @@ class GDBTracer:
             entry = DwarfTypeEntry(
                 kind=kind,
                 target_type=canonical_struct,
+                deref_cast_type=deref_cast,
                 fields=parsed_fields,
                 field_order=list(parsed_fields.keys()),
             )
             self._type_cache[clean] = entry
             return (entry.kind, entry.target_type)
 
+        # Handle typedefs to primitives or primitive pointers (e.g. `typedef int *int_ptr;`)
+        if full_console.startswith("type ="):
+            unwrapped_type = full_console.replace("type =", "", 1).strip()
+            if unwrapped_type and unwrapped_type != clean:
+                u_kind, u_target = self._resolve_type_info(unwrapped_type)
+                entry = DwarfTypeEntry(kind=u_kind, target_type=u_target)
+                self._type_cache[clean] = entry
+                return (entry.kind, entry.target_type)
+
         entry = DwarfTypeEntry(kind="other", target_type=clean)
         self._type_cache[clean] = entry
         return (entry.kind, entry.target_type)
+
+    def _get_deref_cast_expr(self, struct_type: str, addr: str) -> str:
+        """
+        Builds a valid GDB dereference expression for `struct_type` at `addr`,
+        supporting both named structs (`*((struct node_t *)0x...)`) and anonymous
+        pointer typedefs (`*((node)0x...)`).
+        """
+        clean = struct_type.strip()
+        if clean in self._type_cache and self._type_cache[clean].deref_cast_type:
+            cast_t = self._type_cache[clean].deref_cast_type
+            return f"*(({cast_t}){addr})"
+        return f"*(({clean} *){addr})"
 
     def _ensure_struct_field_types(self, struct_type: str) -> Dict[str, str]:
         clean = struct_type.replace("const", "").replace("volatile", "").strip()
         if clean in self._type_cache and self._type_cache[clean].fields:
             return self._type_cache[clean].fields
 
-        responses = self._cmd(f"ptype {clean}")
-        full_console = "".join(
-            r.get("payload", "") for r in responses if r.get("type") == "console"
-        )
+        full_console = self._query_ptype_console(clean)
         parsed_fields = self._parse_ptype_fields(full_console)
         if clean in self._type_cache:
             self._type_cache[clean].fields = parsed_fields
@@ -1143,6 +1318,7 @@ class GDBTracer:
             self._type_cache[clean] = DwarfTypeEntry(
                 kind="struct_val",
                 target_type=clean,
+                deref_cast_type=f"{clean} *",
                 fields=parsed_fields,
                 field_order=list(parsed_fields.keys()),
             )
@@ -1214,11 +1390,11 @@ class GDBTracer:
 
     def _collect_fast_frame_variables(self) -> Tuple[List[str], List[Dict[str, Any]]]:
         """
-        Harvests variables from the active user frame, strictly discarding any
-        glibc/pthread/runtime internal symbols (`@entry`, `unwind_buf`, `__*`, etc.)
-        and merging non-shadowed user variables from caller frames.
+        Harvests all initialized user-scope variables from the active frame (using token
+        synchronization) and merges non-shadowed variables from caller frames.
+        Excludes any local variable whose declaration line has not yet executed.
         """
-        var_res = self._cmd("-stack-list-variables --simple-values")
+        var_res = self._cmd_tokenized("-stack-list-variables --simple-values")
         current_frame_vars: List[Dict[str, str]] = []
         for r in var_res:
             if r.get("type") == "result" and r.get("message") == "done":
@@ -1231,7 +1407,9 @@ class GDBTracer:
             v_type = v.get("type", "")
             if not self._is_valid_user_symbol(v_name, v_type):
                 continue
-            if self._is_declared_on_current_line(v_name, self._current_line):
+            if self._is_uninitialized_at_line(
+                self._current_func, v_name, self._current_line
+            ):
                 continue
             filtered_leaf_vars.append(v)
 
@@ -1334,7 +1512,7 @@ class GDBTracer:
         raw_struct_ptr_array_vars: List[Tuple[str, str, str, int]] = []
 
         # ----------------------------------------------------------------------
-        # Pass 1: Classify all user-scope variables
+        # Pass 1: Classify all user-scope variables (Including Typedef Pointers)
         # ----------------------------------------------------------------------
         for v in raw_vars:
             v_name = v.get("name", "")
@@ -1384,7 +1562,7 @@ class GDBTracer:
                     raw_2d_ptr_vars.append((v_name, resolved_target, addr, f_level))
                 continue
 
-            # 1E: Single Struct Pointer (`BSTNode *root`, `union_find uf`)
+            # 1E: Single Struct Pointer or Typedef-Pointer (`node head`, `node new_head`, `BSTNode *root`)
             if type_kind == "struct_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
@@ -1820,7 +1998,8 @@ class GDBTracer:
 
             if valid_elem_addrs:
                 deref_exprs = [
-                    f"*(({elem_struct_type} *){e_addr})" for e_addr in valid_elem_addrs
+                    self._get_deref_cast_expr(elem_struct_type, e_addr)
+                    for e_addr in valid_elem_addrs
                 ]
                 batch_derefs = self._eval_expr_batch(deref_exprs)
                 for e_addr, d_expr in zip(valid_elem_addrs, deref_exprs):
@@ -1874,7 +2053,12 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
-        seen_addresses: Set[str] = set()
+        """
+        Crawls all active local struct pointer roots (`head`, `new_head`, etc.) and
+        reachable heap nodes using token-synchronized batch dereferencing.
+        """
+        emitted_node_ids: Set[str] = set()
+        queued_addresses: Set[str] = set()
         nodes: List[GraphNode] = []
         edges: List[GraphEdge] = []
         embedded_arrays: List[ArraySnapshot] = []
@@ -1883,25 +2067,24 @@ class GDBTracer:
         addr_to_ptr_names: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, str, str]] = []
 
-        # 1. Seed from active stack pointers across frames
+        # 1. Seed every active local struct pointer (`head`, `new_head`, etc.) as an independent root
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
             if self._is_valid_heap_or_data_address(addr):
                 addr_to_ptr_names.setdefault(addr, []).append(ptr_name)
-                if addr not in seen_addresses:
-                    seen_addresses.add(addr)
+                if addr not in queued_addresses:
+                    queued_addresses.add(addr)
                     frontier.append((addr, s_type, ptr_name.split(":")[-1]))
 
-        # 2. Seed any known live heap structs so recursion base cases (`root == NULL`)
-        #    never wipe the existing tree/list on the canvas!
+        # 2. Seed known live heap structs so recursion base cases never wipe the canvas
         for live_addr, live_type in list(self._live_heap_structs.items()):
             if (
-                live_addr not in seen_addresses
+                live_addr not in queued_addresses
                 and live_addr not in self._freed_addresses
                 and self._is_valid_heap_or_data_address(live_addr)
             ):
-                seen_addresses.add(live_addr)
+                queued_addresses.add(live_addr)
                 frontier.append((live_addr, live_type, "heap"))
 
         while frontier and len(nodes) < MAX_GRAPH_NODES:
@@ -1909,7 +2092,7 @@ class GDBTracer:
             frontier = frontier[MAX_GRAPH_NODES - len(nodes) :]
 
             batch_expr_map: Dict[str, str] = {
-                addr: f"*(({struct_type} *){addr})"
+                addr: self._get_deref_cast_expr(struct_type, addr)
                 for addr, struct_type, _ in current_batch
             }
             batch_deref_results = self._eval_expr_batch(list(batch_expr_map.values()))
@@ -1917,7 +2100,13 @@ class GDBTracer:
             next_frontier: List[Tuple[str, str, str]] = []
 
             for addr, struct_type, owner_name in current_batch:
+                if addr in emitted_node_ids:
+                    continue
+
                 deref_str = batch_deref_results.get(batch_expr_map[addr])
+                if not deref_str:
+                    # Fallback single evaluation if batch expression needed direct retry
+                    deref_str = self._eval_expr(batch_expr_map[addr])
                 if not deref_str:
                     continue
 
@@ -1925,6 +2114,7 @@ class GDBTracer:
                 if not raw_fields:
                     continue
 
+                emitted_node_ids.add(addr)
                 field_types = self._ensure_struct_field_types(struct_type)
                 field_order_list = list(field_types.keys())
                 is_freed = self._is_tcache_poisoned(addr, raw_fields)
@@ -2013,8 +2203,8 @@ class GDBTracer:
                                                 field_order_idx=idx,
                                             )
                                         )
-                                    if sub_addr not in seen_addresses:
-                                        seen_addresses.add(sub_addr)
+                                    if sub_addr not in queued_addresses:
+                                        queued_addresses.add(sub_addr)
                                         next_frontier.append(
                                             (
                                                 sub_addr,
@@ -2112,8 +2302,8 @@ class GDBTracer:
                                                             field_order_idx=idx,
                                                         )
                                                     )
-                                                if hp_addr not in seen_addresses:
-                                                    seen_addresses.add(hp_addr)
+                                                if hp_addr not in queued_addresses:
+                                                    queued_addresses.add(hp_addr)
                                                     next_frontier.append(
                                                         (
                                                             hp_addr,
@@ -2183,7 +2373,7 @@ class GDBTracer:
                                         )
                             continue
 
-                        # Subcase 2C: Single Struct Pointer (`struct Node *next`, `left`, `right`, `parent`)
+                        # Subcase 2C: Single Struct Pointer (`struct node_t *next`, `left`, `right`, `parent`)
                         target_s_type = (
                             f_target_type
                             if f_kind == "struct_ptr"
@@ -2224,8 +2414,8 @@ class GDBTracer:
                                         field_order_idx=f_order_idx,
                                     )
                                 )
-                        if target_addr not in seen_addresses:
-                            seen_addresses.add(target_addr)
+                        if target_addr not in queued_addresses and target_addr not in emitted_node_ids:
+                            queued_addresses.add(target_addr)
                             next_frontier.append(
                                 (target_addr, target_s_type, f"{owner_name}->{f_name}")
                             )
@@ -2261,9 +2451,8 @@ class GDBTracer:
             frontier.extend(next_frontier)
 
         # 3. Also append any freed struct nodes that were orphaned when their pointer moved/freed
-        emitted_ids = {n.id for n in nodes}
         for f_addr in self._freed_addresses:
-            if f_addr not in emitted_ids and f_addr in self._last_valid_node_fields:
+            if f_addr not in emitted_node_ids and f_addr in self._last_valid_node_fields:
                 if len(nodes) >= MAX_GRAPH_NODES:
                     break
                 f_type = self._freed_struct_types.get(f_addr, "struct")
@@ -2297,7 +2486,6 @@ class GDBTracer:
             return False
         if val < 0x402000:
             return False
-        # Exclude shared library memory regions (`0x7f0000000000` - `0x7ffffff00000`)
         if 0x7f0000000000 <= val < 0x7ffffff00000:
             return False
         return True
