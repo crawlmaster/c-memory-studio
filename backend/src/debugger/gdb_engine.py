@@ -6,17 +6,16 @@ High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memor
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Three-Stage Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`):
-     - `ALLOCATED` (`status="active"`): Tracked in `self.heap_blocks[addr]` with live DWARF fields.
-     - `FREED` (`status="freed"`, `is_freed=True`, `is_dangling=True`): Triggered by `free(addr)`
-       or glibc safe-linking tcache detection (`fd = next_chunk ^ (addr >> 12)`). Freezes last known
-       valid struct fields so tcache metadata (`4331233` / `0x4216e1`) never pollutes the UI.
-       Status is immutable against dangling pointer traversal.
-     - `PURGED` (`status="purged"`): On every step snapshot, any `"freed"` block with `references == 0`
-       (unreachable from all live stack pointers and active heap pointers) is purged from the snapshot.
-  2. Depth-Keyed Call Stack Variable Retention (`_frame_vars_by_depth`):
-     - Preserves caller frame variables per stack depth level so recursive functions never overwrite
-       outer frames of the same function.
+  1. Dedicated Logical Graph Builder (`_build_logical_graph_snapshot`) with Immediate Edge Pruning:
+     - Constructs the mathematical graph G = (V, E) (`logical_graph`) directly from DWARF
+       adjacency-list containers or index-buffer forests.
+     - When an adjacency wrapper struct (e.g. `Edge *tmp`) is freed via `free(tmp)`, its
+       directed edge `(u -> v)` is IMMEDIATELY pruned from `logical_graph.edges`, while
+       traversal continues across `tmp`'s pre-free `next` link so remaining active edges
+       in the same bucket (`curr`) stay visible until freed.
+     - Never emits freed physical blocks as active topological nodes in `logical_graph`.
+     - Preserves the original vertex set `V` (even when vertices reach degree 0).
+  2. Three-Stage Physical Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`).
   3. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`).
   4. Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
   5. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
@@ -181,9 +180,16 @@ class GraphEdge(BaseModel):
     field_order_idx: int = 0
 
 
+class LogicalGraphPayload(BaseModel):
+    nodes: List[GraphNode] = Field(default_factory=list)
+    edges: List[GraphEdge] = Field(default_factory=list)
+    is_forest: bool = False
+
+
 class GraphSnapshot(BaseModel):
     nodes: List[GraphNode]
     edges: List[GraphEdge]
+    logical_graph: Optional[LogicalGraphPayload] = None
 
 
 class ExecutionSnapshot(BaseModel):
@@ -193,6 +199,7 @@ class ExecutionSnapshot(BaseModel):
     call_stack: List[str]
     arrays: List[ArraySnapshot]
     graph: GraphSnapshot
+    logical_graph: Optional[LogicalGraphPayload] = None
     stack_frames: Dict[str, Dict[str, Any]]
     status: str = "running"
 
@@ -363,19 +370,15 @@ class GDBTracer:
 
         self._type_cache: Dict[str, DwarfTypeEntry] = {}
 
-        # Cumulative Session Heap Block Ledger:
-        # Maps canonical hex address -> {
-        #   "address": str,
-        #   "status": "active" | "freed" | "purged",
-        #   "type": str,
-        #   "fields": Dict[str, Any],      # Frozen last-known valid fields once freed
-        #   "label": str,
-        #   "self_ref_order": List[str],
-        #   "edges": List[GraphEdge],      # Frozen outgoing edges at time of free
-        #   "freed_at_step": Optional[int],
-        # }
+        # Cumulative Session Heap Block Ledger
         self.heap_blocks: Dict[str, Dict[str, Any]] = {}
         self._freed_addresses: Set[str] = set()
+
+        # Persistent Logical Graph Metadata across the session so isolated vertices V
+        # remain visible even when adjacency lists are being deallocated:
+        # Maps container_addr -> {"num_vertices": int, "head_addrs": List[Optional[str]], "elem_type": str}
+        self._logical_adj_containers: Dict[str, Dict[str, Any]] = {}
+        self._logical_vertex_count: Optional[int] = None
 
         # Caller-Frame & Heap Array Base Address -> Validated Element Count Ledger
         self._address_bounds_ledger: Dict[str, int] = {}
@@ -425,10 +428,6 @@ class GDBTracer:
         return True
 
     def _mark_address_freed(self, addr: str) -> None:
-        r"""
-        Transitions `addr` to `"status": "freed"` in `self.heap_blocks` and freezes
-        its last known valid struct fields so tcache poison values are never displayed.
-        """
         self._freed_addresses.add(addr)
         self._address_bounds_ledger.pop(addr, None)
         if addr in self.heap_blocks:
@@ -669,13 +668,11 @@ class GDBTracer:
                     except (ValueError, TypeError):
                         self._current_line = 0
 
-                    # Maintain call stack depth accurately including recursive calls
                     if self._current_func != prev_func:
                         if (
                             len(self._active_call_stack) >= 2
                             and self._active_call_stack[-2] == self._current_func
                         ):
-                            # Returned to immediate caller frame
                             popped_depth = len(self._active_call_stack) - 1
                             self._frame_vars_by_depth.pop(popped_depth, None)
                             self._active_call_stack.pop()
@@ -687,7 +684,6 @@ class GDBTracer:
                         else:
                             self._active_call_stack.append(self._current_func)
                     else:
-                        # Same function name: check if we just entered or exited a recursive self-call
                         start_l, _ = self._get_function_line_span(
                             self._current_func, self._current_line
                         )
@@ -705,11 +701,6 @@ class GDBTracer:
         return False
 
     def _record_pending_free_on_current_line(self) -> None:
-        r"""
-        Intercepts `free(expr)` on `self._current_line` BEFORE GDB steps over it,
-        evaluates the target pointer address, and permanently marks the block as `"freed"`
-        in `self.heap_blocks` with its last valid fields frozen.
-        """
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line].split("//")[0]
             free_exprs = [
@@ -849,14 +840,6 @@ class GDBTracer:
         return inner_body
 
     def _is_complex_user_function(self, func_name: str) -> bool:
-        r"""
-        Determines purely from the AST/token structure of `func_name` whether it should be
-        stepped into (`-exec-step`) vs stepped over atomically (`-exec-next`):
-          - Functions containing loops (`for`, `while`, `do`), recursion, OR `free(...)`
-            deallocations return `True` (stepped into so `free()` is intercepted before
-            glibc tcache overwrites the struct's memory).
-          - Straight-line O(1) allocation/initialization helpers return `False`.
-        """
         if func_name in self._func_complexity_cache:
             return self._func_complexity_cache[func_name]
 
@@ -1681,11 +1664,6 @@ class GDBTracer:
     def _check_explicit_reallocation_on_last_line(
         self, var_name: str, addr: str, resolved_type: str
     ) -> None:
-        r"""
-        A previously freed/purged address `addr` can ONLY transition back to `"active"`
-        if the immediately preceding executed line explicitly invoked `malloc`, `calloc`,
-        or `realloc` into `var_name`. Dangling pointers never resurrect freed blocks.
-        """
         if not self._is_address_freed(addr):
             return
         if not (1 <= self._last_executed_line < len(self._source_lines)):
@@ -2097,7 +2075,7 @@ class GDBTracer:
                     )
 
         # ----------------------------------------------------------------------
-        # Pass 3: Three-Stage Heap Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`)
+        # Pass 3: Three-Stage Physical Heap Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`)
         # ----------------------------------------------------------------------
         graph_snapshot, embedded_arrays = self._crawl_pointer_graph(
             active_struct_ptrs, leaf_scalar_ints, scalar_ints
@@ -2105,14 +2083,25 @@ class GDBTracer:
         arrays_snapshot.extend(embedded_arrays)
 
         # ----------------------------------------------------------------------
-        # Pass 4: Agnostic Forest / Index-Buffer Graph Projection
+        # Pass 4: Build Dedicated Mathematical Logical Graph G = (V, E)
+        #         with Immediate Deallocated Edge Pruning
         # ----------------------------------------------------------------------
-        if len(graph_snapshot.edges) == 0:
-            forest_graph = self._try_project_index_forest_graph(
-                arrays_snapshot, leaf_scalar_ints
-            )
-            if forest_graph is not None:
-                graph_snapshot = forest_graph
+        logical_payload = self._build_logical_graph_snapshot(
+            physical_graph=graph_snapshot,
+            arrays_snapshot=arrays_snapshot,
+            leaf_scalar_ints=leaf_scalar_ints,
+        )
+        graph_snapshot.logical_graph = logical_payload
+
+        # If the physical pointer mesh has no edges of its own (e.g. an index-buffer DSU forest),
+        # populate `graph_snapshot.nodes/edges` from `logical_payload` as well.
+        if (
+            len(graph_snapshot.edges) == 0
+            and logical_payload is not None
+            and logical_payload.is_forest
+        ):
+            graph_snapshot.nodes = list(logical_payload.nodes)
+            graph_snapshot.edges = list(logical_payload.edges)
 
         self.step_count += 1
         return ExecutionSnapshot(
@@ -2122,9 +2111,181 @@ class GDBTracer:
             call_stack=call_stack,
             arrays=arrays_snapshot,
             graph=graph_snapshot,
+            logical_graph=logical_payload,
             stack_frames={"locals": locals_out},
             status="running",
         )
+
+    def _build_logical_graph_snapshot(
+        self,
+        physical_graph: GraphSnapshot,
+        arrays_snapshot: List[ArraySnapshot],
+        leaf_scalar_ints: Dict[str, int],
+    ) -> Optional[LogicalGraphPayload]:
+        r"""
+        Builds the clean mathematical graph G = (V, E) (`LogicalGraphPayload`):
+          - Never emits freed physical blocks (`status == "freed"` or `is_freed == True`)
+            as active topological nodes.
+          - When an adjacency edge struct (`Edge *tmp`) is freed via `free(tmp)`, its
+            directed edge `(u -> v)` is IMMEDIATELY omitted from `logical_graph.edges`,
+            while traversal continues past `tmp` via its saved pre-free `next` link so
+            subsequent active edges in the same bucket (`curr`) remain in `logical_graph.edges`
+            until they are freed themselves.
+          - Retains isolated vertices (`vertex-0 .. vertex-(V-1)`) with degree 0 as part of `V`.
+        """
+        # 1. Check if we have a registered Adjacency-List Graph container
+        if self._logical_adj_containers:
+            # Pick the most recent container
+            container_addr, container_meta = next(
+                reversed(list(self._logical_adj_containers.items()))
+            )
+            num_v = container_meta.get("num_vertices") or self._logical_vertex_count or 0
+            head_addrs: List[Optional[str]] = container_meta.get("head_addrs", [])
+
+            if 1 <= num_v <= MAX_GRAPH_NODES:
+                p_node_by_id: Dict[str, GraphNode] = {
+                    n.id: n for n in physical_graph.nodes
+                }
+                live_outgoing: Dict[str, List[GraphEdge]] = {}
+                for e in physical_graph.edges:
+                    live_outgoing.setdefault(e.source, []).append(e)
+
+                # Overlay 1D metric array of length `num_v` (e.g. `dist[]`) if present
+                metric_arr = next(
+                    (
+                        a
+                        for a in arrays_snapshot
+                        if not a.is_compound
+                        and a.kind != "matrix"
+                        and len(a.elements) == num_v
+                    ),
+                    None,
+                )
+
+                vertex_ptrs: Dict[int, List[str]] = {}
+                if metric_arr and metric_arr.active_indices:
+                    for v_name, idx_val in metric_arr.active_indices.items():
+                        if 0 <= idx_val < num_v:
+                            vertex_ptrs.setdefault(idx_val, []).append(v_name)
+                else:
+                    for v_name, val in leaf_scalar_ints.items():
+                        if 0 <= val < num_v:
+                            vertex_ptrs.setdefault(val, []).append(v_name)
+
+                raw_active_edges: List[Tuple[int, int, Any, str]] = []
+
+                for u_idx in range(min(num_v, len(head_addrs))):
+                    curr_addr = head_addrs[u_idx]
+                    visited_chain: Set[str] = set()
+
+                    while (
+                        curr_addr
+                        and curr_addr not in visited_chain
+                        and len(visited_chain) < 32
+                    ):
+                        visited_chain.add(curr_addr)
+                        is_freed_node = self._is_address_freed(curr_addr)
+                        p_node = p_node_by_id.get(curr_addr)
+                        blk = self.heap_blocks.get(curr_addr, {})
+
+                        if not is_freed_node and p_node and not p_node.is_freed:
+                            # Node is ACTIVE -> extract its `(u -> v, weight)` edge!
+                            scalar_vals: List[Any] = []
+                            for f_k, f_v in (p_node.fields or {}).items():
+                                s_v = str(f_v)
+                                if (
+                                    s_v != "NULL"
+                                    and not s_v.startswith("0x")
+                                    and not s_v.startswith("ptr[")
+                                ):
+                                    scalar_vals.append(f_v)
+
+                            if len(scalar_vals) >= 1:
+                                dest_v = scalar_vals[0]
+                                weight_w = (
+                                    scalar_vals[1] if len(scalar_vals) >= 2 else None
+                                )
+                                if isinstance(dest_v, int) and 0 <= dest_v < num_v:
+                                    raw_active_edges.append(
+                                        (u_idx, dest_v, weight_w, curr_addr)
+                                    )
+                                    for p_tag in p_node.pointers or []:
+                                        if not p_tag.includes("->") if hasattr(p_tag, "includes") else ("->" not in p_tag):
+                                            tag_str = f"{p_tag}→"
+                                            if tag_str not in vertex_ptrs.get(dest_v, []):
+                                                vertex_ptrs.setdefault(dest_v, []).append(tag_str)
+
+                        # Advance to the next node in the bucket chain:
+                        # Even if `curr_addr` was just FREED (`free(tmp)`), follow its saved
+                        # pre-free `next` link in `blk["edges"]` so unfreed nodes behind it
+                        # (`curr`) remain in the logical graph!
+                        next_addr: Optional[str] = None
+                        live_outs = live_outgoing.get(curr_addr, [])
+                        if live_outs:
+                            next_addr = live_outs[0].target
+                        else:
+                            saved_outs: List[GraphEdge] = blk.get("edges", [])
+                            if saved_outs:
+                                next_addr = saved_outs[0].target
+
+                        curr_addr = next_addr
+
+                logical_nodes: List[GraphNode] = []
+                for i in range(num_v):
+                    ptrs = vertex_ptrs.get(i, [])
+                    fields_obj: Dict[str, Any] = {"vertex": i}
+                    label_str = f"Node {i}"
+
+                    if metric_arr and i < len(metric_arr.elements):
+                        m_val = metric_arr.elements[i]
+                        fields_obj[metric_arr.name] = m_val
+                        label_str = f"Node {i} ({metric_arr.name}: {m_val})"
+
+                    logical_nodes.append(
+                        GraphNode(
+                            id=f"vertex-{i}",
+                            type="LogicalVertex",
+                            c_type="Vertex",
+                            label=label_str,
+                            status="active",
+                            fields=fields_obj,
+                            is_active=bool(ptrs),
+                            is_freed=False,
+                            is_dangling=False,
+                            pointers=ptrs,
+                        )
+                    )
+
+                logical_edges: List[GraphEdge] = []
+                for u_idx, v_idx, w_val, _ in raw_active_edges:
+                    w_label = f"w: {w_val}" if w_val is not None else ""
+                    logical_edges.append(
+                        GraphEdge(
+                            source=f"vertex-{u_idx}",
+                            target=f"vertex-{v_idx}",
+                            label=w_label,
+                            field_order_idx=0,
+                        )
+                    )
+
+                return LogicalGraphPayload(
+                    nodes=logical_nodes,
+                    edges=logical_edges,
+                    is_forest=False,
+                )
+
+        # 2. Check if we have an Index-Buffer Forest (`int *parent` in DSU)
+        forest_snap = self._try_project_index_forest_graph(
+            arrays_snapshot, leaf_scalar_ints
+        )
+        if forest_snap is not None:
+            return LogicalGraphPayload(
+                nodes=forest_snap.nodes,
+                edges=forest_snap.edges,
+                is_forest=True,
+            )
+
+        return None
 
     def _try_project_index_forest_graph(
         self,
@@ -2306,17 +2467,6 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
-        r"""
-        Crawls all reachable struct nodes starting from `active_struct_ptrs` and enforces
-        the 3-stage `ALLOCATED` -> `FREED` -> `PURGED` lifecycle:
-          - Seeds `frontier` ONLY from live stack pointers (`active_struct_ptrs`).
-          - Tracks `reference_counts[addr]` across live stack pointers and live heap pointer fields.
-          - If a block is `"freed"` and `reference_counts[addr] > 0`, emits it with
-            `status="freed"`, `is_freed=True`, `is_dangling=True`, and its frozen pre-free `fields`.
-          - If a block is `"freed"` and `reference_counts[addr] == 0` (unreachable from all
-            live stack and active heap pointers), transitions it to `"purged"` and drops it
-            from the snapshot.
-        """
         emitted_node_ids: Set[str] = set()
         queued_addresses: Set[str] = set()
         reference_counts: Dict[str, int] = {}
@@ -2328,7 +2478,6 @@ class GDBTracer:
         addr_to_ptr_names: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, str, str]] = []
 
-        # Seed strictly from live stack pointers across active call stack frames
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
@@ -2369,10 +2518,6 @@ class GDBTracer:
                             self_ref_order=list(saved_order),
                         )
                     )
-                    # If this freed block was reached via a dangling pointer, only follow its
-                    # frozen edges to child blocks that are ALSO freed (and not yet purged),
-                    # preserving post-order freed subtrees (`cleanup(root)`) without pulling
-                    # already-purged nodes back.
                     for saved_edge in blk.get("edges", []):
                         tgt = saved_edge.target
                         tgt_blk = self.heap_blocks.get(tgt)
@@ -2424,7 +2569,6 @@ class GDBTracer:
                 field_order_list = list(field_types.keys())
                 pointing_vars = addr_to_ptr_names.get(addr, [])
 
-                # Check if glibc tcache poisoned this chunk (supports 1st, 2nd, ..., k-th chunk safe-linking)
                 if self._is_tcache_poisoned(addr, raw_fields, field_types):
                     self._mark_address_freed(addr)
                     blk = self.heap_blocks.get(addr, {})
@@ -2491,11 +2635,13 @@ class GDBTracer:
                                 else elem_decl_type.rstrip("*").strip() or struct_type
                             )
                             non_null_count = 0
+                            parsed_head_addrs: List[Optional[str]] = []
                             for idx, item in enumerate(sub_items):
                                 sub_addr = extract_hex_address(str(item))
                                 if sub_addr and self._is_valid_heap_or_data_address(
                                     sub_addr
                                 ):
+                                    parsed_head_addrs.append(sub_addr)
                                     non_null_count += 1
                                     reference_counts[sub_addr] = (
                                         reference_counts.get(sub_addr, 0) + 1
@@ -2521,7 +2667,22 @@ class GDBTracer:
                                                 f"{owner_name}->{f_name}[{idx}]",
                                             )
                                         )
+                                else:
+                                    parsed_head_addrs.append(None)
+
                             node_fields[f_name] = f"ptr[{len(sub_items)}] ({non_null_count} active)"
+                            if self._has_struct_pointer_links(target_s_type):
+                                v_cnt = (
+                                    next(iter(sister_scalars.values()))
+                                    if sister_scalars
+                                    else len(sub_items)
+                                )
+                                self._logical_vertex_count = v_cnt
+                                self._logical_adj_containers[addr] = {
+                                    "num_vertices": v_cnt,
+                                    "head_addrs": parsed_head_addrs,
+                                    "elem_type": target_s_type,
+                                }
                         elif sub_items:
                             formatted_sub = [format_scalar_val(x) for x in sub_items]
                             node_fields[f_name] = formatted_sub
@@ -2565,10 +2726,7 @@ class GDBTracer:
                             continue
 
                         # Subcase 2A: Dynamic Pointer-to-Pointer Array (`Type **adj` or `Type **array`)
-                        if (
-                            (f_kind == "struct_ptr_array" or "**" in declared_f_type)
-                            and not self._is_address_freed(target_addr)
-                        ):
+                        if f_kind == "struct_ptr_array" or "**" in declared_f_type:
                             elem_struct = (
                                 f_target_type
                                 if f_kind == "struct_ptr_array"
@@ -2586,41 +2744,68 @@ class GDBTracer:
                                     ptr_addr=target_addr,
                                 )
                                 if table_len and 1 <= table_len <= MAX_STRUCT_BUFFER_ELEMENTS:
-                                    ptr_table_raw = self._eval_expr(
-                                        f"*(void *[{table_len}]*)({target_addr})"
-                                    )
-                                    if ptr_table_raw:
-                                        head_ptrs = parse_gdb_array(
-                                            ptr_table_raw, max_elems=table_len
+                                    self._logical_vertex_count = table_len
+                                    if self._is_address_freed(target_addr):
+                                        # The bucket table itself (`g->adj`) was freed:
+                                        # retain the vertex count V with empty heads so V isolated vertices remain
+                                        self._logical_adj_containers[addr] = {
+                                            "num_vertices": table_len,
+                                            "head_addrs": [None] * table_len,
+                                            "elem_type": elem_struct,
+                                        }
+                                        node_fields[f_name] = f"ptr[{table_len}] (freed)"
+                                    else:
+                                        ptr_table_raw = self._eval_expr(
+                                            f"*(void *[{table_len}]*)({target_addr})"
                                         )
-                                        for idx, raw_hp in enumerate(head_ptrs):
-                                            hp_addr = extract_hex_address(str(raw_hp))
-                                            if hp_addr and self._is_valid_heap_or_data_address(hp_addr):
-                                                reference_counts[hp_addr] = (
-                                                    reference_counts.get(hp_addr, 0) + 1
-                                                )
-                                                edge_label = f"{f_name}[{idx}]"
-                                                edge_obj = GraphEdge(
-                                                    source=addr,
-                                                    target=hp_addr,
-                                                    label=edge_label,
-                                                    field_order_idx=idx,
-                                                )
-                                                node_outgoing_edges.append(edge_obj)
-                                                edge_key = (addr, hp_addr, edge_label)
-                                                if edge_key not in seen_edges:
-                                                    seen_edges.add(edge_key)
-                                                    edges.append(edge_obj)
-                                                if hp_addr not in queued_addresses:
-                                                    queued_addresses.add(hp_addr)
-                                                    next_frontier.append(
-                                                        (
-                                                            hp_addr,
-                                                            elem_struct,
-                                                            f"{owner_name}->{f_name}[{idx}]",
-                                                        )
+                                        if ptr_table_raw:
+                                            head_ptrs = parse_gdb_array(
+                                                ptr_table_raw, max_elems=table_len
+                                            )
+                                            parsed_head_addrs = []
+                                            active_bucket_count = 0
+                                            for idx, raw_hp in enumerate(head_ptrs):
+                                                hp_addr = extract_hex_address(str(raw_hp))
+                                                if hp_addr and self._is_valid_heap_or_data_address(hp_addr):
+                                                    parsed_head_addrs.append(hp_addr)
+                                                    if not self._is_address_freed(hp_addr):
+                                                        active_bucket_count += 1
+                                                    reference_counts[hp_addr] = (
+                                                        reference_counts.get(hp_addr, 0) + 1
                                                     )
-                            else:
+                                                    edge_label = f"{f_name}[{idx}]"
+                                                    edge_obj = GraphEdge(
+                                                        source=addr,
+                                                        target=hp_addr,
+                                                        label=edge_label,
+                                                        field_order_idx=idx,
+                                                    )
+                                                    node_outgoing_edges.append(edge_obj)
+                                                    edge_key = (addr, hp_addr, edge_label)
+                                                    if edge_key not in seen_edges:
+                                                        seen_edges.add(edge_key)
+                                                        edges.append(edge_obj)
+                                                    if hp_addr not in queued_addresses:
+                                                        queued_addresses.add(hp_addr)
+                                                        next_frontier.append(
+                                                            (
+                                                                hp_addr,
+                                                                elem_struct,
+                                                                f"{owner_name}->{f_name}[{idx}]",
+                                                            )
+                                                        )
+                                                else:
+                                                    parsed_head_addrs.append(None)
+
+                                            node_fields[f_name] = (
+                                                f"ptr[{table_len}] ({active_bucket_count} active)"
+                                            )
+                                            self._logical_adj_containers[addr] = {
+                                                "num_vertices": table_len,
+                                                "head_addrs": parsed_head_addrs,
+                                                "elem_type": elem_struct,
+                                            }
+                            elif not self._is_address_freed(target_addr):
                                 comp_snap = self._extract_struct_array_field(
                                     owner_name=owner_name,
                                     field_name=f_name,
@@ -2787,7 +2972,6 @@ class GDBTracer:
 
             frontier.extend(next_frontier)
 
-        # Transition any `"freed"` block in `self.heap_blocks` with 0 references to `"purged"`
         for blk_addr, blk_info in self.heap_blocks.items():
             if blk_info.get("status") == "freed":
                 if reference_counts.get(blk_addr, 0) == 0:
@@ -2831,19 +3015,6 @@ class GDBTracer:
         raw_fields: Dict[str, str],
         field_types: Optional[Dict[str, str]] = None,
     ) -> bool:
-        r"""
-        Detects glibc `ptmalloc2` tcache deallocation poison across ALL chunks in a tcache bin:
-          1. 1st chunk in bin (`next == NULL`):
-             `first_val == (addr_int >> 12)`
-          2. 2nd..k-th chunk in bin (glibc 2.32+ Safe-Linking XOR):
-             `fd = prev_chunk_addr ^ (addr_int >> 12)` (e.g. `4331233 = 0x4216e1`).
-             XORing `first_val` with `(addr_int >> 12)` recovers `prev_chunk_addr` in the same
-             4KB heap page (`(decoded >> 12) == (addr_int >> 12)` and 16-byte aligned) or in
-             `self.heap_blocks` / `self._freed_addresses`.
-          3. Offset 8 `tcache_key` corruption:
-             Pointer member overwritten with an unaligned cookie (`addr & 0x7 != 0`) or
-             `tcache_perthread_struct` base (`(addr & 0xfff) == 0x010`).
-        """
         if self._is_address_freed(addr):
             return True
         try:
@@ -2859,12 +3030,10 @@ class GDBTracer:
                 low32_val = first_val & 0xFFFFFFFF
                 low32_key = safe_link_key & 0xFFFFFFFF
 
-                # Check 1: 1st chunk in tcache bin (`next == NULL`)
                 if first_val == safe_link_key or low32_val == low32_key:
                     self._mark_address_freed(addr)
                     return True
 
-                # Check 2: Safe-linked 2nd..k-th chunk in tcache bin (`fd = next_chunk ^ (addr >> 12)`)
                 decoded_low32 = low32_val ^ low32_key
                 decoded_full_addr = (addr_int & ~0xFFFFFFFF) | decoded_low32
                 decoded_hex = hex(decoded_full_addr)
@@ -2876,7 +3045,6 @@ class GDBTracer:
                     self._mark_address_freed(addr)
                     return True
 
-                # Same 4KB heap page & 16-byte chunk alignment check (catches `4331233` = `0x4216e1`)
                 if (
                     decoded_full_addr != addr_int
                     and (decoded_full_addr >> 12) == safe_link_key
@@ -2885,7 +3053,6 @@ class GDBTracer:
                     self._mark_address_freed(addr)
                     return True
 
-            # Check 3: Pointer field overwritten by `tcache_key`
             if field_types:
                 for f_name, f_val_str in raw_fields.items():
                     decl_t = field_types.get(f_name, "")
@@ -2893,8 +3060,6 @@ class GDBTracer:
                         p_addr = extract_hex_address(f_val_str)
                         if p_addr:
                             p_int = int(p_addr, 16)
-                            # Struct pointers on 64-bit heap are always 8-byte aligned;
-                            # an unaligned pointer or `tcache_perthread_struct` (`0x...010`) indicates tcache_key
                             if (p_int & 0x7) != 0 or (
                                 (p_int & 0xFFF) == 0x010
                                 and p_addr not in self.heap_blocks
