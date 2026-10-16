@@ -2,17 +2,15 @@
  * frontend/src/components/Visualizer/ArrayVisualizer.tsx
  * Dual-Mode 1D Array / Compound Tuple / 2D Matrix Grid Visualizer.
  *
- * Features:
- * 1. Strict 1D vs 2D Matrix Discrimination:
- *    - Whenever `arr.kind === "matrix"` or `arr.dimensions?.length === 2` (or 2D nested rows),
- *      bypasses the 1D bar-chart renderer and renders `<MatrixGrid />`.
- * 2. Dedicated `<MatrixGrid />` Component:
- *    - Header bar with matrix C declaration (`int mat[10][10]`), dimension badge (`10 × 10`),
- *      and active loop index pills (`i = 3`, `j = 1`).
- *    - Dark-themed HTML table grid with sticky `[0]..[C-1]` column headers and `[0]..[R-1]` row headers.
- *    - Crosshair row/column shading + glowing target cell highlight when active indices match `[r][c]`.
- *    - Step-delta mutation tracking: flashes cells that were just written/updated on the current step.
- *    - Muted styling (`text-slate-600`) for `0` or uninitialized stack garbage values.
+ * Matrix Coordinate Mapping Guarantees:
+ * - Binds Dimension 0 (`dimensions[0]`, `access.row_var`, `access.row_val`) strictly
+ *   to the vertical Y-axis (Rows `[0] .. [R-1]`).
+ * - Binds Dimension 1 (`dimensions[1]`, `access.col_var`, `access.col_val`) strictly
+ *   to the horizontal X-axis (Columns `[0] .. [C-1]`).
+ * - Renders explicit Row badge (`${row_var} = ${row_val} (row)`),
+ *   Column badge (`${col_var} = ${col_val} (col)`), and
+ *   Target badge (`Target: ${name}[${row_val}][${col_val}]`).
+ * - Places the active amber target border strictly at `cell[row_val][col_val]`.
  */
 
 import React, { useRef, useEffect } from "react";
@@ -28,6 +26,18 @@ export interface ArrayVisualizerProps {
   arrays: ArraySnapshot[];
   locals?: Record<string, number | string>;
   graphNodes?: GraphNode[];
+}
+
+interface MatrixAccessInfo {
+  row_var?: string | null;
+  row_val?: number | null;
+  col_var?: string | null;
+  col_val?: number | null;
+  target_repr?: string | null;
+}
+
+interface ExtendedMatrixSnapshot extends ArraySnapshot {
+  access?: MatrixAccessInfo | null;
 }
 
 const BADGE_PALETTE = [
@@ -60,10 +70,6 @@ function isCompoundElement(el: ArrayElement): el is CompoundArrayElement {
   );
 }
 
-/**
- * Strictly discriminates whether an ArraySnapshot represents a 2D Matrix
- * rather than a 1D Array.
- */
 function isMatrixSnapshot(arr: ArraySnapshot): boolean {
   if (arr.kind === "matrix") return true;
   if (Array.isArray(arr.dimensions) && arr.dimensions.length === 2) return true;
@@ -78,10 +84,6 @@ function isMatrixSnapshot(arr: ArraySnapshot): boolean {
   return false;
 }
 
-/**
- * Extracts normalized 2D rows `Array<Array<number | string>>` and `[numRows, numCols]`
- * from a matrix snapshot.
- */
 function extractMatrixGridData(arr: ArraySnapshot): {
   gridRows: Array<Array<number | string>>;
   numRows: number;
@@ -109,11 +111,6 @@ function extractMatrixGridData(arr: ArraySnapshot): {
   };
 }
 
-/**
- * Heuristic-free check for uninitialized stack garbage values (e.g. -135296, 32767, 0x7fff...)
- * vs meaningful matrix numbers so uninitialized cells in stack matrices (`int mat[10][10]`)
- * render with subtle muted text until written.
- */
 function isLikelyGarbageOrZero(val: number | string): {
   isZero: boolean;
   isGarbage: boolean;
@@ -144,31 +141,59 @@ function isLikelyGarbageOrZero(val: number | string): {
 }
 
 interface MatrixGridProps {
-  matrix: ArraySnapshot;
+  matrix: ExtendedMatrixSnapshot;
 }
 
 /**
- * Dedicated 2D Matrix Table / Grid Component.
+ * Dedicated 2D Matrix Table / Grid Component with Strict Row (Dim 0) & Col (Dim 1) Binding.
  */
 const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
   const { gridRows, numRows, numCols } = extractMatrixGridData(matrix);
   const prevGridRef = useRef<Record<string, string>>({});
 
+  const access = matrix.access;
   const activeEntries = Object.entries(matrix.active_indices || {});
 
-  // Identify active row and column indices from syntactically proven active_indices:
-  // If 2+ active indices exist (e.g. outer loop `i` and inner loop `j`), the 1st maps to row and 2nd to col.
-  // If 1 active index exists, highlight that row index.
-  const rowCursor = activeEntries.length >= 1 ? activeEntries[0] : null;
-  const colCursor = activeEntries.length >= 2 ? activeEntries[1] : null;
+  // Primary binding from explicit positional `matrix.access` metadata;
+  // fallback to ordered `active_indices` (where backend places row_var 1st, col_var 2nd).
+  const rowVar: string | null =
+    access?.row_var !== undefined && access?.row_var !== null
+      ? access.row_var
+      : activeEntries.length >= 1
+      ? activeEntries[0][0]
+      : null;
 
+  const rawRowVal: number | null =
+    typeof access?.row_val === "number"
+      ? access.row_val
+      : activeEntries.length >= 1
+      ? activeEntries[0][1]
+      : null;
+
+  const colVar: string | null =
+    access?.col_var !== undefined && access?.col_var !== null
+      ? access.col_var
+      : activeEntries.length >= 2
+      ? activeEntries[1][0]
+      : null;
+
+  const rawColVal: number | null =
+    typeof access?.col_val === "number"
+      ? access.col_val
+      : activeEntries.length >= 2
+      ? activeEntries[1][1]
+      : null;
+
+  // In-bounds validation for table highlighting:
+  // Dimension 0 (Row) -> vertical Y-axis [0 .. numRows - 1]
+  // Dimension 1 (Column) -> horizontal X-axis [0 .. numCols - 1]
   const activeRowIdx =
-    rowCursor && rowCursor[1] >= 0 && rowCursor[1] < numRows
-      ? rowCursor[1]
+    rawRowVal !== null && rawRowVal >= 0 && rawRowVal < numRows
+      ? rawRowVal
       : null;
   const activeColIdx =
-    colCursor && colCursor[1] >= 0 && colCursor[1] < numCols
-      ? colCursor[1]
+    rawColVal !== null && rawColVal >= 0 && rawColVal < numCols
+      ? rawColVal
       : null;
 
   // Detect cells modified on the current step compared to the previous render
@@ -214,38 +239,36 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
           </span>
         </div>
 
-        {/* Active Loop Index Badges */}
+        {/* Positional Row, Column & Target Badges */}
         <div className="flex flex-wrap items-center gap-2">
           {activeRowIdx !== null && activeColIdx !== null && (
-            <span className="px-2.5 py-0.5 rounded-md bg-amber-500/20 border border-amber-400/70 text-amber-300 text-xs font-mono font-bold shadow-sm">
+            <span
+              className="px-2.5 py-0.5 rounded-md bg-amber-500/20 border border-amber-400/80 text-amber-300 text-xs font-mono font-bold shadow-sm"
+              title={access?.target_repr || undefined}
+            >
               Target: {matrix.name}[{activeRowIdx}][{activeColIdx}]
             </span>
           )}
 
-          {activeEntries.map(([ptrName, idxVal], idxPos) => {
-            const boundLimit = idxPos === 0 ? numRows : numCols;
-            const isOob = idxVal < 0 || idxVal >= boundLimit;
-            const axisRole =
-              activeEntries.length >= 2
-                ? idxPos === 0
-                  ? "row"
-                  : idxPos === 1
-                  ? "col"
-                  : ""
-                : "row";
+          {rowVar !== null && rawRowVal !== null && (
+            <span
+              className={`px-2.5 py-0.5 rounded text-[11px] font-mono font-bold border bg-sky-400 text-slate-950 border-sky-200 shadow-[0_0_10px_rgba(56,189,248,0.45)] ${
+                activeRowIdx === null ? "opacity-65" : ""
+              }`}
+            >
+              {rowVar} = {rawRowVal} (row)
+            </span>
+          )}
 
-            return (
-              <span
-                key={ptrName}
-                className={`px-2.5 py-0.5 rounded text-[11px] font-mono font-bold border ${getIndexBadgeStyle(
-                  ptrName
-                )} ${isOob ? "opacity-65" : ""}`}
-              >
-                {ptrName} = {idxVal}
-                {axisRole ? ` (${axisRole})` : ""}
-              </span>
-            );
-          })}
+          {colVar !== null && rawColVal !== null && (
+            <span
+              className={`px-2.5 py-0.5 rounded text-[11px] font-mono font-bold border bg-amber-400 text-slate-950 border-amber-200 shadow-[0_0_10px_rgba(251,191,36,0.45)] ${
+                activeColIdx === null ? "opacity-65" : ""
+              }`}
+            >
+              {colVar} = {rawColVal} (col)
+            </span>
+          )}
         </div>
       </div>
 
@@ -256,10 +279,10 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
             <tr>
               {/* Top-Left Corner Axis Key */}
               <th className="sticky top-0 left-0 z-20 bg-slate-900/95 border border-slate-800 rounded-md px-2.5 py-1.5 text-[10px] text-slate-400 font-semibold">
-                [r \ c]
+                [row \ col]
               </th>
 
-              {/* Column Headers [0], [1], ... */}
+              {/* Column Headers [0] .. [numCols - 1] (Dimension 1 / Horizontal X-Axis) */}
               {Array.from({ length: numCols }).map((_, cIdx) => {
                 const isColActive = activeColIdx === cIdx;
                 return (
@@ -272,9 +295,9 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
                     }`}
                   >
                     <div className="flex flex-col items-center leading-tight">
-                      {isColActive && colCursor && (
+                      {isColActive && colVar && (
                         <span className="text-[9px] text-amber-400 font-extrabold mb-0.5">
-                          {colCursor[0]} ↓
+                          {colVar} ↓
                         </span>
                       )}
                       <span>[{cIdx}]</span>
@@ -286,36 +309,38 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
           </thead>
 
           <tbody>
+            {/* Rows [0] .. [numRows - 1] (Dimension 0 / Vertical Y-Axis) */}
             {gridRows.map((rowValues, rIdx) => {
               const isRowActive = activeRowIdx === rIdx;
 
               return (
                 <tr key={`row-${rIdx}`}>
-                  {/* Sticky Row Header [0], [1], ... */}
+                  {/* Sticky Row Header [0] .. [numRows - 1] */}
                   <th
-                    className={`sticky left-0 z-10 min-w-[48px] px-2.5 py-1.5 rounded-md border text-center transition-colors ${
+                    className={`sticky left-0 z-10 min-w-[54px] px-2.5 py-1.5 rounded-md border text-center transition-colors ${
                       isRowActive
                         ? "bg-sky-950/90 border-sky-400 text-sky-300 font-extrabold shadow-[0_0_10px_rgba(56,189,248,0.3)]"
                         : "bg-slate-900/90 border-slate-800/90 text-slate-400 font-medium"
                     }`}
                   >
                     <div className="flex items-center justify-center gap-1">
-                      {isRowActive && rowCursor && (
+                      {isRowActive && rowVar && (
                         <span className="text-[9px] text-sky-400 font-extrabold">
-                          {rowCursor[0]} →
+                          {rowVar} →
                         </span>
                       )}
                       <span>[{rIdx}]</span>
                     </div>
                   </th>
 
-                  {/* Matrix Cells */}
+                  {/* Matrix Cells: cell[rIdx][cIdx] */}
                   {Array.from({ length: numCols }).map((_, cIdx) => {
                     const rawCellVal =
                       cIdx < rowValues.length ? rowValues[cIdx] : 0;
                     const { isZero, isGarbage, displayVal } =
                       isLikelyGarbageOrZero(rawCellVal);
 
+                    // Active coordinate match strictly at (rIdx === activeRowIdx && cIdx === activeColIdx)
                     const isTargetCell =
                       activeRowIdx === rIdx && activeColIdx === cIdx;
                     const isJustModified = modifiedCells.has(
@@ -334,9 +359,10 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
                       cellClasses =
                         "bg-emerald-950/85 border-2 border-emerald-400 text-emerald-200 font-extrabold shadow-[0_0_12px_rgba(52,211,153,0.4)]";
                     } else if (isCrosshair) {
-                      cellClasses = isGarbage || isZero
-                        ? "bg-slate-900/95 border-sky-500/40 text-slate-500"
-                        : "bg-sky-950/40 border-sky-500/50 text-sky-100 font-semibold";
+                      cellClasses =
+                        isGarbage || isZero
+                          ? "bg-slate-900/95 border-sky-500/40 text-slate-500"
+                          : "bg-sky-950/40 border-sky-500/50 text-sky-100 font-semibold";
                     } else if (isGarbage || isZero) {
                       cellClasses =
                         "bg-slate-950/80 border-slate-800/70 text-slate-600";
@@ -373,7 +399,9 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-1.5">
             <span className="w-3 h-3 rounded-sm bg-amber-950 border-2 border-amber-400 inline-block" />
-            <span>Active Target [i][j]</span>
+            <span>
+              Active Target [{rowVar || "row"}][{colVar || "col"}]
+            </span>
           </div>
           <div className="flex items-center gap-1.5">
             <span className="w-3 h-3 rounded-sm bg-emerald-950 border-2 border-emerald-400 inline-block" />
@@ -492,9 +520,13 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
   return (
     <div className="flex flex-col gap-6 p-5 overflow-y-auto h-full bg-slate-950">
       {arrays.map((arr) => {
-        // Strict discrimination: 2D matrices bypass the 1D bar-chart view completely
         if (isMatrixSnapshot(arr)) {
-          return <MatrixGrid key={arr.name} matrix={arr} />;
+          return (
+            <MatrixGrid
+              key={arr.name}
+              matrix={arr as ExtendedMatrixSnapshot}
+            />
+          );
         }
 
         const isStructOwned =

@@ -6,19 +6,21 @@ High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memor
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Monotonic Cumulative Heap Block Ledger (`self.heap_blocks`):
-     - Tracks every discovered heap struct block across the entire debug session:
-       `heap_blocks[addr] = {"address": addr, "status": "active" | "freed", "type": ..., "fields": ..., "edges": ...}`
+  1. Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`):
+     - Extracts exact positional subscript expressions `<name>[<expr0>][<expr1>]` from the
+       active source line and enclosing function body.
+     - Strictly binds `<expr0>` to Dimension 0 (`row_var`, `row_val`) and `<expr1>` to
+       Dimension 1 (`col_var`, `col_val`), eliminating GDB's inner-to-outer lexical block
+       ordering inversion (`j` before `i`).
+     - Emits structured `access: { row_var, row_val, col_var, col_val, target_repr }`
+       and a 2D numeric `rows: List[List[Any]]` grid.
+  2. Monotonic Cumulative Heap Block Ledger (`self.heap_blocks`):
+     - Tracks every discovered heap struct block across the entire debug session.
      - Once `free(addr)` executes, `heap_blocks[addr]["status"] = "freed"` is IMMUTABLE
-       (never overwritten by dangling stack/heap pointers on subsequent steps) unless
-       an explicit `malloc`/`calloc`/`realloc` reallocates that exact address.
-     - Preserves pre-free field values and structural edges so all freed nodes (e.g. all 7
-       nodes of a recursively freed binary tree) remain visible in their exact topology with
-       `status: "freed"` and `is_freed: True`.
-  2. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
-  3. Generic Iterative Typedef-Pointer Resolution (`_resolve_type_info`).
-  4. Strict User-Scope Variable Filtering & Unified 2D Matrix Schema (`kind: "matrix"`).
-  5. Step Budget: `MAX_STEPS = 1500`.
+       unless an explicit `malloc`/`calloc`/`realloc` reallocates that exact address.
+  3. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
+  4. Generic Iterative Typedef-Pointer Resolution (`_resolve_type_info`).
+  5. Strict User-Scope Variable Filtering & Step Budget `MAX_STEPS = 1500`.
 """
 
 import asyncio
@@ -134,14 +136,23 @@ class DwarfTypeEntry:
 
 
 # ==============================================================================
-# Clean Pydantic Data Contract (With Unified 2D Matrix & Heap Status Support)
+# Clean Pydantic Data Contract (With Positional 2D Matrix Access Metadata)
 # ==============================================================================
+
+class MatrixAccessMetadata(BaseModel):
+    row_var: Optional[str] = None
+    row_val: Optional[int] = None
+    col_var: Optional[str] = None
+    col_val: Optional[int] = None
+    target_repr: Optional[str] = None
+
 
 class ArraySnapshot(BaseModel):
     name: str
     type: str
     kind: str = "array"  # "array" | "matrix"
     dimensions: Optional[List[int]] = None
+    access: Optional[MatrixAccessMetadata] = None
     rows: Optional[List[List[Any]]] = None
     element_type: str = ""
     is_compound: bool = False
@@ -352,19 +363,8 @@ class GDBTracer:
 
         self._type_cache: Dict[str, DwarfTypeEntry] = {}
 
-        # Authoritative, Monotonic Cumulative Heap Block Ledger:
-        # Maps canonical hex address -> {
-        #   "address": str,
-        #   "status": "active" | "freed",
-        #   "type": str,
-        #   "fields": Dict[str, Any],
-        #   "label": str,
-        #   "self_ref_order": List[str],
-        #   "edges": List[GraphEdge],
-        #   "freed_at_step": Optional[int],
-        # }
+        # Authoritative, Monotonic Cumulative Heap Block Ledger
         self.heap_blocks: Dict[str, Dict[str, Any]] = {}
-        # Tracks addresses freed on the non-struct buffer path (e.g. `free(s->data)`, `free(dist)`)
         self._freed_addresses: Set[str] = set()
 
         # Per-function variable snapshot cache for user caller frames
@@ -373,6 +373,7 @@ class GDBTracer:
 
         # Syntactic analysis caches
         self._syntactic_index_cache: Dict[Tuple[str, str], Set[str]] = {}
+        self._matrix_subscript_pairs_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self._func_body_cache: Dict[str, str] = {}
         self._func_line_span_cache: Dict[str, Tuple[int, int]] = {}
         self._var_decl_line_cache: Dict[Tuple[str, str], Optional[Tuple[int, bool]]] = {}
@@ -410,11 +411,6 @@ class GDBTracer:
         return True
 
     def _mark_address_freed(self, addr: str) -> None:
-        """
-        Marks `addr` as permanently `"freed"` in `self.heap_blocks` and `self._freed_addresses`.
-        Once marked `"freed"`, a block cannot revert to `"active"` unless explicitly reallocated
-        by `malloc`/`calloc`/`realloc`.
-        """
         self._freed_addresses.add(addr)
         if addr in self.heap_blocks:
             self.heap_blocks[addr]["status"] = "freed"
@@ -664,11 +660,6 @@ class GDBTracer:
         return False
 
     def _record_pending_free_on_current_line(self) -> None:
-        """
-        Intercepts `free(expr)` on `self._current_line` BEFORE GDB steps over it,
-        evaluates the target pointer address, and permanently marks the block as `"freed"`
-        in `self.heap_blocks`.
-        """
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line].split("//")[0]
             free_exprs = [
@@ -877,7 +868,7 @@ class GDBTracer:
         )
 
     # ==========================================================================
-    # Syntactic Subscript, Multi-Dimensional Index & Forest Proof Engine
+    # Syntactic Subscript, Positional 2D Matrix Access & Forest Proof Engine
     # ==========================================================================
 
     @staticmethod
@@ -893,6 +884,153 @@ class GDBTracer:
                 continue
             idents.add(token)
         return idents
+
+    @staticmethod
+    def _extract_ordered_identifiers_from_expr(expr: str) -> List[str]:
+        """Preserves left-to-right lexical appearance order of identifiers inside an expression."""
+        idents: List[str] = []
+        for match in C_IDENT_RE.finditer(expr):
+            token = match.group(1)
+            if token in C_SYNTAX_KEYWORDS:
+                continue
+            end_pos = match.end()
+            trailing = expr[end_pos:].lstrip()
+            if trailing.startswith("("):
+                continue
+            if token not in idents:
+                idents.append(token)
+        return idents
+
+    def _resolve_matrix_access(
+        self,
+        matrix_name: str,
+        num_rows: int,
+        num_cols: int,
+        leaf_scalar_ints: Dict[str, int],
+    ) -> Tuple[Optional[MatrixAccessMetadata], Dict[str, int]]:
+        """
+        Positional 2D Subscript Analyzer (Zero Hardcoding):
+        Extracts `<matrix_name>[<expr0>][<expr1>]` from:
+          1. The active execution line (`self._current_line`) if present, OR
+          2. The enclosing function body (`self._current_func`), excluding declaration `[R][C]`.
+        Strictly binds `<expr0>` to Dimension 0 (`row_var`, `row_val`) and `<expr1>`
+        to Dimension 1 (`col_var`, `col_val`).
+        Never relies on GDB's `-stack-list-variables` lexical ordering.
+        """
+        clean_name = matrix_name.split(":")[-1].strip()
+        esc_name = re.escape(clean_name)
+        pair_re = re.compile(rf"\b{esc_name}\s*\[\s*([^\]]+?)\s*\]\s*\[\s*([^\]]+?)\s*\]")
+
+        candidate_pairs: List[Tuple[str, str]] = []
+
+        # 1. Check current source line first for immediate active access `mat[expr0][expr1]`
+        if 1 <= self._current_line < len(self._source_lines):
+            curr_src = C_COMMENTS_AND_STRINGS_RE.sub(
+                " ", self._source_lines[self._current_line]
+            )
+            # Exclude array declaration lines like `int mat[10][10];`
+            decl_info = self._get_var_declaration_info(
+                self._current_func, clean_name, self._current_line
+            )
+            if not (decl_info and decl_info[0] == self._current_line):
+                for m in pair_re.finditer(curr_src):
+                    candidate_pairs.append((m.group(1).strip(), m.group(2).strip()))
+
+        # 2. Fall back to cached function-body 2D subscript pairs `mat[expr0][expr1]`
+        cache_key = (self._current_func, clean_name)
+        if cache_key not in self._matrix_subscript_pairs_cache:
+            body = self._extract_function_body_by_name(
+                self._current_func, self._current_line
+            )
+            body_pairs: List[Tuple[str, str]] = []
+            for m in pair_re.finditer(body):
+                e0, e1 = m.group(1).strip(), m.group(2).strip()
+                # Skip constant dimension declarations like `mat[10][10]` where both are integer literals
+                if e0.isdigit() and e1.isdigit():
+                    continue
+                if (e0, e1) not in body_pairs:
+                    body_pairs.append((e0, e1))
+            self._matrix_subscript_pairs_cache[cache_key] = body_pairs
+
+        for bp in self._matrix_subscript_pairs_cache[cache_key]:
+            if bp not in candidate_pairs:
+                candidate_pairs.append(bp)
+
+        def eval_subscript_dim(expr_str: str) -> Tuple[Optional[str], Optional[int]]:
+            """
+            Resolves a subscript expression (`i`, `r + 1`, `0`, etc.) to `(symbol_label, int_val)`.
+            Uses `leaf_scalar_ints` directly when `expr_str` is a single variable identifier
+            (zero MI round-trip overhead), or evaluates compound expressions via GDB.
+            """
+            idents = self._extract_ordered_identifiers_from_expr(expr_str)
+            # Fast path: single identifier in `leaf_scalar_ints`
+            if expr_str in leaf_scalar_ints:
+                return (expr_str, leaf_scalar_ints[expr_str])
+            # Integer literal
+            if re.match(r"^-?\d+$", expr_str):
+                return (expr_str, int(expr_str))
+            # If the primary identifier in `expr_str` is not yet in `leaf_scalar_ints`
+            # (e.g. inner loop variable `j` while execution is on the outer `for (int i = ...)` line),
+            # do not evaluate out-of-scope garbage.
+            if idents and not any(id_tok in leaf_scalar_ints for id_tok in idents):
+                return (idents[0], None)
+            # Compound expression (`i + 1`, `r - 1`) with in-scope variables
+            raw_eval = self._eval_expr(expr_str)
+            if raw_eval is not None:
+                parsed = parse_scalar(raw_eval)
+                if isinstance(parsed, int):
+                    return (expr_str, parsed)
+            if idents and idents[0] in leaf_scalar_ints:
+                return (idents[0], leaf_scalar_ints[idents[0]])
+            return (expr_str if idents else None, None)
+
+        row_var: Optional[str] = None
+        row_val: Optional[int] = None
+        col_var: Optional[str] = None
+        col_val: Optional[int] = None
+
+        for expr0, expr1 in candidate_pairs:
+            r_sym, r_v = eval_subscript_dim(expr0)
+            c_sym, c_v = eval_subscript_dim(expr1)
+            if r_sym is not None or c_sym is not None:
+                row_var, row_val = r_sym, r_v
+                col_var, col_val = c_sym, c_v
+                if r_v is not None and c_v is not None:
+                    break
+
+        # Build deterministically ordered `active_indices`:
+        # ALWAYS insert `row_var` (Dimension 0) FIRST and `col_var` (Dimension 1) SECOND.
+        ordered_active_indices: Dict[str, int] = {}
+        if row_var and row_val is not None and -1 <= row_val <= num_rows:
+            ordered_active_indices[row_var] = row_val
+        if col_var and col_val is not None and -1 <= col_val <= num_cols:
+            ordered_active_indices[col_var] = col_val
+
+        # Include any additional syntactically proven cursors after `row_var` and `col_var`
+        extra_proven = self._collect_active_indices(
+            leaf_scalar_ints, max(num_rows, num_cols), array_name=clean_name
+        )
+        for k, v in extra_proven.items():
+            if k not in ordered_active_indices:
+                ordered_active_indices[k] = v
+
+        if row_var is None and col_var is None:
+            return (None, ordered_active_indices)
+
+        target_repr: Optional[str] = None
+        if row_var is not None and col_var is not None and row_val is not None and col_val is not None:
+            target_repr = f"{clean_name}[{row_var}][{col_var}] -> {clean_name}[{row_val}][{col_val}]"
+        elif row_var is not None and row_val is not None:
+            target_repr = f"{clean_name}[{row_var}][...] -> row [{row_val}]"
+
+        access_meta = MatrixAccessMetadata(
+            row_var=row_var,
+            row_val=row_val,
+            col_var=col_var,
+            col_val=col_val,
+            target_repr=target_repr,
+        )
+        return (access_meta, ordered_active_indices)
 
     def _is_syntactically_self_indexed_buffer(self, buf_leaf_name: str) -> bool:
         clean_leaf = buf_leaf_name.split("->")[-1].split(".")[-1].strip()
@@ -1491,11 +1629,6 @@ class GDBTracer:
     def _check_explicit_reallocation_on_last_line(
         self, var_name: str, addr: str, resolved_type: str
     ) -> None:
-        """
-        Allows a previously freed address `addr` to transition back to `"active"` ONLY
-        if `self._last_executed_line` explicitly executed `malloc`, `calloc`, or `realloc`
-        assigning into `var_name`. Dangling pointers NEVER resurrect a freed block.
-        """
         if not self._is_address_freed(addr):
             return
         if not (1 <= self._last_executed_line < len(self._source_lines)):
@@ -1548,7 +1681,7 @@ class GDBTracer:
             if not self._is_valid_user_symbol(v_name, v_type):
                 continue
 
-            # 1A: Fixed 2D stack array (`int mat[3][3]`)
+            # 1A: Fixed 2D stack array (`int mat[10][10]`)
             arr_2d_match = FIXED_2D_ARR_RE.match(v_type)
             if arr_2d_match:
                 elem_type = arr_2d_match.group(1).strip()
@@ -1776,7 +1909,7 @@ class GDBTracer:
                             )
                         )
 
-        # 2B: Unified Fixed 2D Stack Matrices (`int mat[3][3]`)
+        # 2B: Unified Fixed 2D Stack Matrices (`int mat[10][10]`)
         for mat_name, elem_type, rows, cols, _ in raw_2d_array_vars:
             mat_val = self._eval_expr(mat_name)
             if not mat_val:
@@ -1794,8 +1927,11 @@ class GDBTracer:
                     parsed_rows.append([format_scalar_val(r_str)] * cols)
 
             if parsed_rows:
-                active_idx = self._collect_active_indices(
-                    leaf_scalar_ints, max(rows, cols), array_name=mat_name
+                access_meta, ordered_active_idx = self._resolve_matrix_access(
+                    matrix_name=mat_name,
+                    num_rows=len(parsed_rows),
+                    num_cols=cols,
+                    leaf_scalar_ints=leaf_scalar_ints,
                 )
                 arrays_snapshot.append(
                     ArraySnapshot(
@@ -1803,12 +1939,13 @@ class GDBTracer:
                         type=f"{elem_type}[{rows}][{cols}]",
                         kind="matrix",
                         dimensions=[len(parsed_rows), cols],
+                        access=access_meta,
                         rows=parsed_rows,
                         element_type=elem_type,
                         is_compound=False,
                         capacity=len(parsed_rows) * cols,
                         elements=parsed_rows,
-                        active_indices=active_idx,
+                        active_indices=ordered_active_idx,
                     )
                 )
 
@@ -1858,8 +1995,11 @@ class GDBTracer:
                         ]
                         parsed_rows.append(row_elems)
                 if parsed_rows:
-                    active_idx = self._collect_active_indices(
-                        leaf_scalar_ints, max(rows_len, cols_len), array_name=clean_mat
+                    access_meta, ordered_active_idx = self._resolve_matrix_access(
+                        matrix_name=clean_mat,
+                        num_rows=len(parsed_rows),
+                        num_cols=cols_len,
+                        leaf_scalar_ints=leaf_scalar_ints,
                     )
                     arrays_snapshot.append(
                         ArraySnapshot(
@@ -1867,12 +2007,13 @@ class GDBTracer:
                             type=f"{elem_type}[{len(parsed_rows)}][{cols_len}]",
                             kind="matrix",
                             dimensions=[len(parsed_rows), cols_len],
+                            access=access_meta,
                             rows=parsed_rows,
                             element_type=elem_type,
                             is_compound=False,
                             capacity=len(parsed_rows) * cols_len,
                             elements=parsed_rows,
-                            active_indices=active_idx,
+                            active_indices=ordered_active_idx,
                         )
                     )
 
@@ -2084,15 +2225,6 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
-        """
-        Crawls all active heap blocks AND emits all previously freed blocks stored
-        in the cumulative `self.heap_blocks` ledger.
-        - Once `self.heap_blocks[addr]["status"] == "freed"`, the block is NEVER
-          re-evaluated as `"active"` even if dangling stack or struct pointers still
-          reference `addr`.
-        - Preserves last known `fields`, `self_ref_order`, and `edges` on freed blocks
-          so freed tree/list structures retain their exact layout and tombstoned values.
-        """
         emitted_node_ids: Set[str] = set()
         queued_addresses: Set[str] = set()
         nodes: List[GraphNode] = []
@@ -2103,7 +2235,6 @@ class GDBTracer:
         addr_to_ptr_names: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, str, str]] = []
 
-        # 1. Seed from active stack pointers across frames
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
@@ -2113,8 +2244,6 @@ class GDBTracer:
                     queued_addresses.add(addr)
                     frontier.append((addr, s_type, ptr_name.split(":")[-1]))
 
-        # 2. Seed all known blocks from `self.heap_blocks` so recursion base cases (`root == NULL`)
-        #    and freed blocks are always included in the snapshot
         for blk_addr, blk_info in list(self.heap_blocks.items()):
             if (
                 blk_addr not in queued_addresses
@@ -2127,8 +2256,6 @@ class GDBTracer:
             current_batch = frontier[: MAX_GRAPH_NODES - len(nodes)]
             frontier = frontier[MAX_GRAPH_NODES - len(nodes) :]
 
-            # Separate already-freed blocks from potentially active blocks:
-            # Freed blocks in `self.heap_blocks` are IMMUTABLE and do not need GDB dereferencing!
             active_candidates: List[Tuple[str, str, str]] = []
             for addr, struct_type, owner_name in current_batch:
                 if addr in emitted_node_ids:
@@ -2187,7 +2314,6 @@ class GDBTracer:
                 field_order_list = list(field_types.keys())
                 pointing_vars = addr_to_ptr_names.get(addr, [])
 
-                # Check if glibc tcache poisoned this block since the last step
                 if self._is_tcache_poisoned(addr, raw_fields):
                     self._mark_address_freed(addr)
                     blk = self.heap_blocks.get(addr, {})
@@ -2509,7 +2635,6 @@ class GDBTracer:
                     else struct_type.replace("struct ", "")
                 )
 
-                # Update authoritative cumulative heap block entry while active
                 self.heap_blocks[addr] = {
                     "address": addr,
                     "status": "active",
@@ -2538,8 +2663,6 @@ class GDBTracer:
 
             frontier.extend(next_frontier)
 
-        # 3. Restore preserved structural edges for freed blocks so freed trees/lists
-        #    maintain their visual hierarchy instead of collapsing into isolated cards
         for blk_addr, blk_info in self.heap_blocks.items():
             if blk_info.get("status") == "freed" and blk_addr in emitted_node_ids:
                 for saved_edge in blk_info.get("edges", []):
