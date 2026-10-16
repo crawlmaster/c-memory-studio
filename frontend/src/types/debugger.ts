@@ -14,6 +14,9 @@ export type ArrayElement = number | string | CompoundArrayElement;
 export interface ArraySnapshot {
   name: string;
   type: string;
+  kind?: "array" | "matrix";
+  dimensions?: number[];
+  rows?: Array<Array<number | string>>;
   element_type?: string;
   is_compound?: boolean;
   capacity?: number;

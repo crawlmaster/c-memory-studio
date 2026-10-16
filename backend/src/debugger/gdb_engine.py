@@ -6,17 +6,17 @@ High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memor
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`):
-     - Guarantees 100% of batched root dereferences (e.g. multiple independent pointers
-       `head`, `new_head`, `nodes[0..N-1]`) are read from the GDB pipe before returning,
-       eliminating dropped nodes and pipe desynchronization.
-  2. Generic Iterative Typedef-Pointer Resolution (`_resolve_type_info`):
-     - Unwraps `DW_TAG_typedef` aliases (e.g. `typedef struct node_t *node;`) down to their
-       underlying struct and pointer indirection levels.
-  3. Complete Local Root Discovery & Declaration Line Guard:
-     - Tracks the exact source line where each local variable is declared in the active function
-       so uninitialized future variables are ignored prior to declaration and immediately
-       registered as independent heap roots as soon as their initialization line completes.
+  1. Monotonic Cumulative Heap Block Ledger (`self.heap_blocks`):
+     - Tracks every discovered heap struct block across the entire debug session:
+       `heap_blocks[addr] = {"address": addr, "status": "active" | "freed", "type": ..., "fields": ..., "edges": ...}`
+     - Once `free(addr)` executes, `heap_blocks[addr]["status"] = "freed"` is IMMUTABLE
+       (never overwritten by dangling stack/heap pointers on subsequent steps) unless
+       an explicit `malloc`/`calloc`/`realloc` reallocates that exact address.
+     - Preserves pre-free field values and structural edges so all freed nodes (e.g. all 7
+       nodes of a recursively freed binary tree) remain visible in their exact topology with
+       `status: "freed"` and `is_freed: True`.
+  2. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
+  3. Generic Iterative Typedef-Pointer Resolution (`_resolve_type_info`).
   4. Strict User-Scope Variable Filtering & Unified 2D Matrix Schema (`kind: "matrix"`).
   5. Step Budget: `MAX_STEPS = 1500`.
 """
@@ -55,6 +55,7 @@ PTR_TYPE_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_\s\*]*?)\s*\*$")
 FREE_CALL_RE = re.compile(
     r"\bfree\s*\(\s*([a-zA-Z_][a-zA-Z0-9_\->\.\[\]]*)\s*\)"
 )
+ALLOC_CALL_RE = re.compile(r"\b(malloc|calloc|realloc)\s*\(")
 
 # ==============================================================================
 # C Lexical, Grammar & Runtime Noise Filter Constants
@@ -126,14 +127,14 @@ USER_FUNC_CALL_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
 class DwarfTypeEntry:
     kind: str  # "primitive", "primitive_ptr", "primitive_ptr_array", "struct_val", "struct_ptr", "struct_ptr_array", "other"
     target_type: str
-    deref_cast_type: str = ""  # C type expression used to dereference a pointer to this struct: e.g. "struct node_t *" or "node"
+    deref_cast_type: str = ""
     fields: Dict[str, str] = field(default_factory=dict)
     field_order: List[str] = field(default_factory=list)
     has_struct_links: Optional[bool] = None
 
 
 # ==============================================================================
-# Clean Pydantic Data Contract (With Unified 2D Matrix Support)
+# Clean Pydantic Data Contract (With Unified 2D Matrix & Heap Status Support)
 # ==============================================================================
 
 class ArraySnapshot(BaseModel):
@@ -154,6 +155,7 @@ class GraphNode(BaseModel):
     type: str
     c_type: str = ""
     label: str
+    status: str = "active"  # "active" | "freed"
     fields: Dict[str, Any]
     is_active: bool
     is_freed: bool = False
@@ -349,10 +351,21 @@ class GDBTracer:
                     self._user_source_identifiers.add(tok)
 
         self._type_cache: Dict[str, DwarfTypeEntry] = {}
+
+        # Authoritative, Monotonic Cumulative Heap Block Ledger:
+        # Maps canonical hex address -> {
+        #   "address": str,
+        #   "status": "active" | "freed",
+        #   "type": str,
+        #   "fields": Dict[str, Any],
+        #   "label": str,
+        #   "self_ref_order": List[str],
+        #   "edges": List[GraphEdge],
+        #   "freed_at_step": Optional[int],
+        # }
+        self.heap_blocks: Dict[str, Dict[str, Any]] = {}
+        # Tracks addresses freed on the non-struct buffer path (e.g. `free(s->data)`, `free(dist)`)
         self._freed_addresses: Set[str] = set()
-        self._freed_struct_types: Dict[str, str] = {}
-        self._live_heap_structs: Dict[str, str] = {}
-        self._last_valid_node_fields: Dict[str, Dict[str, Any]] = {}
 
         # Per-function variable snapshot cache for user caller frames
         self._frame_vars_by_func: Dict[str, List[Dict[str, str]]] = {}
@@ -370,6 +383,7 @@ class GDBTracer:
         self._current_line: int = 0
         self._current_file: str = ""
         self._current_func: str = "main"
+        self._last_executed_line: int = 0
         self._token_counter: int = 100
 
     @staticmethod
@@ -394,6 +408,35 @@ class GDBTracer:
         if self._user_source_identifiers and base_name not in self._user_source_identifiers:
             return False
         return True
+
+    def _mark_address_freed(self, addr: str) -> None:
+        """
+        Marks `addr` as permanently `"freed"` in `self.heap_blocks` and `self._freed_addresses`.
+        Once marked `"freed"`, a block cannot revert to `"active"` unless explicitly reallocated
+        by `malloc`/`calloc`/`realloc`.
+        """
+        self._freed_addresses.add(addr)
+        if addr in self.heap_blocks:
+            self.heap_blocks[addr]["status"] = "freed"
+            if self.heap_blocks[addr].get("freed_at_step") is None:
+                self.heap_blocks[addr]["freed_at_step"] = self.step_count
+        else:
+            self.heap_blocks[addr] = {
+                "address": addr,
+                "status": "freed",
+                "type": "struct",
+                "fields": {"status": "FREED"},
+                "label": "FREED",
+                "self_ref_order": [],
+                "edges": [],
+                "freed_at_step": self.step_count,
+            }
+
+    def _is_address_freed(self, addr: str) -> bool:
+        if addr in self._freed_addresses:
+            return True
+        blk = self.heap_blocks.get(addr)
+        return bool(blk and blk.get("status") == "freed")
 
     def start(self) -> bool:
         now = time.monotonic()
@@ -465,11 +508,6 @@ class GDBTracer:
     def _cmd_tokenized(
         self, mi_command: str, timeout: float = STEP_INACTIVITY_TIMEOUT_SEC
     ) -> List[Dict[str, Any]]:
-        """
-        Executes a single GDB-MI command prefixed with a unique numeric token and
-        drains the GDB output pipe until that exact token's `result` record arrives.
-        Guarantees zero leftover packets in the pipe.
-        """
         self._check_budget()
         if not self.gdb:
             raise RuntimeError("GDB controller is not initialized.")
@@ -516,12 +554,6 @@ class GDBTracer:
         return None
 
     def _eval_expr_batch(self, exprs: List[str]) -> Dict[str, Optional[str]]:
-        """
-        Pipelines multiple `-data-evaluate-expression` queries in a single write AND
-        loops on `get_gdb_response()` until 100% of sent token IDs have returned their
-        `result` record (`done` or `error`).
-        Fixes the multi-root drop bug where `new_head` was lost when batched with `head`.
-        """
         if not exprs:
             return {}
         if len(exprs) == 1:
@@ -578,7 +610,6 @@ class GDBTracer:
 
         process_responses(responses)
 
-        # Drain any remaining tokenized responses from the OS pipe
         while pending_tokens and time.monotonic() < deadline:
             more = self.gdb.get_gdb_response(
                 timeout_sec=0.015, raise_error_on_timeout=False
@@ -633,6 +664,11 @@ class GDBTracer:
         return False
 
     def _record_pending_free_on_current_line(self) -> None:
+        """
+        Intercepts `free(expr)` on `self._current_line` BEFORE GDB steps over it,
+        evaluates the target pointer address, and permanently marks the block as `"freed"`
+        in `self.heap_blocks`.
+        """
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line].split("//")[0]
             free_exprs = [
@@ -643,14 +679,11 @@ class GDBTracer:
                 for raw_addr in eval_map.values():
                     addr = extract_hex_address(raw_addr or "")
                     if addr and self._is_valid_heap_or_data_address(addr):
-                        self._freed_addresses.add(addr)
-                        if addr in self._live_heap_structs:
-                            self._freed_struct_types[addr] = self._live_heap_structs[addr]
+                        self._mark_address_freed(addr)
 
     def _get_function_line_span(
         self, func_name: str, anchor_line: int
     ) -> Tuple[int, int]:
-        """Returns `(start_line, end_line)` for `func_name` in `self._source_lines`."""
         if func_name in self._func_line_span_cache:
             return self._func_line_span_cache[func_name]
 
@@ -691,18 +724,12 @@ class GDBTracer:
     def _get_var_declaration_info(
         self, func_name: str, var_name: str, anchor_line: int
     ) -> Optional[Tuple[int, bool]]:
-        """
-        Finds the exact line number `(decl_line, has_initializer)` where local variable
-        `var_name` is declared inside `func_name`.
-        Returns `None` if `var_name` is a function parameter (declared in the signature).
-        """
         cache_key = (func_name, var_name)
         if cache_key in self._var_decl_line_cache:
             return self._var_decl_line_cache[cache_key]
 
         start_line, end_line = self._get_function_line_span(func_name, anchor_line)
 
-        # Check if `var_name` is a parameter in the function signature header
         sig_text = " ".join(
             self._source_lines[i].split("//")[0]
             for i in range(start_line, min(end_line + 1, start_line + 3))
@@ -745,12 +772,6 @@ class GDBTracer:
     def _is_uninitialized_at_line(
         self, func_name: str, var_name: str, current_line: int
     ) -> bool:
-        """
-        Returns True if `var_name` in `func_name` is declared on a future line
-        (`current_line < decl_line`) OR is being declared-with-initializer on `current_line`
-        (`current_line == decl_line and has_init`), preventing uninitialized stack garbage
-        from being crawled before the declaration statement executes.
-        """
         decl_info = self._get_var_declaration_info(func_name, var_name, current_line)
         if decl_info is None:
             return False
@@ -824,6 +845,7 @@ class GDBTracer:
 
     def step_next_user_line(self) -> bool:
         self._check_budget()
+        self._last_executed_line = self._current_line
         self._record_pending_free_on_current_line()
 
         mi_step_cmd = (
@@ -1124,10 +1146,6 @@ class GDBTracer:
     # ==========================================================================
 
     def _query_ptype_console(self, type_expr: str) -> str:
-        """
-        Executes a token-synchronized `ptype` query via GDB-MI so 100% of the
-        DWARF type definition is captured without pipe truncation.
-        """
         escaped = type_expr.replace('"', '\\"')
         responses = self._cmd_tokenized(f'-interpreter-exec console "ptype {escaped}"')
         return "".join(
@@ -1135,13 +1153,6 @@ class GDBTracer:
         ).strip()
 
     def _resolve_type_info(self, raw_type: str) -> Tuple[str, str]:
-        """
-        Iteratively unwraps C typedefs (`DW_TAG_typedef`) and pointers (`DW_TAG_pointer_type`)
-        down to their canonical DWARF category and underlying struct type:
-          - `typedef struct node_t *node;` -> `("struct_ptr", "struct node_t")`
-          - `typedef struct { ... } *anon_node;` -> `("struct_ptr", "anon_node")`
-          - `UFNode **` -> `("struct_ptr_array", "struct UFNode")`
-        """
         clean = raw_type.replace("const", "").replace("volatile", "").strip()
         if clean in self._type_cache:
             entry = self._type_cache[clean]
@@ -1223,7 +1234,6 @@ class GDBTracer:
             self._type_cache[clean] = entry
             return (entry.kind, entry.target_type)
 
-        # Query GDB `ptype` with full token synchronization to unwrap `DW_TAG_typedef`
         full_console = self._query_ptype_console(clean)
 
         if "type = struct" in full_console:
@@ -1237,7 +1247,6 @@ class GDBTracer:
                 canonical_struct = header_match.group(1).strip()
                 deref_cast = f"{canonical_struct} *"
             else:
-                # Anonymous struct typedef (`typedef struct { ... } *node;` or `typedef struct { ... } Node;`)
                 canonical_struct = clean
                 deref_cast = clean if "*" in tail else f"{clean} *"
 
@@ -1279,7 +1288,6 @@ class GDBTracer:
             self._type_cache[clean] = entry
             return (entry.kind, entry.target_type)
 
-        # Handle typedefs to primitives or primitive pointers (e.g. `typedef int *int_ptr;`)
         if full_console.startswith("type ="):
             unwrapped_type = full_console.replace("type =", "", 1).strip()
             if unwrapped_type and unwrapped_type != clean:
@@ -1293,11 +1301,6 @@ class GDBTracer:
         return (entry.kind, entry.target_type)
 
     def _get_deref_cast_expr(self, struct_type: str, addr: str) -> str:
-        """
-        Builds a valid GDB dereference expression for `struct_type` at `addr`,
-        supporting both named structs (`*((struct node_t *)0x...)`) and anonymous
-        pointer typedefs (`*((node)0x...)`).
-        """
         clean = struct_type.strip()
         if clean in self._type_cache and self._type_cache[clean].deref_cast_type:
             cast_t = self._type_cache[clean].deref_cast_type
@@ -1389,11 +1392,6 @@ class GDBTracer:
         return (False, "primitive", clean_type or "int")
 
     def _collect_fast_frame_variables(self) -> Tuple[List[str], List[Dict[str, Any]]]:
-        """
-        Harvests all initialized user-scope variables from the active frame (using token
-        synchronization) and merges non-shadowed variables from caller frames.
-        Excludes any local variable whose declaration line has not yet executed.
-        """
         var_res = self._cmd_tokenized("-stack-list-variables --simple-values")
         current_frame_vars: List[Dict[str, str]] = []
         for r in var_res:
@@ -1490,6 +1488,33 @@ class GDBTracer:
             record["address"] = addr
         return record
 
+    def _check_explicit_reallocation_on_last_line(
+        self, var_name: str, addr: str, resolved_type: str
+    ) -> None:
+        """
+        Allows a previously freed address `addr` to transition back to `"active"` ONLY
+        if `self._last_executed_line` explicitly executed `malloc`, `calloc`, or `realloc`
+        assigning into `var_name`. Dangling pointers NEVER resurrect a freed block.
+        """
+        if not self._is_address_freed(addr):
+            return
+        if not (1 <= self._last_executed_line < len(self._source_lines)):
+            return
+        prev_src = self._source_lines[self._last_executed_line].split("//")[0]
+        clean_var = var_name.split(":")[-1].strip()
+        if re.search(rf"\b{re.escape(clean_var)}\b\s*=", prev_src) and ALLOC_CALL_RE.search(prev_src):
+            self._freed_addresses.discard(addr)
+            self.heap_blocks[addr] = {
+                "address": addr,
+                "status": "active",
+                "type": resolved_type,
+                "fields": {},
+                "label": resolved_type.replace("struct ", ""),
+                "self_ref_order": [],
+                "edges": [],
+                "freed_at_step": None,
+            }
+
     def inspect_state(self) -> Optional[ExecutionSnapshot]:
         self._check_budget()
         if (
@@ -1512,7 +1537,7 @@ class GDBTracer:
         raw_struct_ptr_array_vars: List[Tuple[str, str, str, int]] = []
 
         # ----------------------------------------------------------------------
-        # Pass 1: Classify all user-scope variables (Including Typedef Pointers)
+        # Pass 1: Classify all user-scope variables
         # ----------------------------------------------------------------------
         for v in raw_vars:
             v_name = v.get("name", "")
@@ -1549,7 +1574,7 @@ class GDBTracer:
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
                     locals_out[v_name] = addr if addr else "0x0"
-                if addr and addr not in self._freed_addresses:
+                if addr and not self._is_address_freed(addr):
                     raw_struct_ptr_array_vars.append((v_name, resolved_target, addr, f_level))
                 continue
 
@@ -1558,11 +1583,11 @@ class GDBTracer:
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
                     locals_out[v_name] = addr if addr else "0x0"
-                if addr and addr not in self._freed_addresses:
+                if addr and not self._is_address_freed(addr):
                     raw_2d_ptr_vars.append((v_name, resolved_target, addr, f_level))
                 continue
 
-            # 1E: Single Struct Pointer or Typedef-Pointer (`node head`, `node new_head`, `BSTNode *root`)
+            # 1E: Single Struct Pointer or Typedef-Pointer (`TreeNode *root`, `node head`)
             if type_kind == "struct_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
@@ -1570,23 +1595,22 @@ class GDBTracer:
                 if not addr:
                     continue
 
-                if addr in self._freed_addresses and self._current_line > 0:
-                    line_txt = (
-                        self._source_lines[self._current_line - 1]
-                        if self._current_line - 1 < len(self._source_lines)
-                        else ""
-                    )
-                    if v_name.split(":")[-1] in line_txt and (
-                        "malloc" in line_txt
-                        or "calloc" in line_txt
-                        or "realloc" in line_txt
-                        or "=" in line_txt
-                    ):
-                        self._freed_addresses.discard(addr)
-                        self._freed_struct_types.pop(addr, None)
-
+                self._check_explicit_reallocation_on_last_line(
+                    v_name, addr, resolved_target
+                )
                 active_struct_ptrs[v_name] = (addr, resolved_target)
-                self._live_heap_structs[addr] = resolved_target
+
+                if addr not in self.heap_blocks:
+                    self.heap_blocks[addr] = {
+                        "address": addr,
+                        "status": "active",
+                        "type": resolved_target,
+                        "fields": {},
+                        "label": resolved_target.replace("struct ", ""),
+                        "self_ref_order": [],
+                        "edges": [],
+                        "freed_at_step": None,
+                    }
                 continue
 
             # 1F: 1D Primitive Pointer (`int *dist`, `int *arr`)
@@ -1641,16 +1665,22 @@ class GDBTracer:
                     elem_ptrs = parse_gdb_array(ptr_slice_raw, max_elems=tbl_len)
                     for idx, raw_ep in enumerate(elem_ptrs):
                         ep_addr = extract_hex_address(str(raw_ep))
-                        if (
-                            ep_addr
-                            and self._is_valid_heap_or_data_address(ep_addr)
-                            and ep_addr not in self._freed_addresses
-                        ):
+                        if ep_addr and self._is_valid_heap_or_data_address(ep_addr):
                             active_struct_ptrs[f"{clean_tbl_name}[{idx}]"] = (
                                 ep_addr,
                                 target_s_type,
                             )
-                            self._live_heap_structs[ep_addr] = target_s_type
+                            if ep_addr not in self.heap_blocks:
+                                self.heap_blocks[ep_addr] = {
+                                    "address": ep_addr,
+                                    "status": "active",
+                                    "type": target_s_type,
+                                    "fields": {},
+                                    "label": target_s_type.replace("struct ", ""),
+                                    "self_ref_order": [],
+                                    "edges": [],
+                                    "freed_at_step": None,
+                                }
             else:
                 comp_snap = self._extract_struct_array_field(
                     owner_name=clean_tbl_name,
@@ -1680,7 +1710,7 @@ class GDBTracer:
 
         for ptr_name, elem_type, addr, _ in raw_ptr_vars:
             if (
-                addr in self._freed_addresses
+                self._is_address_freed(addr)
                 or not self._is_valid_heap_or_data_address(addr)
             ):
                 continue
@@ -1812,7 +1842,7 @@ class GDBTracer:
                 if (
                     rp_addr
                     and self._is_valid_heap_or_data_address(rp_addr)
-                    and rp_addr not in self._freed_addresses
+                    and not self._is_address_freed(rp_addr)
                 ):
                     row_expr_map[r_idx] = f"*({elem_type}[{cols_len}]*)({rp_addr})"
 
@@ -1847,7 +1877,7 @@ class GDBTracer:
                     )
 
         # ----------------------------------------------------------------------
-        # Pass 3: Pipelined DWARF Pointer-Mesh Crawler & Embedded Struct Buffers
+        # Pass 3: Monotonic Heap Block Ledger & Pointer-Mesh Crawler
         # ----------------------------------------------------------------------
         graph_snapshot, embedded_arrays = self._crawl_pointer_graph(
             active_struct_ptrs, leaf_scalar_ints, scalar_ints
@@ -1930,6 +1960,7 @@ class GDBTracer:
                         type="IndexNode",
                         c_type=f"Index [{i}]",
                         label=f"[{i}] → {target_idx}",
+                        status="active",
                         fields={
                             "index": i,
                             leaf_field_name: target_idx,
@@ -1955,7 +1986,7 @@ class GDBTracer:
         return None
 
     # ==========================================================================
-    # Pipelined DWARF Pointer-Mesh & Struct Buffer Crawler
+    # Pipelined DWARF Pointer-Mesh & Cumulative Heap Ledger Crawler
     # ==========================================================================
 
     def _extract_struct_array_field(
@@ -1992,7 +2023,7 @@ class GDBTracer:
                 if (
                     elem_addr
                     and self._is_valid_heap_or_data_address(elem_addr)
-                    and elem_addr not in self._freed_addresses
+                    and not self._is_address_freed(elem_addr)
                 ):
                     valid_elem_addrs.append(elem_addr)
 
@@ -2054,8 +2085,13 @@ class GDBTracer:
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
         """
-        Crawls all active local struct pointer roots (`head`, `new_head`, etc.) and
-        reachable heap nodes using token-synchronized batch dereferencing.
+        Crawls all active heap blocks AND emits all previously freed blocks stored
+        in the cumulative `self.heap_blocks` ledger.
+        - Once `self.heap_blocks[addr]["status"] == "freed"`, the block is NEVER
+          re-evaluated as `"active"` even if dangling stack or struct pointers still
+          reference `addr`.
+        - Preserves last known `fields`, `self_ref_order`, and `edges` on freed blocks
+          so freed tree/list structures retain their exact layout and tombstoned values.
         """
         emitted_node_ids: Set[str] = set()
         queued_addresses: Set[str] = set()
@@ -2067,7 +2103,7 @@ class GDBTracer:
         addr_to_ptr_names: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, str, str]] = []
 
-        # 1. Seed every active local struct pointer (`head`, `new_head`, etc.) as an independent root
+        # 1. Seed from active stack pointers across frames
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
@@ -2077,35 +2113,67 @@ class GDBTracer:
                     queued_addresses.add(addr)
                     frontier.append((addr, s_type, ptr_name.split(":")[-1]))
 
-        # 2. Seed known live heap structs so recursion base cases never wipe the canvas
-        for live_addr, live_type in list(self._live_heap_structs.items()):
+        # 2. Seed all known blocks from `self.heap_blocks` so recursion base cases (`root == NULL`)
+        #    and freed blocks are always included in the snapshot
+        for blk_addr, blk_info in list(self.heap_blocks.items()):
             if (
-                live_addr not in queued_addresses
-                and live_addr not in self._freed_addresses
-                and self._is_valid_heap_or_data_address(live_addr)
+                blk_addr not in queued_addresses
+                and self._is_valid_heap_or_data_address(blk_addr)
             ):
-                queued_addresses.add(live_addr)
-                frontier.append((live_addr, live_type, "heap"))
+                queued_addresses.add(blk_addr)
+                frontier.append((blk_addr, blk_info.get("type", "struct"), "heap"))
 
         while frontier and len(nodes) < MAX_GRAPH_NODES:
             current_batch = frontier[: MAX_GRAPH_NODES - len(nodes)]
             frontier = frontier[MAX_GRAPH_NODES - len(nodes) :]
 
+            # Separate already-freed blocks from potentially active blocks:
+            # Freed blocks in `self.heap_blocks` are IMMUTABLE and do not need GDB dereferencing!
+            active_candidates: List[Tuple[str, str, str]] = []
+            for addr, struct_type, owner_name in current_batch:
+                if addr in emitted_node_ids:
+                    continue
+                if self._is_address_freed(addr):
+                    emitted_node_ids.add(addr)
+                    blk = self.heap_blocks.get(addr, {})
+                    saved_type = blk.get("type") or struct_type
+                    saved_fields = blk.get("fields") or {"status": "FREED"}
+                    saved_order = blk.get("self_ref_order") or []
+                    pointing_vars = addr_to_ptr_names.get(addr, [])
+                    nodes.append(
+                        GraphNode(
+                            id=addr,
+                            type=saved_type,
+                            c_type=saved_type,
+                            label="FREED",
+                            status="freed",
+                            fields=dict(saved_fields),
+                            is_active=bool(pointing_vars),
+                            is_freed=True,
+                            pointers=pointing_vars,
+                            self_ref_order=list(saved_order),
+                        )
+                    )
+                else:
+                    active_candidates.append((addr, struct_type, owner_name))
+
+            if not active_candidates:
+                continue
+
             batch_expr_map: Dict[str, str] = {
                 addr: self._get_deref_cast_expr(struct_type, addr)
-                for addr, struct_type, _ in current_batch
+                for addr, struct_type, _ in active_candidates
             }
             batch_deref_results = self._eval_expr_batch(list(batch_expr_map.values()))
 
             next_frontier: List[Tuple[str, str, str]] = []
 
-            for addr, struct_type, owner_name in current_batch:
+            for addr, struct_type, owner_name in active_candidates:
                 if addr in emitted_node_ids:
                     continue
 
                 deref_str = batch_deref_results.get(batch_expr_map[addr])
                 if not deref_str:
-                    # Fallback single evaluation if batch expression needed direct retry
                     deref_str = self._eval_expr(batch_expr_map[addr])
                 if not deref_str:
                     continue
@@ -2117,30 +2185,29 @@ class GDBTracer:
                 emitted_node_ids.add(addr)
                 field_types = self._ensure_struct_field_types(struct_type)
                 field_order_list = list(field_types.keys())
-                is_freed = self._is_tcache_poisoned(addr, raw_fields)
                 pointing_vars = addr_to_ptr_names.get(addr, [])
 
-                if is_freed:
-                    self._freed_struct_types[addr] = struct_type
-                    last_known = self._last_valid_node_fields.get(addr, {})
-                    freed_fields: Dict[str, Any] = (
-                        dict(last_known) if last_known else {"status": "FREED"}
-                    )
+                # Check if glibc tcache poisoned this block since the last step
+                if self._is_tcache_poisoned(addr, raw_fields):
+                    self._mark_address_freed(addr)
+                    blk = self.heap_blocks.get(addr, {})
+                    saved_fields = blk.get("fields") or {"status": "FREED"}
+                    saved_order = blk.get("self_ref_order") or []
                     nodes.append(
                         GraphNode(
                             id=addr,
                             type=struct_type,
                             c_type=struct_type,
                             label="FREED",
-                            fields=freed_fields,
+                            status="freed",
+                            fields=dict(saved_fields),
                             is_active=bool(pointing_vars),
                             is_freed=True,
                             pointers=pointing_vars,
+                            self_ref_order=list(saved_order),
                         )
                     )
                     continue
-
-                self._live_heap_structs[addr] = struct_type
 
                 sister_scalars: Dict[str, int] = {}
                 for f_name, f_val in raw_fields.items():
@@ -2156,6 +2223,7 @@ class GDBTracer:
                 node_fields: Dict[str, Any] = {}
                 scalar_summary_parts: List[str] = []
                 self_ref_fields_ordered: List[str] = []
+                node_outgoing_edges: List[GraphEdge] = []
 
                 for f_name, f_val in raw_fields.items():
                     declared_f_type = field_types.get(f_name, "").strip()
@@ -2192,17 +2260,17 @@ class GDBTracer:
                                 ):
                                     non_null_count += 1
                                     edge_label = f"{f_name}[{idx}]"
+                                    edge_obj = GraphEdge(
+                                        source=addr,
+                                        target=sub_addr,
+                                        label=edge_label,
+                                        field_order_idx=idx,
+                                    )
+                                    node_outgoing_edges.append(edge_obj)
                                     edge_key = (addr, sub_addr, edge_label)
                                     if edge_key not in seen_edges:
                                         seen_edges.add(edge_key)
-                                        edges.append(
-                                            GraphEdge(
-                                                source=addr,
-                                                target=sub_addr,
-                                                label=edge_label,
-                                                field_order_idx=idx,
-                                            )
-                                        )
+                                        edges.append(edge_obj)
                                     if sub_addr not in queued_addresses:
                                         queued_addresses.add(sub_addr)
                                         next_frontier.append(
@@ -2258,7 +2326,7 @@ class GDBTracer:
                         # Subcase 2A: Dynamic Pointer-to-Pointer Array (`Type **adj` or `Type **array`)
                         if (
                             (f_kind == "struct_ptr_array" or "**" in declared_f_type)
-                            and target_addr not in self._freed_addresses
+                            and not self._is_address_freed(target_addr)
                         ):
                             elem_struct = (
                                 f_target_type
@@ -2285,23 +2353,19 @@ class GDBTracer:
                                         )
                                         for idx, raw_hp in enumerate(head_ptrs):
                                             hp_addr = extract_hex_address(str(raw_hp))
-                                            if (
-                                                hp_addr
-                                                and self._is_valid_heap_or_data_address(hp_addr)
-                                                and hp_addr not in self._freed_addresses
-                                            ):
+                                            if hp_addr and self._is_valid_heap_or_data_address(hp_addr):
                                                 edge_label = f"{f_name}[{idx}]"
+                                                edge_obj = GraphEdge(
+                                                    source=addr,
+                                                    target=hp_addr,
+                                                    label=edge_label,
+                                                    field_order_idx=idx,
+                                                )
+                                                node_outgoing_edges.append(edge_obj)
                                                 edge_key = (addr, hp_addr, edge_label)
                                                 if edge_key not in seen_edges:
                                                     seen_edges.add(edge_key)
-                                                    edges.append(
-                                                        GraphEdge(
-                                                            source=addr,
-                                                            target=hp_addr,
-                                                            label=edge_label,
-                                                            field_order_idx=idx,
-                                                        )
-                                                    )
+                                                    edges.append(edge_obj)
                                                 if hp_addr not in queued_addresses:
                                                     queued_addresses.add(hp_addr)
                                                     next_frontier.append(
@@ -2330,7 +2394,7 @@ class GDBTracer:
                         if (
                             f_kind == "primitive_ptr"
                             and "**" not in declared_f_type
-                            and target_addr not in self._freed_addresses
+                            and not self._is_address_freed(target_addr)
                         ):
                             elem_c_type = f_target_type
                             buf_len = self._infer_pointer_buffer_length(
@@ -2373,7 +2437,7 @@ class GDBTracer:
                                         )
                             continue
 
-                        # Subcase 2C: Single Struct Pointer (`struct node_t *next`, `left`, `right`, `parent`)
+                        # Subcase 2C: Single Struct Pointer (`struct TreeNode *left`, `right`, `next`)
                         target_s_type = (
                             f_target_type
                             if f_kind == "struct_ptr"
@@ -2403,17 +2467,30 @@ class GDBTracer:
                                 continue
 
                         if target_addr != addr:
+                            edge_obj = GraphEdge(
+                                source=addr,
+                                target=target_addr,
+                                label=f_name,
+                                field_order_idx=f_order_idx,
+                            )
+                            node_outgoing_edges.append(edge_obj)
                             edge_key = (addr, target_addr, f_name)
                             if edge_key not in seen_edges:
                                 seen_edges.add(edge_key)
-                                edges.append(
-                                    GraphEdge(
-                                        source=addr,
-                                        target=target_addr,
-                                        label=f_name,
-                                        field_order_idx=f_order_idx,
-                                    )
-                                )
+                                edges.append(edge_obj)
+
+                        if target_addr not in self.heap_blocks:
+                            self.heap_blocks[target_addr] = {
+                                "address": target_addr,
+                                "status": "active",
+                                "type": target_s_type,
+                                "fields": {},
+                                "label": target_s_type.replace("struct ", ""),
+                                "self_ref_order": [],
+                                "edges": [],
+                                "freed_at_step": None,
+                            }
+
                         if target_addr not in queued_addresses and target_addr not in emitted_node_ids:
                             queued_addresses.add(target_addr)
                             next_frontier.append(
@@ -2432,7 +2509,17 @@ class GDBTracer:
                     else struct_type.replace("struct ", "")
                 )
 
-                self._last_valid_node_fields[addr] = dict(node_fields)
+                # Update authoritative cumulative heap block entry while active
+                self.heap_blocks[addr] = {
+                    "address": addr,
+                    "status": "active",
+                    "type": struct_type,
+                    "fields": dict(node_fields),
+                    "label": node_label,
+                    "self_ref_order": list(self_ref_fields_ordered),
+                    "edges": list(node_outgoing_edges),
+                    "freed_at_step": None,
+                }
 
                 nodes.append(
                     GraphNode(
@@ -2440,6 +2527,7 @@ class GDBTracer:
                         type=struct_type,
                         c_type=struct_type,
                         label=node_label,
+                        status="active",
                         fields=node_fields,
                         is_active=bool(pointing_vars),
                         is_freed=False,
@@ -2450,25 +2538,16 @@ class GDBTracer:
 
             frontier.extend(next_frontier)
 
-        # 3. Also append any freed struct nodes that were orphaned when their pointer moved/freed
-        for f_addr in self._freed_addresses:
-            if f_addr not in emitted_node_ids and f_addr in self._last_valid_node_fields:
-                if len(nodes) >= MAX_GRAPH_NODES:
-                    break
-                f_type = self._freed_struct_types.get(f_addr, "struct")
-                pointing_vars = addr_to_ptr_names.get(f_addr, [])
-                nodes.append(
-                    GraphNode(
-                        id=f_addr,
-                        type=f_type,
-                        c_type=f_type,
-                        label="FREED",
-                        fields=dict(self._last_valid_node_fields[f_addr]),
-                        is_active=bool(pointing_vars),
-                        is_freed=True,
-                        pointers=pointing_vars,
-                    )
-                )
+        # 3. Restore preserved structural edges for freed blocks so freed trees/lists
+        #    maintain their visual hierarchy instead of collapsing into isolated cards
+        for blk_addr, blk_info in self.heap_blocks.items():
+            if blk_info.get("status") == "freed" and blk_addr in emitted_node_ids:
+                for saved_edge in blk_info.get("edges", []):
+                    if saved_edge.target in emitted_node_ids:
+                        edge_key = (saved_edge.source, saved_edge.target, saved_edge.label)
+                        if edge_key not in seen_edges:
+                            seen_edges.add(edge_key)
+                            edges.append(saved_edge)
 
         return (
             GraphSnapshot(
@@ -2491,7 +2570,7 @@ class GDBTracer:
         return True
 
     def _is_tcache_poisoned(self, addr: str, raw_fields: Dict[str, str]) -> bool:
-        if addr in self._freed_addresses:
+        if self._is_address_freed(addr):
             return True
         try:
             addr_int = int(addr, 16)
@@ -2499,7 +2578,7 @@ class GDBTracer:
             first_val_str = next(iter(raw_fields.values()), "")
             first_val = parse_scalar(first_val_str)
             if isinstance(first_val, int) and first_val == expected_safe_link_base:
-                self._freed_addresses.add(addr)
+                self._mark_address_freed(addr)
                 return True
         except Exception:
             pass

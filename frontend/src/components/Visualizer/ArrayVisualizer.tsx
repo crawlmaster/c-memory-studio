@@ -1,25 +1,28 @@
 /**
  * frontend/src/components/Visualizer/ArrayVisualizer.tsx
- * Generic DWARF Array & Compound Struct-Array Visualizer.
+ * Dual-Mode 1D Array / Compound Tuple / 2D Matrix Grid Visualizer.
+ *
  * Features:
- * - Supports both primitive arrays (`[2, 5, 8, "∞"]`) and compound struct arrays
- *   (`[{ fields: { v: 0, dist: 9 } }, ...]`).
- * - For compound struct elements: renders all DWARF scalar fields as clean key-value tags
- *   inside each cell card and dynamically scales bar height using the first non-ID numeric field.
- * - Renders all syntactically proven `active_indices` (`i ↓`, `j ↓`, `low ↓`, `middle ↓`, `top ↓`)
- *   above their target cells with deterministic color badges (zero hardcoded name filtering).
- * - Displays all in-scope scalar variables (`target`, `swapped`, `sum`, etc.) in the
- *   "Stack Frame Locals" footer panel.
+ * 1. Strict 1D vs 2D Matrix Discrimination:
+ *    - Whenever `arr.kind === "matrix"` or `arr.dimensions?.length === 2` (or 2D nested rows),
+ *      bypasses the 1D bar-chart renderer and renders `<MatrixGrid />`.
+ * 2. Dedicated `<MatrixGrid />` Component:
+ *    - Header bar with matrix C declaration (`int mat[10][10]`), dimension badge (`10 × 10`),
+ *      and active loop index pills (`i = 3`, `j = 1`).
+ *    - Dark-themed HTML table grid with sticky `[0]..[C-1]` column headers and `[0]..[R-1]` row headers.
+ *    - Crosshair row/column shading + glowing target cell highlight when active indices match `[r][c]`.
+ *    - Step-delta mutation tracking: flashes cells that were just written/updated on the current step.
+ *    - Muted styling (`text-slate-600`) for `0` or uninitialized stack garbage values.
  */
 
-import React from "react";
+import React, { useRef, useEffect } from "react";
 import {
   type ArraySnapshot,
   type ArrayElement,
   type CompoundArrayElement,
   type GraphNode,
 } from "../../types/debugger";
-import { BarChart3, Database, Layers } from "lucide-react";
+import { BarChart3, Database, Grid3X3, Layers } from "lucide-react";
 
 export interface ArrayVisualizerProps {
   arrays: ArraySnapshot[];
@@ -50,11 +53,344 @@ function isCompoundElement(el: ArrayElement): el is CompoundArrayElement {
   return (
     el !== null &&
     typeof el === "object" &&
+    !Array.isArray(el) &&
     "fields" in el &&
     el.fields !== null &&
     typeof el.fields === "object"
   );
 }
+
+/**
+ * Strictly discriminates whether an ArraySnapshot represents a 2D Matrix
+ * rather than a 1D Array.
+ */
+function isMatrixSnapshot(arr: ArraySnapshot): boolean {
+  if (arr.kind === "matrix") return true;
+  if (Array.isArray(arr.dimensions) && arr.dimensions.length === 2) return true;
+  if (Array.isArray(arr.rows) && arr.rows.length > 0) return true;
+  if (
+    Array.isArray(arr.elements) &&
+    arr.elements.length > 0 &&
+    Array.isArray(arr.elements[0])
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Extracts normalized 2D rows `Array<Array<number | string>>` and `[numRows, numCols]`
+ * from a matrix snapshot.
+ */
+function extractMatrixGridData(arr: ArraySnapshot): {
+  gridRows: Array<Array<number | string>>;
+  numRows: number;
+  numCols: number;
+} {
+  const rawRows: Array<Array<number | string>> = Array.isArray(arr.rows)
+    ? arr.rows
+    : Array.isArray(arr.elements) && Array.isArray(arr.elements[0])
+    ? (arr.elements as unknown as Array<Array<number | string>>)
+    : [];
+
+  const numRows =
+    arr.dimensions && arr.dimensions.length >= 1
+      ? arr.dimensions[0]
+      : rawRows.length;
+  const numCols =
+    arr.dimensions && arr.dimensions.length >= 2
+      ? arr.dimensions[1]
+      : rawRows[0]?.length || 0;
+
+  return {
+    gridRows: rawRows,
+    numRows,
+    numCols,
+  };
+}
+
+/**
+ * Heuristic-free check for uninitialized stack garbage values (e.g. -135296, 32767, 0x7fff...)
+ * vs meaningful matrix numbers so uninitialized cells in stack matrices (`int mat[10][10]`)
+ * render with subtle muted text until written.
+ */
+function isLikelyGarbageOrZero(val: number | string): {
+  isZero: boolean;
+  isGarbage: boolean;
+  displayVal: string;
+} {
+  if (typeof val === "number") {
+    if (val === 0) {
+      return { isZero: true, isGarbage: false, displayVal: "0" };
+    }
+    if (Math.abs(val) >= 32760) {
+      return { isZero: false, isGarbage: true, displayVal: String(val) };
+    }
+    return { isZero: false, isGarbage: false, displayVal: String(val) };
+  }
+
+  const str = String(val).trim();
+  if (str === "0") {
+    return { isZero: true, isGarbage: false, displayVal: "0" };
+  }
+  if (str === "∞") {
+    return { isZero: false, isGarbage: false, displayVal: "∞" };
+  }
+  const num = Number(str);
+  if (Number.isFinite(num) && Math.abs(num) >= 32760) {
+    return { isZero: false, isGarbage: true, displayVal: str };
+  }
+  return { isZero: false, isGarbage: false, displayVal: str };
+}
+
+interface MatrixGridProps {
+  matrix: ArraySnapshot;
+}
+
+/**
+ * Dedicated 2D Matrix Table / Grid Component.
+ */
+const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
+  const { gridRows, numRows, numCols } = extractMatrixGridData(matrix);
+  const prevGridRef = useRef<Record<string, string>>({});
+
+  const activeEntries = Object.entries(matrix.active_indices || {});
+
+  // Identify active row and column indices from syntactically proven active_indices:
+  // If 2+ active indices exist (e.g. outer loop `i` and inner loop `j`), the 1st maps to row and 2nd to col.
+  // If 1 active index exists, highlight that row index.
+  const rowCursor = activeEntries.length >= 1 ? activeEntries[0] : null;
+  const colCursor = activeEntries.length >= 2 ? activeEntries[1] : null;
+
+  const activeRowIdx =
+    rowCursor && rowCursor[1] >= 0 && rowCursor[1] < numRows
+      ? rowCursor[1]
+      : null;
+  const activeColIdx =
+    colCursor && colCursor[1] >= 0 && colCursor[1] < numCols
+      ? colCursor[1]
+      : null;
+
+  // Detect cells modified on the current step compared to the previous render
+  const modifiedCells = new Set<string>();
+  const currentSnapshotMap: Record<string, string> = {};
+
+  gridRows.forEach((rList, rIdx) => {
+    rList.forEach((cellVal, cIdx) => {
+      const key = `${rIdx}:${cIdx}`;
+      const strVal = String(cellVal);
+      currentSnapshotMap[key] = strVal;
+      if (
+        prevGridRef.current[key] !== undefined &&
+        prevGridRef.current[key] !== strVal
+      ) {
+        modifiedCells.add(key);
+      }
+    });
+  });
+
+  useEffect(() => {
+    prevGridRef.current = currentSnapshotMap;
+  });
+
+  const baseType = (matrix.element_type || matrix.type || "int")
+    .replace(/\[.*$/, "")
+    .trim();
+
+  return (
+    <div className="rounded-xl bg-slate-900/95 border border-slate-800 p-5 shadow-lg">
+      {/* 1. Matrix Header Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3.5 mb-4">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-indigo-500/15 border border-indigo-500/40 text-indigo-300 font-mono text-xs font-semibold">
+            <Grid3X3 className="w-3.5 h-3.5 text-indigo-400" />
+            <span>
+              {baseType} {matrix.name}[{numRows}][{numCols}]
+            </span>
+          </span>
+
+          <span className="px-2.5 py-0.5 rounded-full bg-slate-950 border border-slate-800 text-xs font-mono font-bold text-sky-400">
+            {numRows} &times; {numCols}
+          </span>
+        </div>
+
+        {/* Active Loop Index Badges */}
+        <div className="flex flex-wrap items-center gap-2">
+          {activeRowIdx !== null && activeColIdx !== null && (
+            <span className="px-2.5 py-0.5 rounded-md bg-amber-500/20 border border-amber-400/70 text-amber-300 text-xs font-mono font-bold shadow-sm">
+              Target: {matrix.name}[{activeRowIdx}][{activeColIdx}]
+            </span>
+          )}
+
+          {activeEntries.map(([ptrName, idxVal], idxPos) => {
+            const boundLimit = idxPos === 0 ? numRows : numCols;
+            const isOob = idxVal < 0 || idxVal >= boundLimit;
+            const axisRole =
+              activeEntries.length >= 2
+                ? idxPos === 0
+                  ? "row"
+                  : idxPos === 1
+                  ? "col"
+                  : ""
+                : "row";
+
+            return (
+              <span
+                key={ptrName}
+                className={`px-2.5 py-0.5 rounded text-[11px] font-mono font-bold border ${getIndexBadgeStyle(
+                  ptrName
+                )} ${isOob ? "opacity-65" : ""}`}
+              >
+                {ptrName} = {idxVal}
+                {axisRole ? ` (${axisRole})` : ""}
+              </span>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 2. Scrollable 2D Matrix Table Container */}
+      <div className="max-h-[500px] overflow-auto border border-slate-800 rounded-lg p-4 bg-slate-950/60">
+        <table className="border-separate border-spacing-1.5 font-mono text-xs mx-auto">
+          <thead>
+            <tr>
+              {/* Top-Left Corner Axis Key */}
+              <th className="sticky top-0 left-0 z-20 bg-slate-900/95 border border-slate-800 rounded-md px-2.5 py-1.5 text-[10px] text-slate-400 font-semibold">
+                [r \ c]
+              </th>
+
+              {/* Column Headers [0], [1], ... */}
+              {Array.from({ length: numCols }).map((_, cIdx) => {
+                const isColActive = activeColIdx === cIdx;
+                return (
+                  <th
+                    key={`col-hdr-${cIdx}`}
+                    className={`sticky top-0 z-10 min-w-[48px] px-2 py-1.5 rounded-md border text-center transition-colors ${
+                      isColActive
+                        ? "bg-amber-950/90 border-amber-400 text-amber-300 font-extrabold shadow-[0_0_10px_rgba(251,191,36,0.3)]"
+                        : "bg-slate-900/90 border-slate-800/90 text-slate-400 font-medium"
+                    }`}
+                  >
+                    <div className="flex flex-col items-center leading-tight">
+                      {isColActive && colCursor && (
+                        <span className="text-[9px] text-amber-400 font-extrabold mb-0.5">
+                          {colCursor[0]} ↓
+                        </span>
+                      )}
+                      <span>[{cIdx}]</span>
+                    </div>
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+
+          <tbody>
+            {gridRows.map((rowValues, rIdx) => {
+              const isRowActive = activeRowIdx === rIdx;
+
+              return (
+                <tr key={`row-${rIdx}`}>
+                  {/* Sticky Row Header [0], [1], ... */}
+                  <th
+                    className={`sticky left-0 z-10 min-w-[48px] px-2.5 py-1.5 rounded-md border text-center transition-colors ${
+                      isRowActive
+                        ? "bg-sky-950/90 border-sky-400 text-sky-300 font-extrabold shadow-[0_0_10px_rgba(56,189,248,0.3)]"
+                        : "bg-slate-900/90 border-slate-800/90 text-slate-400 font-medium"
+                    }`}
+                  >
+                    <div className="flex items-center justify-center gap-1">
+                      {isRowActive && rowCursor && (
+                        <span className="text-[9px] text-sky-400 font-extrabold">
+                          {rowCursor[0]} →
+                        </span>
+                      )}
+                      <span>[{rIdx}]</span>
+                    </div>
+                  </th>
+
+                  {/* Matrix Cells */}
+                  {Array.from({ length: numCols }).map((_, cIdx) => {
+                    const rawCellVal =
+                      cIdx < rowValues.length ? rowValues[cIdx] : 0;
+                    const { isZero, isGarbage, displayVal } =
+                      isLikelyGarbageOrZero(rawCellVal);
+
+                    const isTargetCell =
+                      activeRowIdx === rIdx && activeColIdx === cIdx;
+                    const isJustModified = modifiedCells.has(
+                      `${rIdx}:${cIdx}`
+                    );
+                    const isCrosshair =
+                      !isTargetCell &&
+                      (activeRowIdx === rIdx || activeColIdx === cIdx);
+
+                    let cellClasses =
+                      "bg-slate-900/90 border-slate-800 text-slate-100";
+                    if (isTargetCell) {
+                      cellClasses =
+                        "bg-amber-950/90 border-2 border-amber-400 text-amber-100 font-extrabold scale-105 z-10 shadow-[0_0_14px_rgba(251,191,36,0.5)]";
+                    } else if (isJustModified) {
+                      cellClasses =
+                        "bg-emerald-950/85 border-2 border-emerald-400 text-emerald-200 font-extrabold shadow-[0_0_12px_rgba(52,211,153,0.4)]";
+                    } else if (isCrosshair) {
+                      cellClasses = isGarbage || isZero
+                        ? "bg-slate-900/95 border-sky-500/40 text-slate-500"
+                        : "bg-sky-950/40 border-sky-500/50 text-sky-100 font-semibold";
+                    } else if (isGarbage || isZero) {
+                      cellClasses =
+                        "bg-slate-950/80 border-slate-800/70 text-slate-600";
+                    } else {
+                      cellClasses =
+                        "bg-slate-900 border-slate-700/80 text-emerald-300 font-bold";
+                    }
+
+                    return (
+                      <td
+                        key={`cell-${rIdx}-${cIdx}`}
+                        title={
+                          isGarbage
+                            ? `${matrix.name}[${rIdx}][${cIdx}] = ${displayVal} (uninitialized stack memory)`
+                            : `${matrix.name}[${rIdx}][${cIdx}] = ${displayVal}`
+                        }
+                        className={`w-12 h-10 px-2 py-1.5 rounded-md border text-center align-middle transition-all duration-200 select-all ${cellClasses}`}
+                      >
+                        <div className="truncate max-w-[54px] mx-auto">
+                          {isGarbage ? "·" : displayVal}
+                        </div>
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Matrix Legend Footer */}
+      <div className="flex flex-wrap items-center justify-between gap-3 mt-3 pt-2.5 border-t border-slate-800/70 text-[11px] font-mono text-slate-400">
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-1.5">
+            <span className="w-3 h-3 rounded-sm bg-amber-950 border-2 border-amber-400 inline-block" />
+            <span>Active Target [i][j]</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-3 h-3 rounded-sm bg-emerald-950 border-2 border-emerald-400 inline-block" />
+            <span>Updated This Step</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="w-3 h-3 rounded-sm bg-slate-950 border border-slate-800 inline-block" />
+            <span className="text-slate-500">0 / Unwritten (·)</span>
+          </div>
+        </div>
+        <span className="text-slate-500">
+          Hover any cell to inspect exact value &amp; coordinates
+        </span>
+      </div>
+    </div>
+  );
+};
 
 interface NormalizedCell {
   isCompound: boolean;
@@ -64,13 +400,6 @@ interface NormalizedCell {
   isInfinity: boolean;
 }
 
-/**
- * Normalizes any ArrayElement (primitive or compound DWARF struct record)
- * into a uniform cell representation.
- * For compound structs with multiple numeric fields (e.g. `{ v: 2, dist: 6 }`),
- * picks the first non-ID numeric field (index 1 if >=2 numeric fields, else index 0)
- * to scale the vertical comparison bar.
- */
 function normalizeArrayElement(el: ArrayElement): NormalizedCell {
   if (isCompoundElement(el)) {
     const entries = Object.entries(el.fields);
@@ -101,8 +430,12 @@ function normalizeArrayElement(el: ArrayElement): NormalizedCell {
     };
   }
 
-  // Fallback for legacy object with `{ label, value }` if present
-  if (el !== null && typeof el === "object" && "value" in (el as Record<string, unknown>)) {
+  if (
+    el !== null &&
+    typeof el === "object" &&
+    !Array.isArray(el) &&
+    "value" in (el as Record<string, unknown>)
+  ) {
     const rawObj = el as Record<string, unknown>;
     const rawVal = rawObj.value;
     const isInf = rawVal === "∞";
@@ -145,12 +478,12 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
       <div className="flex flex-col items-center justify-center h-full text-slate-400 p-8 text-center">
         <BarChart3 className="w-12 h-12 text-slate-600 mb-3 stroke-[1.5]" />
         <p className="text-sm font-medium text-slate-300">
-          No Contiguous Arrays or Struct Buffers in Current Scope
+          No Contiguous Arrays or 2D Matrices in Current Scope
         </p>
         <p className="text-xs text-slate-500 max-w-md mt-1">
-          Start a GDB trace or step into a function containing stack arrays,
-          heap buffers, or struct-embedded dynamic arrays to inspect elements
-          and active index cursors.
+          Start a GDB trace or step into a function containing 1D arrays, 2D
+          matrices (<code className="text-indigo-400">int mat[R][C]</code>), or
+          struct-embedded buffers to inspect live elements.
         </p>
       </div>
     );
@@ -159,6 +492,11 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
   return (
     <div className="flex flex-col gap-6 p-5 overflow-y-auto h-full bg-slate-950">
       {arrays.map((arr) => {
+        // Strict discrimination: 2D matrices bypass the 1D bar-chart view completely
+        if (isMatrixSnapshot(arr)) {
+          return <MatrixGrid key={arr.name} matrix={arr} />;
+        }
+
         const isStructOwned =
           arr.name.includes("->") || arr.name.includes(".");
         const ownerVar = isStructOwned ? arr.name.split(/->|\./)[0] : null;
@@ -175,7 +513,6 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
           1
         );
 
-        // Map in-bounds index -> list of active index variable names
         const indexToPointers: Record<number, string[]> = {};
         Object.entries(arr.active_indices || {}).forEach(([ptrName, idxVal]) => {
           if (
@@ -195,7 +532,7 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
             key={arr.name}
             className="rounded-xl bg-slate-900/95 border border-slate-800 p-5 shadow-lg"
           >
-            {/* Array Header */}
+            {/* 1D Array Header */}
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3 mb-5">
               <div className="flex flex-wrap items-center gap-2.5">
                 <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-sky-500/10 border border-sky-500/30 text-sky-400 font-mono text-xs font-semibold">
@@ -259,7 +596,7 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
               </div>
             </div>
 
-            {/* Bars + Element Cards Strip */}
+            {/* 1D Bars + Element Cards Strip */}
             <div className="overflow-x-auto pb-2">
               <div className="inline-flex items-end gap-3.5 min-w-full pt-12 pb-2 px-2">
                 {cells.map((cell, idx) => {
@@ -309,7 +646,7 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                         />
                       </div>
 
-                      {/* Element Card (Primitive Scalar OR Generic DWARF Struct Fields Card) */}
+                      {/* Element Card */}
                       <div
                         className={`w-full py-2 px-2.5 text-center font-mono border rounded-b-md transition-all duration-300 ${
                           isHighlighted
