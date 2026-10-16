@@ -1,18 +1,21 @@
 /**
  * frontend/src/components/Visualizer/GraphVisualizer.tsx
- * Purely Structural DWARF Graph, Tree, Forest & Pointer Mesh Visualizer.
+ * Topology-Aware DWARF Graph, Tree, Linear-List & Pointer Mesh Visualizer.
  *
- * Key Guarantees:
- * 1. Incremental In-Place Cytoscape Diffing (Zero State Wipe during Recursion):
- *    - Never destroys or wipes the canvas between steps; updates existing nodes via `ele.data(...)`.
- * 2. Strict Hierarchical Tree & Forest Layout (Reingold-Tilford / Network-Simplex Geometry):
- *    - Detects top-down trees (`inDegree <= 1`, acyclic, e.g. 20-node BST) and bottom-up parent
- *      forests (`outDegree <= 1`, acyclic, e.g. Union-Find / DSU).
- *    - Enforces strict DWARF declaration-order child placement: the 1st self-referential pointer
- *      field is always positioned strictly to the LEFT of its parent, and the 2nd self-referential
- *      pointer field is always positioned strictly to the RIGHT of its parent (`nodeSep: 60`, `rankSep: 95`).
- * 3. Content-Aware Card Dimensions:
- *    - `const calculatedHeight = Math.max(52, 38 + fieldCount * 18);`
+ * Key Guarantees (Prompt 2/4):
+ * 1. Automatic Topology Classifier (`detectTopology(nodes, edges)`):
+ *    - Collapses symmetric pointer pairs (`u -> v` and `v -> u`, e.g. doubly-linked lists)
+ *      into a single bidirectional link for degree and cycle analysis.
+ *    - Classifies active structures without any hardcoded struct or field names into:
+ *      * `'linear-list'`: Acyclic 1D chains where canonical in-degree <= 1 and out-degree <= 1.
+ *      * `'tree'`: Directed acyclic hierarchies (binary trees, ternary/k-ary trees, tries, DSU forests).
+ *      * `'general-graph'`: Cyclic meshes or multi-parent DAGs.
+ * 2. Adaptive Layout Configurations:
+ *    - `'linear-list'` -> Cytoscape `dagre` (`rankDir: 'LR', nodeSep: 60, rankSep: 80, edgeSep: 30`)
+ *    - `'tree'`        -> Cytoscape `dagre` (`rankDir: 'TB', nodeSep: 90, rankSep: 110, edgeSep: 40, ranker: 'network-simplex'`)
+ *    - `'general-graph'` -> Cytoscape `cose` (`nodeRepulsion: 8000, idealEdgeLength: 120, componentSpacing: 100`)
+ * 3. Dimension-Aware Edge Routing & Autorotated Labels:
+ *    - `'edge-text-rotation': 'autorotate'`, `'text-background-opacity': 1`, `'text-background-color': '#0f172a'`.
  */
 
 import React, {
@@ -22,7 +25,7 @@ import React, {
   useMemo,
   useCallback,
 } from "react";
-import cytoscape, { type Core } from "cytoscape";
+import cytoscape, { type Core, type LayoutOptions } from "cytoscape";
 import {
   type GraphData,
   type GraphNode,
@@ -48,6 +51,7 @@ export interface GraphVisualizerProps {
 }
 
 type ViewMode = "logical" | "physical";
+export type GraphTopologyKind = "linear-list" | "tree" | "general-graph";
 
 interface BadgeOverlayItem {
   nodeId: string;
@@ -59,10 +63,24 @@ interface BadgeOverlayItem {
 
 interface ExtendedGraphNode extends GraphNode {
   self_ref_order?: string[];
+  status?: string;
 }
 
 interface ExtendedGraphEdge extends GraphEdge {
   field_order_idx?: number;
+}
+
+interface DagreLayoutConfig {
+  name: "dagre";
+  rankDir: "LR" | "TB";
+  nodeSep: number;
+  rankSep: number;
+  edgeSep: number;
+  ranker?: "network-simplex" | "tight-tree" | "longest-path";
+  animate: boolean;
+  animationDuration: number;
+  fit: boolean;
+  padding: number;
 }
 
 const BADGE_PALETTE = [
@@ -92,17 +110,518 @@ function escapeXml(unsafe: string): string {
 }
 
 /**
- * Content-Aware Memory Card Builder:
- *   `const fieldCount = Object.keys(node.fields || {}).length;`
- *   `const calculatedWidth = 160;`
- *   `const calculatedHeight = Math.max(52, 38 + fieldCount * 18);`
+ * Automatic Topology Classifier (Zero Hardcoding):
+ * Analyzes the active node and edge set by collapsing symmetric pointer pairs
+ * (`u -> v` and `v -> u`) into single bidirectional links:
+ *   - `'linear-list'`: Acyclic 1D chains where canonical in-degree <= 1 and out-degree <= 1
+ *     (undirected degree <= 2 in every component).
+ *   - `'tree'`: Acyclic hierarchy where max undirected degree > 2 (or branching factor >= 2)
+ *     and canonical in-degree <= 1 (top-down tree) or out-degree <= 1 (parent-pointer forest).
+ *   - `'general-graph'`: Contains undirected cycles of length >= 3 or multi-parent DAG merges.
  */
+export function detectTopology(
+  nodes: ExtendedGraphNode[],
+  edges: ExtendedGraphEdge[]
+): GraphTopologyKind {
+  if (nodes.length <= 1) {
+    return "linear-list";
+  }
+
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  const validEdges = edges.filter(
+    (e) => nodeIds.has(e.source) && nodeIds.has(e.target) && e.source !== e.target
+  );
+
+  if (validEdges.length === 0) {
+    return "linear-list";
+  }
+
+  // Collapse parallel and symmetric edges `(u -> v)` and `(v -> u)` into unique undirected pairs
+  const undirNeighbors = new Map<string, Set<string>>();
+  nodes.forEach((n) => undirNeighbors.set(n.id, new Set<string>()));
+
+  const uniqueUndirPairs = new Set<string>();
+  validEdges.forEach((e) => {
+    undirNeighbors.get(e.source)!.add(e.target);
+    undirNeighbors.get(e.target)!.add(e.source);
+    const canonPair =
+      e.source < e.target ? `${e.source}::${e.target}` : `${e.target}::${e.source}`;
+    uniqueUndirPairs.add(canonPair);
+  });
+
+  // Check each undirected connected component for cycles of length >= 3:
+  // A connected component with V_c vertices is acyclic iff its unique undirected edge count E_c == V_c - 1.
+  const visited = new Set<string>();
+  let hasUndirectedCycle = false;
+  let maxUndirectedDegree = 0;
+
+  for (const n of nodes) {
+    const deg = undirNeighbors.get(n.id)?.size ?? 0;
+    if (deg > maxUndirectedDegree) {
+      maxUndirectedDegree = deg;
+    }
+
+    if (!visited.has(n.id)) {
+      const compNodes: string[] = [];
+      const queue: string[] = [n.id];
+      visited.add(n.id);
+
+      while (queue.length > 0) {
+        const curr = queue.shift()!;
+        compNodes.push(curr);
+        undirNeighbors.get(curr)?.forEach((nbr) => {
+          if (!visited.has(nbr)) {
+            visited.add(nbr);
+            queue.push(nbr);
+          }
+        });
+      }
+
+      let compUndirEdgeCount = 0;
+      compNodes.forEach((u) => {
+        undirNeighbors.get(u)?.forEach((v) => {
+          if (u < v) compUndirEdgeCount += 1;
+        });
+      });
+
+      if (compUndirEdgeCount >= compNodes.length) {
+        hasUndirectedCycle = true;
+      }
+    }
+  }
+
+  if (hasUndirectedCycle) {
+    return "general-graph";
+  }
+
+  // Every component is an acyclic tree/path in the collapsed undirected skeleton!
+  // If no node has undirected degree > 2, every component is a 1D Linear Chain / Doubly-Linked List.
+  if (maxUndirectedDegree <= 2) {
+    // Also verify that if there are no symmetric back-edges, we don't have a v-shaped 3-node tree
+    // (`root -> left` and `root -> right` where root has out-degree 2 and in-degree 0).
+    const directedPairSet = new Set(
+      validEdges.map((e) => `${e.source}->${e.target}`)
+    );
+    let hasPureBranchingRoot = false;
+    nodes.forEach((n) => {
+      const nonSymmetricOutTargets = new Set<string>();
+      validEdges.forEach((e) => {
+        if (
+          e.source === n.id &&
+          !directedPairSet.has(`${e.target}->${e.source}`)
+        ) {
+          nonSymmetricOutTargets.add(e.target);
+        }
+      });
+      if (nonSymmetricOutTargets.size >= 2) {
+        hasPureBranchingRoot = true;
+      }
+    });
+
+    if (!hasPureBranchingRoot) {
+      return "linear-list";
+    }
+  }
+
+  return "tree";
+}
+
+/**
+ * Dimension-Aware Dagre Hierarchical Layout Engine (`rankDir: 'LR'` & `rankDir: 'TB'`).
+ * Computes exact border-to-border `nodeSep` and `rankSep` coordinates so:
+ *   - `'LR'` Linear Lists (`head <-> second <-> third`) form a crisp 1D horizontal sequence.
+ *   - `'TB'` Multi-Child Trees (`left`, `mid`, `right` or 20-node BSTs) have full `nodeSep: 90px`
+ *     horizontal clearance between sibling cards and `rankSep: 110px` vertical clearance between
+ *     parent and child card borders.
+ */
+function computeDagreHierarchicalPositions(
+  nodes: ExtendedGraphNode[],
+  edges: ExtendedGraphEdge[],
+  config: {
+    rankDir: "LR" | "TB";
+    nodeSep: number;
+    rankSep: number;
+    edgeSep: number;
+  }
+): Record<string, { x: number; y: number }> {
+  const positions: Record<string, { x: number; y: number }> = {};
+  if (nodes.length === 0) return positions;
+
+  const nodeMap = new Map<string, ExtendedGraphNode>();
+  const nodeDims = new Map<string, { width: number; height: number }>();
+
+  nodes.forEach((n) => {
+    nodeMap.set(n.id, n);
+    const fCount = Object.keys(n.fields || {}).length;
+    const width = 160;
+    const height = Math.max(52, 38 + fCount * 18);
+    nodeDims.set(n.id, { width, height });
+  });
+
+  const validEdges = edges.filter(
+    (e) => nodeMap.has(e.source) && nodeMap.has(e.target) && e.source !== e.target
+  );
+
+  // ---------------------------------------------------------------------------
+  // Mode 1: Horizontal 1D Linear List (`rankDir: 'LR'`)
+  // ---------------------------------------------------------------------------
+  if (config.rankDir === "LR") {
+    const undirAdj = new Map<string, string[]>();
+    const forwardInDeg = new Map<string, number>();
+    const directedSet = new Set(
+      validEdges.map((e) => `${e.source}->${e.target}`)
+    );
+
+    nodes.forEach((n) => {
+      undirAdj.set(n.id, []);
+      forwardInDeg.set(n.id, 0);
+    });
+
+    validEdges.forEach((e) => {
+      const uList = undirAdj.get(e.source)!;
+      if (!uList.includes(e.target)) uList.push(e.target);
+      const vList = undirAdj.get(e.target)!;
+      if (!vList.includes(e.source)) vList.push(e.source);
+
+      // Count non-symmetric incoming edges
+      if (!directedSet.has(`${e.target}->${e.source}`)) {
+        forwardInDeg.set(e.target, (forwardInDeg.get(e.target) || 0) + 1);
+      }
+    });
+
+    const visited = new Set<string>();
+    let currentRowY = 180;
+
+    // Order components so nodes with active stack pointers (`head`) come first
+    const sortedCandidates = [...nodes].sort((a, b) => {
+      const aDeg = undirAdj.get(a.id)?.length ?? 0;
+      const bDeg = undirAdj.get(b.id)?.length ?? 0;
+      // Prefer chain endpoints (degree <= 1)
+      const aIsEnd = aDeg <= 1 ? 0 : 1;
+      const bIsEnd = bDeg <= 1 ? 0 : 1;
+      if (aIsEnd !== bIsEnd) return aIsEnd - bIsEnd;
+
+      // Among endpoints, prefer lower non-symmetric in-degree
+      const aIn = forwardInDeg.get(a.id) ?? 0;
+      const bIn = forwardInDeg.get(b.id) ?? 0;
+      if (aIn !== bIn) return aIn - bIn;
+
+      // Prefer nodes referenced by stack pointers
+      const aHasPtr = (a.pointers?.length ?? 0) > 0 ? 0 : 1;
+      const bHasPtr = (b.pointers?.length ?? 0) > 0 ? 0 : 1;
+      return aHasPtr - bHasPtr;
+    });
+
+    for (const startNode of sortedCandidates) {
+      if (visited.has(startNode.id)) continue;
+
+      // Walk linear chain from `startNode`
+      const chain: string[] = [];
+      let curr: string | undefined = startNode.id;
+
+      while (curr && !visited.has(curr)) {
+        visited.add(curr);
+        chain.push(curr);
+        // Prefer outgoing edge order from `curr` first, then undirected neighbor
+        const nextOutgoing = validEdges.find(
+          (e) => e.source === curr && !visited.has(e.target)
+        );
+        if (nextOutgoing) {
+          curr = nextOutgoing.target;
+        } else {
+          const fallbackNbr: string | undefined = (undirAdj.get(curr) || []).find(
+            (nbr) => !visited.has(nbr)
+          );
+          curr = fallbackNbr;
+        }
+      }
+
+      let cursorX = 140;
+      let maxChainHeight = 76;
+
+      chain.forEach((nodeId, idx) => {
+        const dim = nodeDims.get(nodeId) || { width: 160, height: 76 };
+        maxChainHeight = Math.max(maxChainHeight, dim.height);
+        if (idx === 0) {
+          positions[nodeId] = { x: cursorX, y: currentRowY };
+        } else {
+          const prevId = chain[idx - 1];
+          const prevDim = nodeDims.get(prevId) || { width: 160, height: 76 };
+          // Border-to-border horizontal gap = rankSep (plus nodeSep cushion)
+          const stepX =
+            prevDim.width / 2 +
+            Math.max(config.rankSep, config.nodeSep + 30) +
+            dim.height * 0 +
+            dim.width / 2;
+          cursorX += stepX;
+          positions[nodeId] = { x: Math.round(cursorX), y: currentRowY };
+        }
+      });
+
+      currentRowY += maxChainHeight + config.nodeSep + 20;
+    }
+
+    return positions;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mode 2: Top-to-Bottom Hierarchical Tree (`rankDir: 'TB'`, Network-Simplex)
+  // ---------------------------------------------------------------------------
+  // Orient edges from root -> children (collapsing symmetric parent back-edges via BFS from roots)
+  const inDegree: Record<string, number> = {};
+  const outDegree: Record<string, number> = {};
+  const directedSet = new Set(
+    validEdges.map((e) => `${e.source}->${e.target}`)
+  );
+
+  nodes.forEach((n) => {
+    inDegree[n.id] = 0;
+    outDegree[n.id] = 0;
+  });
+
+  validEdges.forEach((e) => {
+    outDegree[e.source] = (outDegree[e.source] || 0) + 1;
+    inDegree[e.target] = (inDegree[e.target] || 0) + 1;
+  });
+
+  const maxIn = Math.max(0, ...Object.values(inDegree));
+  const maxOut = Math.max(0, ...Object.values(outDegree));
+  const isParentPointerForest = maxIn > 1 && maxOut <= 1;
+
+  // Build oriented tree adjacency list `treeChildren`
+  const treeChildren = new Map<
+    string,
+    Array<{ childId: string; slotIdx: number }>
+  >();
+  nodes.forEach((n) => treeChildren.set(n.id, []));
+
+  if (isParentPointerForest) {
+    // Invert `child -> parent` edges so roots sit at the top
+    validEdges.forEach((e, idx) => {
+      treeChildren.get(e.target)!.push({ childId: e.source, slotIdx: idx });
+    });
+  } else {
+    // Pick root candidates (in-degree 0 on non-symmetric edges, or referenced by root stack pointer)
+    const nonSymInDeg: Record<string, number> = {};
+    nodes.forEach((n) => (nonSymInDeg[n.id] = 0));
+    validEdges.forEach((e) => {
+      if (!directedSet.has(`${e.target}->${e.source}`)) {
+        nonSymInDeg[e.target] = (nonSymInDeg[e.target] || 0) + 1;
+      }
+    });
+
+    const rootSeeds = nodes
+      .filter((n) => nonSymInDeg[n.id] === 0)
+      .sort((a, b) => (b.pointers?.length ?? 0) - (a.pointers?.length ?? 0));
+    if (rootSeeds.length === 0) {
+      rootSeeds.push(nodes[0]);
+    }
+
+    const bfsVisited = new Set<string>();
+    const orientFromSeed = (seedId: string) => {
+      const queue: string[] = [seedId];
+      bfsVisited.add(seedId);
+
+      while (queue.length > 0) {
+        const u = queue.shift()!;
+        const uNode = nodeMap.get(u);
+        const selfOrder = uNode?.self_ref_order || [];
+
+        const outEdges = validEdges.filter((e) => e.source === u);
+        outEdges.forEach((e) => {
+          if (!bfsVisited.has(e.target)) {
+            bfsVisited.add(e.target);
+            let slotIdx = e.field_order_idx ?? 0;
+            if (e.label && selfOrder.includes(e.label)) {
+              slotIdx = selfOrder.indexOf(e.label);
+            }
+            treeChildren.get(u)!.push({ childId: e.target, slotIdx });
+            queue.push(e.target);
+          }
+        });
+      }
+    };
+
+    rootSeeds.forEach((r) => {
+      if (!bfsVisited.has(r.id)) orientFromSeed(r.id);
+    });
+    nodes.forEach((n) => {
+      if (!bfsVisited.has(n.id)) orientFromSeed(n.id);
+    });
+  }
+
+  // Sort children strictly by DWARF field declaration order (`slotIdx`)
+  treeChildren.forEach((list) => {
+    list.sort((a, b) => a.slotIdx - b.slotIdx);
+  });
+
+  const childIdSet = new Set<string>();
+  treeChildren.forEach((list) => {
+    list.forEach((c) => childIdSet.add(c.childId));
+  });
+
+  const roots = nodes.filter((n) => !childIdSet.has(n.id)).map((n) => n.id);
+  if (roots.length === 0) {
+    roots.push(nodes[0].id);
+  }
+
+  // Compute bottom-up subtree widths with full `nodeSep` border-to-border horizontal gap
+  const CARD_WIDTH = 160;
+  const UNIT_SLOT = CARD_WIDTH + config.nodeSep;
+  const subtreeWidth = new Map<string, number>();
+  const visitedWidth = new Set<string>();
+
+  const computeWidth = (uId: string): number => {
+    if (visitedWidth.has(uId)) {
+      return subtreeWidth.get(uId) || UNIT_SLOT;
+    }
+    visitedWidth.add(uId);
+
+    const uNode = nodeMap.get(uId);
+    const isBinaryNode =
+      (uNode?.self_ref_order?.length ?? 0) === 2 && !isParentPointerForest;
+    const chList = treeChildren.get(uId) || [];
+
+    let w = UNIT_SLOT;
+    if (chList.length === 0) {
+      w = UNIT_SLOT;
+    } else if (isBinaryNode && chList.length === 1) {
+      const childW = computeWidth(chList[0].childId);
+      w = childW + UNIT_SLOT * 0.65;
+    } else {
+      let sum = 0;
+      chList.forEach((c) => {
+        sum += computeWidth(c.childId);
+      });
+      w = Math.max(UNIT_SLOT, sum);
+    }
+
+    subtreeWidth.set(uId, w);
+    return w;
+  };
+
+  roots.forEach((rId) => computeWidth(rId));
+
+  // Assign coordinates top-down using TRUE border-to-border vertical `rankSep`
+  const assignCoords = (uId: string, centerX: number, centerY: number) => {
+    positions[uId] = { x: Math.round(centerX), y: Math.round(centerY) };
+
+    const uNode = nodeMap.get(uId);
+    const uDim = nodeDims.get(uId) || { width: 160, height: 76 };
+    const isBinaryNode =
+      (uNode?.self_ref_order?.length ?? 0) === 2 && !isParentPointerForest;
+    const chList = treeChildren.get(uId) || [];
+
+    if (chList.length === 0) return;
+
+    if (isBinaryNode && chList.length === 1) {
+      const onlyChild = chList[0];
+      const childDim = nodeDims.get(onlyChild.childId) || {
+        width: 160,
+        height: 76,
+      };
+      const childW = subtreeWidth.get(onlyChild.childId) || UNIT_SLOT;
+      const offset = Math.max(95, childW * 0.35);
+      const childCenterX =
+        onlyChild.slotIdx === 0 ? centerX - offset : centerX + offset;
+      const childCenterY =
+        centerY + uDim.height / 2 + config.rankSep + childDim.height / 2;
+      assignCoords(onlyChild.childId, childCenterX, childCenterY);
+      return;
+    }
+
+    const totalW = chList.reduce(
+      (acc, c) => acc + (subtreeWidth.get(c.childId) || UNIT_SLOT),
+      0
+    );
+    let currentLeft = centerX - totalW / 2;
+
+    chList.forEach((c) => {
+      const cW = subtreeWidth.get(c.childId) || UNIT_SLOT;
+      const childDim = nodeDims.get(c.childId) || { width: 160, height: 76 };
+      const cCenterX = currentLeft + cW / 2;
+      // Border-to-border vertical clearance = config.rankSep (110px)
+      const cCenterY =
+        centerY + uDim.height / 2 + config.rankSep + childDim.height / 2;
+      assignCoords(c.childId, cCenterX, cCenterY);
+      currentLeft += cW;
+    });
+  };
+
+  let cursorX = 140;
+  roots.forEach((rId) => {
+    const rW = subtreeWidth.get(rId) || UNIT_SLOT;
+    assignCoords(rId, cursorX + rW / 2, 110);
+    cursorX += rW + config.nodeSep;
+  });
+
+  return positions;
+}
+
+// Register the custom `'dagre'` layout plugin on Cytoscape so `cy.layout({ name: 'dagre', ... })`
+// works natively without external npm binary dependencies.
+let isDagreRegistered = false;
+function ensureDagreLayoutRegistered() {
+  if (isDagreRegistered) return;
+  try {
+    function CustomDagreLayout(this: any, options: any) {
+      this.options = options;
+    }
+    CustomDagreLayout.prototype.run = function () {
+      const options = this.options;
+      const cy: Core = options.cy;
+      const eles = options.eles;
+      const cyNodes = eles.nodes();
+
+      const rawNodes: ExtendedGraphNode[] = [];
+      cyNodes.forEach((n: any) => {
+        const raw = n.data("rawNode") as ExtendedGraphNode | undefined;
+        if (raw) {
+          rawNodes.push(raw);
+        } else {
+          rawNodes.push({
+            id: n.id(),
+            fields: {},
+          });
+        }
+      });
+
+      const rawEdges: ExtendedGraphEdge[] = [];
+      eles.edges().forEach((e: any) => {
+        rawEdges.push({
+          source: e.source().id(),
+          target: e.target().id(),
+          label: e.data("label") || "",
+          field_order_idx: e.data("fieldOrderIdx") ?? 0,
+        });
+      });
+
+      const computed = computeDagreHierarchicalPositions(rawNodes, rawEdges, {
+        rankDir: options.rankDir || "TB",
+        nodeSep: options.nodeSep ?? 90,
+        rankSep: options.rankSep ?? 110,
+        edgeSep: options.edgeSep ?? 40,
+      });
+
+      cyNodes.layoutPositions(this, options, (ele: any) => {
+        return computed[ele.id()] || ele.position();
+      });
+      return this;
+    };
+
+    cytoscape("layout", "dagre", CustomDagreLayout as any);
+    isDagreRegistered = true;
+  } catch {
+    isDagreRegistered = true;
+  }
+}
+
 function buildSvgMemoryCard(node: ExtendedGraphNode): {
   svgDataUri: string;
   width: number;
   height: number;
 } {
-  const isFreed = Boolean(node.is_freed);
+  const isFreed = Boolean(node.is_freed) || node.status === "freed";
   const isActive =
     (Array.isArray(node.pointers) && node.pointers.length > 0) ||
     Boolean(node.is_active);
@@ -260,12 +779,6 @@ function buildSvgVertexCard(
 
 const INDEXED_EDGE_RE = /^([a-zA-Z_][a-zA-Z0-9_]*)\[(\d+)\]$/;
 
-/**
- * Purely structural Logical Graph projector:
- * Supports both:
- *   A. Adjacency-list container meshes (`adj[0]`, `adj[1]`, ...)
- *   B. Index-buffer forest graphs (`IndexNode` emitted by `gdb_engine.py` for DSU Snippet 1)
- */
 function projectLogicalGraphFromMesh(
   physicalGraph: GraphData,
   locals?: Record<string, number | string>,
@@ -282,7 +795,6 @@ function projectLogicalGraphFromMesh(
     };
   }
 
-  // Case A: Index-buffer forest nodes already projected by backend (Snippet 1 DSU)
   if (pNodes.every((n) => n.type === "IndexNode")) {
     const logicalNodes: GraphNode[] = pNodes.map((n, idx) => {
       const idxNum = n.fields?.index ?? idx;
@@ -427,7 +939,7 @@ function projectLogicalGraphFromMesh(
   }
 
   const matchingMetricArray = (arrays || []).find(
-    (a) => !a.is_compound && a.elements.length === vertexCount
+    (a) => !a.is_compound && a.kind !== "matrix" && a.elements.length === vertexCount
   );
 
   const vertexPointers: Record<number, string[]> = {};
@@ -556,199 +1068,12 @@ function computeLogicalCirclePositions(
 }
 
 /**
- * Strict Hierarchical Tree & Forest Layout Engine (Reingold-Tilford / Dagre TB Geometry):
- * Handles both:
- *   1. Top-Down Trees (`inDegree <= 1`, e.g. Binary Search Trees, Tries, Heaps):
- *      - Strictly respects DWARF self-referential pointer declaration order (`self_ref_order`):
- *        * The 1st self-referential pointer field is ALWAYS placed on the LEFT (`x < parent.x`).
- *        * The 2nd self-referential pointer field is ALWAYS placed on the RIGHT (`x > parent.x`).
- *        * Even if a node has ONLY a 2nd-field child (e.g. right child only), a phantom left
- *          slot is reserved so the single right child sits strictly to the right of its parent!
- *   2. Bottom-Up Parent Forests (`outDegree <= 1`, e.g. Union-Find / Disjoint-Set trees where
- *      children point to their parent `node->parent` or `i -> parent[i]`):
- *      - Places roots at the top (`rankDir: TB`) and fans children out cleanly below their root.
- */
-function computeHierarchicalTreePositions(
-  nodes: ExtendedGraphNode[],
-  edges: ExtendedGraphEdge[]
-): { isTreeOrForest: boolean; positions: Record<string, { x: number; y: number }> } {
-  const positions: Record<string, { x: number; y: number }> = {};
-  if (nodes.length === 0) {
-    return { isTreeOrForest: false, positions };
-  }
-
-  const nodeMap = new Map<string, ExtendedGraphNode>();
-  nodes.forEach((n) => nodeMap.set(n.id, n));
-
-  const validEdges = edges.filter(
-    (e) => nodeMap.has(e.source) && nodeMap.has(e.target) && e.source !== e.target
-  );
-
-  const inDegree: Record<string, number> = {};
-  const outDegree: Record<string, number> = {};
-  nodes.forEach((n) => {
-    inDegree[n.id] = 0;
-    outDegree[n.id] = 0;
-  });
-
-  validEdges.forEach((e) => {
-    outDegree[e.source] = (outDegree[e.source] || 0) + 1;
-    inDegree[e.target] = (inDegree[e.target] || 0) + 1;
-  });
-
-  const maxIn = Math.max(0, ...Object.values(inDegree));
-  const maxOut = Math.max(0, ...Object.values(outDegree));
-
-  // Detect whether this is a Top-Down Tree (inDegree <= 1) or a Parent-Pointer Forest (outDegree <= 1 and maxIn > 1)
-  const isTopDownTree = maxIn <= 1;
-  const isParentForest = !isTopDownTree && maxOut <= 1;
-
-  if (!isTopDownTree && !isParentForest) {
-    return { isTreeOrForest: false, positions };
-  }
-
-  // Build tree adjacency list from root -> children
-  const treeChildren = new Map<string, Array<{ childId: string; slotIdx: number }>>();
-  nodes.forEach((n) => treeChildren.set(n.id, []));
-
-  if (isTopDownTree) {
-    validEdges.forEach((e) => {
-      const parentNode = nodeMap.get(e.source);
-      const selfOrder = parentNode?.self_ref_order || [];
-      let slotIdx = e.field_order_idx ?? 0;
-      if (e.label && selfOrder.includes(e.label)) {
-        slotIdx = selfOrder.indexOf(e.label);
-      }
-      treeChildren.get(e.source)!.push({ childId: e.target, slotIdx });
-    });
-  } else {
-    // Parent-pointer forest: edges go `child -> parent`, so invert for top-down layout
-    validEdges.forEach((e, idx) => {
-      treeChildren.get(e.target)!.push({ childId: e.source, slotIdx: idx });
-    });
-  }
-
-  // Sort children of each node strictly by `slotIdx` (DWARF field declaration order)
-  treeChildren.forEach((list) => {
-    list.sort((a, b) => a.slotIdx - b.slotIdx);
-  });
-
-  // Identify roots
-  const roots = nodes
-    .filter((n) => (isTopDownTree ? inDegree[n.id] === 0 : outDegree[n.id] === 0))
-    .map((n) => n.id);
-
-  if (roots.length === 0) {
-    return { isTreeOrForest: false, positions };
-  }
-
-  // Verify acyclicity and compute subtree horizontal widths bottom-up
-  const NODE_WIDTH = 160;
-  const NODE_SEP = 60;
-  const RANK_SEP = 115;
-  const UNIT_SLOT = NODE_WIDTH + NODE_SEP;
-
-  const subtreeWidth = new Map<string, number>();
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  let hasCycle = false;
-
-  const computeWidth = (uId: string): number => {
-    if (visiting.has(uId)) {
-      hasCycle = true;
-      return UNIT_SLOT;
-    }
-    if (visited.has(uId)) {
-      return subtreeWidth.get(uId) || UNIT_SLOT;
-    }
-    visiting.add(uId);
-    visited.add(uId);
-
-    const uNode = nodeMap.get(uId);
-    const isBinaryNode = (uNode?.self_ref_order?.length ?? 0) === 2 && isTopDownTree;
-    const chList = treeChildren.get(uId) || [];
-
-    let w = UNIT_SLOT;
-    if (chList.length === 0) {
-      w = UNIT_SLOT;
-    } else if (isBinaryNode && chList.length === 1) {
-      // Reserve a phantom sibling slot so a single left/right child stays strictly offset from parent center
-      const childW = computeWidth(chList[0].childId);
-      w = childW + UNIT_SLOT * 0.65;
-    } else {
-      let sum = 0;
-      chList.forEach((c) => {
-        sum += computeWidth(c.childId);
-      });
-      w = Math.max(UNIT_SLOT, sum);
-    }
-
-    visiting.delete(uId);
-    subtreeWidth.set(uId, w);
-    return w;
-  };
-
-  roots.forEach((rId) => computeWidth(rId));
-  if (hasCycle || visited.size < nodes.length) {
-    return { isTreeOrForest: false, positions };
-  }
-
-  // Top-down recursive coordinate assignment
-  const assignCoords = (uId: string, centerX: number, depthY: number) => {
-    positions[uId] = { x: Math.round(centerX), y: Math.round(depthY) };
-    const uNode = nodeMap.get(uId);
-    const isBinaryNode = (uNode?.self_ref_order?.length ?? 0) === 2 && isTopDownTree;
-    const chList = treeChildren.get(uId) || [];
-
-    if (chList.length === 0) return;
-
-    if (isBinaryNode && chList.length === 1) {
-      const onlyChild = chList[0];
-      const childW = subtreeWidth.get(onlyChild.childId) || UNIT_SLOT;
-      const offset = Math.max(85, childW * 0.35);
-      // slotIdx === 0 -> strictly LEFT of parent; slotIdx >= 1 -> strictly RIGHT of parent
-      const childCenterX =
-        onlyChild.slotIdx === 0 ? centerX - offset : centerX + offset;
-      assignCoords(onlyChild.childId, childCenterX, depthY + RANK_SEP);
-      return;
-    }
-
-    const totalW = chList.reduce(
-      (acc, c) => acc + (subtreeWidth.get(c.childId) || UNIT_SLOT),
-      0
-    );
-    let currentLeft = centerX - totalW / 2;
-
-    chList.forEach((c) => {
-      const cW = subtreeWidth.get(c.childId) || UNIT_SLOT;
-      const cCenter = currentLeft + cW / 2;
-      assignCoords(c.childId, cCenter, depthY + RANK_SEP);
-      currentLeft += cW;
-    });
-  };
-
-  let cursorX = 140;
-  roots.forEach((rId) => {
-    const rW = subtreeWidth.get(rId) || UNIT_SLOT;
-    assignCoords(rId, cursorX + rW / 2, 100);
-    cursorX += rW + NODE_SEP;
-  });
-
-  return { isTreeOrForest: true, positions };
-}
-
-/**
  * Multi-lane horizontal layout for general Cyclic / Adjacency-List Pointer Meshes.
  */
-function computeGeneralMeshPositions(
+function computeGeneralMeshSeedPositions(
   nodes: ExtendedGraphNode[],
   edges: ExtendedGraphEdge[]
 ): Record<string, { x: number; y: number }> {
-  const treeAttempt = computeHierarchicalTreePositions(nodes, edges);
-  if (treeAttempt.isTreeOrForest) {
-    return treeAttempt.positions;
-  }
-
   const positions: Record<string, { x: number; y: number }> = {};
   if (nodes.length === 0) return positions;
 
@@ -787,7 +1112,7 @@ function computeGeneralMeshPositions(
   const visited = new Set<string>();
   let currentLaneY = 120;
   const HORIZONTAL_PITCH = 250;
-  const VERTICAL_MARGIN = 52;
+  const VERTICAL_MARGIN = 58;
 
   roots.forEach((rootId) => {
     if (visited.has(rootId)) return;
@@ -855,7 +1180,7 @@ function computeGeneralMeshPositions(
 
 function enforceMinimumNodeSeparation(
   positions: Record<string, { x: number; y: number }>,
-  minDist: number = 85
+  minDist: number = 95
 ): Record<string, { x: number; y: number }> {
   const result: Record<string, { x: number; y: number }> = {};
   const ids = Object.keys(positions);
@@ -897,6 +1222,8 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
   arrays,
   isConnecting = false,
 }) => {
+  ensureDagreLayoutRegistered();
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
   const prevTopologyKeyRef = useRef<string>("");
@@ -918,6 +1245,12 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     effectiveMode === "logical" ? logicalGraph : graph;
   const nodes = (activeGraphData?.nodes || []) as ExtendedGraphNode[];
   const edges = (activeGraphData?.edges || []) as ExtendedGraphEdge[];
+
+  // Automatically classify active topology ('linear-list' | 'tree' | 'general-graph')
+  const detectedTopology = useMemo<GraphTopologyKind>(
+    () => detectTopology(nodes, edges),
+    [nodes, edges]
+  );
 
   const syncBadgePositions = useCallback(() => {
     const cy = cyRef.current;
@@ -947,12 +1280,12 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
 
   const clampCameraFit = useCallback(
     (cy: Core) => {
-      cy.fit(undefined, 50);
+      cy.fit(undefined, 60);
       if (cy.zoom() > 1.2) {
         cy.zoom(1.2);
         cy.center();
-      } else if (cy.zoom() < 0.45) {
-        cy.zoom(0.45);
+      } else if (cy.zoom() < 0.42) {
+        cy.zoom(0.42);
         cy.center();
       }
       syncBadgePositions();
@@ -960,28 +1293,48 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     [syncBadgePositions]
   );
 
-  const computeTargetPositions = useCallback((): Record<
+  const computeInitialPositionsForTopology = useCallback((): Record<
     string,
     { x: number; y: number }
   > => {
-    if (effectiveMode === "logical") {
-      if (isForestTopology) {
-        const forestTree = computeHierarchicalTreePositions(nodes, edges);
-        if (forestTree.isTreeOrForest) {
-          return enforceMinimumNodeSeparation(forestTree.positions, 95);
-        }
-      }
+    if (effectiveMode === "logical" && !isForestTopology) {
       return enforceMinimumNodeSeparation(
         computeLogicalCirclePositions(nodes),
         95
       );
     }
-    return enforceMinimumNodeSeparation(
-      computeGeneralMeshPositions(nodes, edges),
-      90
-    );
-  }, [effectiveMode, isForestTopology, nodes, edges]);
 
+    if (detectedTopology === "linear-list") {
+      return computeDagreHierarchicalPositions(nodes, edges, {
+        rankDir: "LR",
+        nodeSep: 60,
+        rankSep: 80,
+        edgeSep: 30,
+      });
+    }
+
+    if (detectedTopology === "tree" || isForestTopology) {
+      return computeDagreHierarchicalPositions(nodes, edges, {
+        rankDir: "TB",
+        nodeSep: 90,
+        rankSep: 110,
+        edgeSep: 40,
+      });
+    }
+
+    return enforceMinimumNodeSeparation(
+      computeGeneralMeshSeedPositions(nodes, edges),
+      95
+    );
+  }, [effectiveMode, isForestTopology, detectedTopology, nodes, edges]);
+
+  /**
+   * Adaptive Layout Runner:
+   * Dispatches the exact layout configuration based on `detectedTopology`:
+   *   - `'linear-list'`   -> `dagre` (`rankDir: 'LR', nodeSep: 60, rankSep: 80, edgeSep: 30`)
+   *   - `'tree'`          -> `dagre` (`rankDir: 'TB', nodeSep: 90, rankSep: 110, edgeSep: 40, ranker: 'network-simplex'`)
+   *   - `'general-graph'` -> `cose` (`nodeRepulsion: 8000, idealEdgeLength: 120, componentSpacing: 100`)
+   */
   const runActiveLayout = useCallback(
     (animate: boolean = true, clearDraggedCache: boolean = false) => {
       const cy = cyRef.current;
@@ -991,20 +1344,93 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         userDraggedPositionsRef.current = {};
       }
 
-      const targetPositions = computeTargetPositions();
+      if (effectiveMode === "logical" && !isForestTopology) {
+        const circleLayout = cy.layout({
+          name: "circle",
+          avoidOverlap: true,
+          nodeDimensionsIncludeLabels: true,
+          spacingFactor: 1.25,
+          padding: 60,
+          startAngle: -Math.PI / 2,
+          clockwise: true,
+          animate,
+          animationDuration: animate ? 250 : 0,
+          fit: true,
+        });
+        circleLayout.on("layoutstop", () => clampCameraFit(cy));
+        circleLayout.run();
+        return;
+      }
 
-      const presetLayout = cy.layout({
-        name: "preset",
-        positions: targetPositions,
-        animate,
-        animationDuration: animate ? 280 : 0,
-        fit: true,
-        padding: 50,
+      if (detectedTopology === "linear-list") {
+        const lrConfig: DagreLayoutConfig = {
+          name: "dagre",
+          rankDir: "LR",
+          nodeSep: 60,
+          rankSep: 80,
+          edgeSep: 30,
+          animate,
+          animationDuration: animate ? 250 : 0,
+          fit: true,
+          padding: 60,
+        };
+        const layout = cy.layout(lrConfig as unknown as LayoutOptions);
+        layout.on("layoutstop", () => clampCameraFit(cy));
+        layout.run();
+        return;
+      }
+
+      if (detectedTopology === "tree" || isForestTopology) {
+        const tbConfig: DagreLayoutConfig = {
+          name: "dagre",
+          rankDir: "TB",
+          nodeSep: 90,
+          rankSep: 110,
+          edgeSep: 40,
+          ranker: "network-simplex",
+          animate,
+          animationDuration: animate ? 250 : 0,
+          fit: true,
+          padding: 60,
+        };
+        const layout = cy.layout(tbConfig as unknown as LayoutOptions);
+        layout.on("layoutstop", () => clampCameraFit(cy));
+        layout.run();
+        return;
+      }
+
+      // General graph: seed clean initial coordinates first, then run force-directed `cose`
+      const seeded = computeInitialPositionsForTopology();
+      cy.batch(() => {
+        cy.nodes().forEach((n) => {
+          const p = seeded[n.id()];
+          if (p) n.position(p);
+        });
       });
-      presetLayout.on("layoutstop", () => clampCameraFit(cy));
-      presetLayout.run();
+
+      const coseLayout = cy.layout({
+        name: "cose",
+        animate,
+        animationDuration: animate ? 250 : 0,
+        fit: true,
+        padding: 60,
+        nodeDimensionsIncludeLabels: true,
+        nodeRepulsion: () => 8000,
+        idealEdgeLength: () => 120,
+        componentSpacing: 100,
+        nodeOverlap: 40,
+        randomize: false,
+      });
+      coseLayout.on("layoutstop", () => clampCameraFit(cy));
+      coseLayout.run();
     },
-    [computeTargetPositions, clampCameraFit]
+    [
+      effectiveMode,
+      isForestTopology,
+      detectedTopology,
+      computeInitialPositionsForTopology,
+      clampCameraFit,
+    ]
   );
 
   const topologyKey = useMemo(() => {
@@ -1017,10 +1443,10 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
       .map((e) => `${e.source}->${e.target}:${e.label ?? ""}`)
       .sort()
       .join(",");
-    return `${effectiveMode}|${nKeys}|${eKeys}`;
-  }, [nodes, edges, effectiveMode]);
+    return `${effectiveMode}|${detectedTopology}|${nKeys}|${eKeys}`;
+  }, [nodes, edges, effectiveMode, detectedTopology]);
 
-  // Initialize Cytoscape instance once on mount (never remounted across steps)
+  // Initialize Cytoscape instance once on mount
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -1075,18 +1501,19 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
             "target-arrow-shape": "triangle",
             "arrow-scale": 1.15,
             "curve-style": "bezier",
-            "control-point-step-size": 45,
+            "control-point-step-size": 52,
             label: "data(label)",
+            "text-rotation": "autorotate",
             "font-family": "'JetBrains Mono', monospace",
             "font-size": 10,
             "font-weight": "bold",
             color: "#f8fafc",
-            "text-background-color": "#020617",
-            "text-background-opacity": 0.85,
-            "text-background-padding": "3px",
+            "text-background-color": "#0f172a",
+            "text-background-opacity": 1,
+            "text-background-padding": "4px",
             "text-background-shape": "roundrectangle",
             "text-border-width": 1,
-            "text-border-color": "#1e293b",
+            "text-border-color": "#334155",
             "text-border-opacity": 1,
           },
         },
@@ -1136,23 +1563,17 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     };
   }, [syncBadgePositions]);
 
-  // Incremental In-Place Element Diffing (Eliminates Canvas Wipe on Recursive Steps)
+  // Incremental In-Place Element Diffing & Topology-Driven Layout Execution
   useEffect(() => {
     const cy = cyRef.current;
     if (!cy) return;
 
-    if (isConnecting) {
+    if (isConnecting || nodes.length === 0) {
       cy.elements().remove();
       prevTopologyKeyRef.current = "";
-      userDraggedPositionsRef.current = {};
-      setBadgeOverlays([]);
-      setSelectedNode(null);
-      return;
-    }
-
-    if (nodes.length === 0) {
-      cy.elements().remove();
-      prevTopologyKeyRef.current = "";
+      if (isConnecting) {
+        userDraggedPositionsRef.current = {};
+      }
       setBadgeOverlays([]);
       setSelectedNode(null);
       return;
@@ -1161,21 +1582,28 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     const validNodeIds = new Set(nodes.map((n) => n.id));
     const isNewTopology = topologyKey !== prevTopologyKeyRef.current;
 
-    const deterministicPositions = computeTargetPositions();
+    const deterministicPositions = computeInitialPositionsForTopology();
 
     const finalPositions: Record<string, { x: number; y: number }> = {};
     nodes.forEach((n, idx) => {
       finalPositions[n.id] =
         userDraggedPositionsRef.current[n.id] ||
         deterministicPositions[n.id] || {
-          x: 160 + (idx % 4) * 220,
-          y: 160 + Math.floor(idx / 4) * 140,
+          x: 160 + (idx % 4) * 240,
+          y: 160 + Math.floor(idx / 4) * 150,
         };
     });
 
     const desiredEdgeMap = new Map<
       string,
-      { id: string; source: string; target: string; label: string; isUndirectedLogical: boolean }
+      {
+        id: string;
+        source: string;
+        target: string;
+        label: string;
+        fieldOrderIdx: number;
+        isUndirectedLogical: boolean;
+      }
     >();
     edges.forEach((e, idx) => {
       if (
@@ -1190,31 +1618,28 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
           source: e.source,
           target: e.target,
           label: e.label ?? "",
+          fieldOrderIdx: e.field_order_idx ?? 0,
           isUndirectedLogical:
             effectiveMode === "logical" && !isForestTopology,
         });
       }
     });
 
-    // Perform in-place batch update without wiping existing nodes
     cy.batch(() => {
-      // 1. Remove nodes that no longer exist
       cy.nodes().forEach((existingNode) => {
         if (!validNodeIds.has(existingNode.id())) {
           existingNode.remove();
         }
       });
 
-      // 2. Remove edges that no longer exist
       cy.edges().forEach((existingEdge) => {
         if (!desiredEdgeMap.has(existingEdge.id())) {
           existingEdge.remove();
         }
       });
 
-      // 3. Upsert nodes in-place
       nodes.forEach((n, idx) => {
-        const isFreed = Boolean(n.is_freed);
+        const isFreed = Boolean(n.is_freed) || n.status === "freed";
         const ptrs = Array.isArray(n.pointers) ? n.pointers : [];
         const isLogicalVertex = n.type === "LogicalVertex";
 
@@ -1280,7 +1705,6 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         }
       });
 
-      // 4. Upsert edges in-place
       desiredEdgeMap.forEach((edgeSpec) => {
         const existingEdge = cy.getElementById(edgeSpec.id);
         if (existingEdge.length > 0) {
@@ -1301,7 +1725,7 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
 
     if (isNewTopology) {
       prevTopologyKeyRef.current = topologyKey;
-      clampCameraFit(cy);
+      runActiveLayout(false, false);
     } else {
       syncBadgePositions();
     }
@@ -1313,8 +1737,8 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     isForestTopology,
     selectedNode,
     isConnecting,
-    computeTargetPositions,
-    clampCameraFit,
+    computeInitialPositionsForTopology,
+    runActiveLayout,
     syncBadgePositions,
   ]);
 

@@ -6,21 +6,19 @@ High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memor
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`):
-     - Extracts exact positional subscript expressions `<name>[<expr0>][<expr1>]` from the
-       active source line and enclosing function body.
-     - Strictly binds `<expr0>` to Dimension 0 (`row_var`, `row_val`) and `<expr1>` to
-       Dimension 1 (`col_var`, `col_val`), eliminating GDB's inner-to-outer lexical block
-       ordering inversion (`j` before `i`).
-     - Emits structured `access: { row_var, row_val, col_var, col_val, target_repr }`
-       and a 2D numeric `rows: List[List[Any]]` grid.
-  2. Monotonic Cumulative Heap Block Ledger (`self.heap_blocks`):
-     - Tracks every discovered heap struct block across the entire debug session.
-     - Once `free(addr)` executes, `heap_blocks[addr]["status"] = "freed"` is IMMUTABLE
-       unless an explicit `malloc`/`calloc`/`realloc` reallocates that exact address.
-  3. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
-  4. Generic Iterative Typedef-Pointer Resolution (`_resolve_type_info`).
-  5. Strict User-Scope Variable Filtering & Step Budget `MAX_STEPS = 1500`.
+  1. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`):
+     - Records the base memory address (`&arr[0]`) and exact DWARF element count `N` of every
+       stack array (`DW_TAG_array_type` `T[N]`) and heap allocation across all frames.
+     - When a stack or heap array decays to a pointer (`const int *arr`) inside a callee
+       function (`binary_search`), resolves `arr`'s exact address in `_address_bounds_ledger`
+       (or walks caller frames) to bind the length strictly to `N = 10`, preventing stack
+       over-reads and garbage slots.
+  2. Strict Distinction Between Index Cursors and Upper-Bound Parameters:
+     - Read-only bound parameters (used in `right = bound - 1` or `< bound` but never mutated
+       and never subscripting `arr[bound]`) are never emitted as active index pointers.
+  3. Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
+  4. Monotonic Cumulative Heap Block Ledger (`self.heap_blocks`).
+  5. Token-Synchronized GDB/MI Command Pipelining (`_cmd_tokenized` & `_eval_expr_batch`).
 """
 
 import asyncio
@@ -136,7 +134,7 @@ class DwarfTypeEntry:
 
 
 # ==============================================================================
-# Clean Pydantic Data Contract (With Positional 2D Matrix Access Metadata)
+# Clean Pydantic Data Contract
 # ==============================================================================
 
 class MatrixAccessMetadata(BaseModel):
@@ -367,6 +365,12 @@ class GDBTracer:
         self.heap_blocks: Dict[str, Dict[str, Any]] = {}
         self._freed_addresses: Set[str] = set()
 
+        # Caller-Frame & Heap Array Base Address -> Validated Element Count Ledger:
+        # Maps canonical hex address (`&arr[0]`) -> element_count `N` so when an array
+        # decays to a pointer (`const int *arr`) in a callee frame, we know its exact bound `N`.
+        self._address_bounds_ledger: Dict[str, int] = {}
+        self._stack_var_addr_cache: Dict[Tuple[str, str], str] = {}
+
         # Per-function variable snapshot cache for user caller frames
         self._frame_vars_by_func: Dict[str, List[Dict[str, str]]] = {}
         self._active_call_stack: List[str] = ["main"]
@@ -412,6 +416,7 @@ class GDBTracer:
 
     def _mark_address_freed(self, addr: str) -> None:
         self._freed_addresses.add(addr)
+        self._address_bounds_ledger.pop(addr, None)
         if addr in self.heap_blocks:
             self.heap_blocks[addr]["status"] = "freed"
             if self.heap_blocks[addr].get("freed_at_step") is None:
@@ -868,7 +873,7 @@ class GDBTracer:
         )
 
     # ==========================================================================
-    # Syntactic Subscript, Positional 2D Matrix Access & Forest Proof Engine
+    # Syntactic Subscript, Positional 2D Matrix Access & Bound Proof Engine
     # ==========================================================================
 
     @staticmethod
@@ -887,7 +892,6 @@ class GDBTracer:
 
     @staticmethod
     def _extract_ordered_identifiers_from_expr(expr: str) -> List[str]:
-        """Preserves left-to-right lexical appearance order of identifiers inside an expression."""
         idents: List[str] = []
         for match in C_IDENT_RE.finditer(expr):
             token = match.group(1)
@@ -908,27 +912,16 @@ class GDBTracer:
         num_cols: int,
         leaf_scalar_ints: Dict[str, int],
     ) -> Tuple[Optional[MatrixAccessMetadata], Dict[str, int]]:
-        """
-        Positional 2D Subscript Analyzer (Zero Hardcoding):
-        Extracts `<matrix_name>[<expr0>][<expr1>]` from:
-          1. The active execution line (`self._current_line`) if present, OR
-          2. The enclosing function body (`self._current_func`), excluding declaration `[R][C]`.
-        Strictly binds `<expr0>` to Dimension 0 (`row_var`, `row_val`) and `<expr1>`
-        to Dimension 1 (`col_var`, `col_val`).
-        Never relies on GDB's `-stack-list-variables` lexical ordering.
-        """
         clean_name = matrix_name.split(":")[-1].strip()
         esc_name = re.escape(clean_name)
         pair_re = re.compile(rf"\b{esc_name}\s*\[\s*([^\]]+?)\s*\]\s*\[\s*([^\]]+?)\s*\]")
 
         candidate_pairs: List[Tuple[str, str]] = []
 
-        # 1. Check current source line first for immediate active access `mat[expr0][expr1]`
         if 1 <= self._current_line < len(self._source_lines):
             curr_src = C_COMMENTS_AND_STRINGS_RE.sub(
                 " ", self._source_lines[self._current_line]
             )
-            # Exclude array declaration lines like `int mat[10][10];`
             decl_info = self._get_var_declaration_info(
                 self._current_func, clean_name, self._current_line
             )
@@ -936,7 +929,6 @@ class GDBTracer:
                 for m in pair_re.finditer(curr_src):
                     candidate_pairs.append((m.group(1).strip(), m.group(2).strip()))
 
-        # 2. Fall back to cached function-body 2D subscript pairs `mat[expr0][expr1]`
         cache_key = (self._current_func, clean_name)
         if cache_key not in self._matrix_subscript_pairs_cache:
             body = self._extract_function_body_by_name(
@@ -945,7 +937,6 @@ class GDBTracer:
             body_pairs: List[Tuple[str, str]] = []
             for m in pair_re.finditer(body):
                 e0, e1 = m.group(1).strip(), m.group(2).strip()
-                # Skip constant dimension declarations like `mat[10][10]` where both are integer literals
                 if e0.isdigit() and e1.isdigit():
                     continue
                 if (e0, e1) not in body_pairs:
@@ -957,24 +948,13 @@ class GDBTracer:
                 candidate_pairs.append(bp)
 
         def eval_subscript_dim(expr_str: str) -> Tuple[Optional[str], Optional[int]]:
-            """
-            Resolves a subscript expression (`i`, `r + 1`, `0`, etc.) to `(symbol_label, int_val)`.
-            Uses `leaf_scalar_ints` directly when `expr_str` is a single variable identifier
-            (zero MI round-trip overhead), or evaluates compound expressions via GDB.
-            """
             idents = self._extract_ordered_identifiers_from_expr(expr_str)
-            # Fast path: single identifier in `leaf_scalar_ints`
             if expr_str in leaf_scalar_ints:
                 return (expr_str, leaf_scalar_ints[expr_str])
-            # Integer literal
             if re.match(r"^-?\d+$", expr_str):
                 return (expr_str, int(expr_str))
-            # If the primary identifier in `expr_str` is not yet in `leaf_scalar_ints`
-            # (e.g. inner loop variable `j` while execution is on the outer `for (int i = ...)` line),
-            # do not evaluate out-of-scope garbage.
             if idents and not any(id_tok in leaf_scalar_ints for id_tok in idents):
                 return (idents[0], None)
-            # Compound expression (`i + 1`, `r - 1`) with in-scope variables
             raw_eval = self._eval_expr(expr_str)
             if raw_eval is not None:
                 parsed = parse_scalar(raw_eval)
@@ -998,15 +978,12 @@ class GDBTracer:
                 if r_v is not None and c_v is not None:
                     break
 
-        # Build deterministically ordered `active_indices`:
-        # ALWAYS insert `row_var` (Dimension 0) FIRST and `col_var` (Dimension 1) SECOND.
         ordered_active_indices: Dict[str, int] = {}
-        if row_var and row_val is not None and -1 <= row_val <= num_rows:
+        if row_var and row_val is not None and 0 <= row_val < num_rows:
             ordered_active_indices[row_var] = row_val
-        if col_var and col_val is not None and -1 <= col_val <= num_cols:
+        if col_var and col_val is not None and 0 <= col_val < num_cols:
             ordered_active_indices[col_var] = col_val
 
-        # Include any additional syntactically proven cursors after `row_var` and `col_var`
         extra_proven = self._collect_active_indices(
             leaf_scalar_ints, max(num_rows, num_cols), array_name=clean_name
         )
@@ -1174,7 +1151,9 @@ class GDBTracer:
         for var_name, val in scalar_ints.items():
             if var_name not in proven_index_names:
                 continue
-            if -1 <= val <= array_len:
+            # Strictly restrict active indices to valid slot range [-1, array_len - 1]
+            # (or array_len ONLY if the variable itself is mutated as a loop induction variable)
+            if -1 <= val < array_len:
                 active[var_name] = val
 
         return active
@@ -1203,7 +1182,7 @@ class GDBTracer:
         proven_struct_cursors = self._get_global_field_subscript_cursors(field_name)
 
         for s_name, s_val in sister_scalars.items():
-            if s_name in proven_struct_cursors and -1 <= s_val <= array_len:
+            if s_name in proven_struct_cursors and -1 <= s_val < array_len:
                 active[s_name] = s_val
 
         local_proven = self._collect_active_indices(
@@ -1222,10 +1201,30 @@ class GDBTracer:
         ptr_leaf_name: str,
         sister_scalars: Dict[str, int],
         frame_scalars: Dict[str, int],
+        ptr_addr: Optional[str] = None,
     ) -> Optional[int]:
+        """
+        Determines the exact element count `N` of a pointer buffer (`ptr_leaf_name` at `ptr_addr`)
+        using a 4-tier structural & caller-frame hierarchy (zero hardcoded names):
+          1. Caller Frame / Address Bounds Ledger (`self._address_bounds_ledger[ptr_addr]`):
+             If `ptr_addr` matches the base address of a known caller-frame `DW_TAG_array_type`
+             (e.g. `int arr[10]` in `main` passed as `const int *arr` to `binary_search`),
+             returns the exact DWARF bound `10` immediately!
+          2. Syntactic Allocation / Upper-Bound Expression Proof (`malloc(N * ...)`, `var < N`,
+             or `idx = N - 1` where `idx` subscripts `ptr_leaf_name`):
+             Matches companion integer parameters that act as syntactic bounds (never arbitrary
+             comparison values like `target = 23`).
+          3. Structural Sister Scalars (for struct-embedded buffers `s->data`, `uf->parent`).
+          4. Caller Frame Integer Bound Fallback.
+        """
+        # Tier 1: Exact Address Match in Caller-Frame / Allocation Ledger
+        if ptr_addr and ptr_addr in self._address_bounds_ledger:
+            return self._address_bounds_ledger[ptr_addr]
+
         if ptr_leaf_name not in self._alloc_bound_expr_cache:
             candidates: List[str] = []
             esc = re.escape(ptr_leaf_name)
+            # 1A: `ptr = malloc(BOUND * sizeof...)`
             alloc_re = re.compile(
                 rf"\b{esc}\s*(?:\[[^\]]+\])?\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(\s*([^,\)\*]+)"
             )
@@ -1234,8 +1233,18 @@ class GDBTracer:
                     if ident not in candidates:
                         candidates.append(ident)
 
+            # 1B: `< BOUND` or `<= BOUND - 1` in loops
             bound_re = re.compile(rf"<\s*([a-zA-Z_][a-zA-Z0-9_]*)\b")
             for m in bound_re.finditer(self._full_clean_source):
+                ident = m.group(1)
+                if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
+                    candidates.append(ident)
+
+            # 1C: `cursor = BOUND - 1` (e.g. `int right = n - 1;` in binary search / quicksort)
+            minus_one_re = re.compile(
+                r"\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*-\s*1\b"
+            )
+            for m in minus_one_re.finditer(self._full_clean_source):
                 ident = m.group(1)
                 if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
                     candidates.append(ident)
@@ -1245,10 +1254,13 @@ class GDBTracer:
         bound_candidates = self._alloc_bound_expr_cache[ptr_leaf_name]
         proven_cursors = self._get_global_field_subscript_cursors(ptr_leaf_name)
 
+        # Tier 2: Sister scalars in the same struct matching syntactic bound expressions
         for cand in bound_candidates:
             if cand in sister_scalars and cand not in proven_cursors:
                 val = sister_scalars[cand]
                 if 1 <= val <= 4096:
+                    if ptr_addr:
+                        self._address_bounds_ledger[ptr_addr] = min(val, MAX_STRUCT_BUFFER_ELEMENTS)
                     return min(val, MAX_STRUCT_BUFFER_ELEMENTS)
 
         non_cursor_sisters = [
@@ -1257,8 +1269,12 @@ class GDBTracer:
             if k not in proven_cursors and 1 <= val <= 4096
         ]
         if non_cursor_sisters:
-            return min(min(non_cursor_sisters), MAX_STRUCT_BUFFER_ELEMENTS)
+            resolved_len = min(min(non_cursor_sisters), MAX_STRUCT_BUFFER_ELEMENTS)
+            if ptr_addr:
+                self._address_bounds_ledger[ptr_addr] = resolved_len
+            return resolved_len
 
+        # Tier 3: Frame scalars that match syntactic bound expressions (`< BOUND`, `BOUND - 1`, `malloc(BOUND)`)
         local_proven_cursors = self._get_syntactically_proven_indices(
             self._current_func, self._current_line, ptr_leaf_name
         )
@@ -1266,13 +1282,11 @@ class GDBTracer:
             if cand in frame_scalars and cand not in local_proven_cursors:
                 val = frame_scalars[cand]
                 if 1 <= val <= MAX_ARRAY_ELEMENTS:
+                    if ptr_addr:
+                        self._address_bounds_ledger[ptr_addr] = val
                     return val
 
-        if not sister_scalars:
-            for k, val in frame_scalars.items():
-                if k not in local_proven_cursors and 1 <= val <= MAX_ARRAY_ELEMENTS:
-                    return val
-
+        # Tier 4: If only a cursor sister field is >= 0, read up to `cursor + 1`
         for k, val in sister_scalars.items():
             if k in proven_cursors and 0 <= val < MAX_STRUCT_BUFFER_ELEMENTS:
                 return val + 1
@@ -1691,13 +1705,26 @@ class GDBTracer:
                     raw_2d_array_vars.append((v_name, elem_type, rows, cols, f_level))
                 continue
 
-            # 1B: Fixed 1D stack array (`int values[20]`)
+            # 1B: Fixed 1D stack array (`int arr[10]` in `main`)
             arr_match = FIXED_ARR_RE.match(v_type)
             if arr_match:
                 elem_type = arr_match.group(1).strip()
                 arr_len = min(int(arr_match.group(2)), MAX_ARRAY_ELEMENTS)
                 if f_level == 0:
                     raw_array_vars.append((v_name, elem_type, arr_len, f_level))
+                    # Record the base stack address `&arr[0]` in `_address_bounds_ledger`
+                    # so if `arr` is passed to a callee (`const int *arr` in `binary_search`),
+                    # its exact DWARF bound `arr_len` is known by address!
+                    addr_cache_key = (self._current_func, v_name)
+                    if addr_cache_key not in self._stack_var_addr_cache:
+                        base_addr_raw = self._eval_expr(f"&{v_name}[0]")
+                        base_addr = extract_hex_address(base_addr_raw or "")
+                        if base_addr:
+                            self._stack_var_addr_cache[addr_cache_key] = base_addr
+                            self._address_bounds_ledger[base_addr] = arr_len
+                    else:
+                        base_addr = self._stack_var_addr_cache[addr_cache_key]
+                        self._address_bounds_ledger[base_addr] = arr_len
                 continue
 
             type_kind, resolved_target = self._resolve_type_info(v_type)
@@ -1746,7 +1773,7 @@ class GDBTracer:
                     }
                 continue
 
-            # 1F: 1D Primitive Pointer (`int *dist`, `int *arr`)
+            # 1F: 1D Primitive Pointer (`const int *arr` in `binary_search`, `int *dist`)
             if type_kind == "primitive_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
@@ -1788,6 +1815,7 @@ class GDBTracer:
                 ptr_leaf_name=clean_tbl_name,
                 sister_scalars={},
                 frame_scalars=scalar_ints,
+                ptr_addr=tbl_addr,
             )
             if not tbl_len or not (1 <= tbl_len <= MAX_STRUCT_BUFFER_ELEMENTS):
                 continue
@@ -1830,32 +1858,43 @@ class GDBTracer:
                     arrays_snapshot.append(comp_snap)
 
         # ----------------------------------------------------------------------
-        # Pass 2: Evaluate 1D Arrays & Unified 2D Matrices (`kind: "matrix"`)
+        # Pass 2: Evaluate 1D Arrays (Including Decayed Stack/Heap Pointers) & 2D Matrices
         # ----------------------------------------------------------------------
         array_eval_specs: List[Tuple[str, str, str, int, bool, str]] = []
+        seen_array_names: Set[str] = set()
 
         for arr_name, elem_type, arr_len, _ in raw_array_vars:
+            seen_array_names.add(arr_name)
             elem_kind, elem_resolved = self._resolve_type_info(elem_type)
             is_comp = elem_kind == "struct_val" and not self._has_struct_pointer_links(elem_resolved)
             array_eval_specs.append(
                 (arr_name, arr_name, elem_type, arr_len, is_comp, elem_resolved if is_comp else elem_type)
             )
 
-        for ptr_name, elem_type, addr, _ in raw_ptr_vars:
+        for ptr_name, elem_type, addr, f_level in raw_ptr_vars:
+            clean_ptr_name = ptr_name.split(":")[-1]
+            if clean_ptr_name in seen_array_names:
+                continue
             if (
                 self._is_address_freed(addr)
-                or not self._is_valid_heap_or_data_address(addr)
+                or not self._is_valid_memory_buffer_address(addr)
             ):
                 continue
+            # Only visualize top-level pointers that belong to the active frame (or are unique)
+            if f_level != 0 and clean_ptr_name in locals_out:
+                continue
+
             inferred_len = self._infer_pointer_buffer_length(
-                ptr_leaf_name=ptr_name.split(":")[-1],
+                ptr_leaf_name=clean_ptr_name,
                 sister_scalars={},
                 frame_scalars=scalar_ints,
+                ptr_addr=addr,
             )
             if inferred_len and 1 <= inferred_len <= MAX_ARRAY_ELEMENTS:
+                seen_array_names.add(clean_ptr_name)
                 deref_expr = f"*({elem_type}[{inferred_len}]*)({addr})"
                 array_eval_specs.append(
-                    (ptr_name, deref_expr, elem_type, inferred_len, False, elem_type)
+                    (clean_ptr_name, deref_expr, elem_type, inferred_len, False, elem_type)
                 )
 
         if array_eval_specs:
@@ -1866,7 +1905,8 @@ class GDBTracer:
                 expr_val = batch_results.get(expr_key)
                 if not expr_val:
                     continue
-                raw_items = parse_gdb_array(expr_val, max_elems=cap_len)
+                # Strictly clip to `cap_len` so stack memory beyond `cap_len` is never emitted
+                raw_items = parse_gdb_array(expr_val, max_elems=cap_len)[:cap_len]
                 if is_comp:
                     compound_elems: List[Dict[str, Any]] = []
                     for item_str in raw_items:
@@ -1958,6 +1998,7 @@ class GDBTracer:
                 ptr_leaf_name=clean_mat,
                 sister_scalars={},
                 frame_scalars=scalar_ints,
+                ptr_addr=mat_addr,
             )
             if not rows_len or not (1 <= rows_len <= MAX_MATRIX_DIM):
                 continue
@@ -2146,6 +2187,7 @@ class GDBTracer:
             ptr_leaf_name=lookup_name,
             sister_scalars=sister_scalars,
             frame_scalars=all_scalar_ints,
+            ptr_addr=array_base_addr,
         )
         if not buf_len or not (1 <= buf_len <= MAX_STRUCT_BUFFER_ELEMENTS):
             return None
@@ -2468,6 +2510,7 @@ class GDBTracer:
                                     ptr_leaf_name=f_name,
                                     sister_scalars=sister_scalars,
                                     frame_scalars=all_scalar_ints,
+                                    ptr_addr=target_addr,
                                 )
                                 if table_len and 1 <= table_len <= MAX_STRUCT_BUFFER_ELEMENTS:
                                     ptr_table_raw = self._eval_expr(
@@ -2527,6 +2570,7 @@ class GDBTracer:
                                 ptr_leaf_name=f_name,
                                 sister_scalars=sister_scalars,
                                 frame_scalars=all_scalar_ints,
+                                ptr_addr=target_addr,
                             )
                             if buf_len and 1 <= buf_len <= MAX_STRUCT_BUFFER_ELEMENTS:
                                 deref_buf_expr = (
@@ -2538,8 +2582,8 @@ class GDBTracer:
                                         format_scalar_val(x)
                                         for x in parse_gdb_array(
                                             buf_val_str,
-                                            max_elems=MAX_STRUCT_BUFFER_ELEMENTS,
-                                        )
+                                            max_elems=buf_len,
+                                        )[:buf_len]
                                     ]
                                     if elements:
                                         active_idx = self._collect_struct_buffer_indices(
@@ -2689,6 +2733,23 @@ class GDBTracer:
         if val < 0x402000:
             return False
         if 0x7f0000000000 <= val < 0x7ffffff00000:
+            return False
+        return True
+
+    @staticmethod
+    def _is_valid_memory_buffer_address(addr: str) -> bool:
+        """
+        Permits both valid heap/data addresses AND user stack addresses (`>= 0x7ffffff00000`
+        on x86_64) so stack arrays decayed to pointers (`const int *arr`) can be dereferenced.
+        Excludes shared library `mmap` regions (`0x7f0000000000 .. 0x7fffffefffff`).
+        """
+        try:
+            val = int(addr, 16)
+        except ValueError:
+            return False
+        if val < 0x402000:
+            return False
+        if 0x7f0000000000 <= val < 0x7fffffe00000:
             return False
         return True
 

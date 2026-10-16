@@ -2,15 +2,20 @@
  * frontend/src/components/Visualizer/ArrayVisualizer.tsx
  * Dual-Mode 1D Array / Compound Tuple / 2D Matrix Grid Visualizer.
  *
- * Matrix Coordinate Mapping Guarantees:
- * - Binds Dimension 0 (`dimensions[0]`, `access.row_var`, `access.row_val`) strictly
- *   to the vertical Y-axis (Rows `[0] .. [R-1]`).
- * - Binds Dimension 1 (`dimensions[1]`, `access.col_var`, `access.col_val`) strictly
- *   to the horizontal X-axis (Columns `[0] .. [C-1]`).
- * - Renders explicit Row badge (`${row_var} = ${row_val} (row)`),
- *   Column badge (`${col_var} = ${col_val} (col)`), and
- *   Target badge (`Target: ${name}[${row_val}][${col_val}]`).
- * - Places the active amber target border strictly at `cell[row_val][col_val]`.
+ * Key Guarantees:
+ * 1. Generous Bar Width & Horizontal Scroll:
+ *    - Every 1D bar column enforces `flex-shrink-0 min-w-[56px] w-14` (`min-w-[96px]` for
+ *      compound struct cells) with `gap-3`, wrapped inside a smooth horizontal scroll
+ *      container (`overflow-x-auto overflow-y-hidden pb-4 scrollbar-thin scrollbar-thumb-slate-700`).
+ *    - Values and `[idx]` footers are centered cleanly inside each cell so text never clips.
+ * 2. Upper-Bound / Length Semantic Separation:
+ *    - A variable whose runtime value equals `array.length` (e.g. `10` for a 10-element array `[0..9]`)
+ *      and has not acted as a moving in-bounds cursor is displayed as a dedicated
+ *      **End-Boundary / Length Chip** in the header (`n = 10 (length)`), never placed over a
+ *      non-existent slot `[10]`.
+ *    - Moving index cursors that step outside `[0..N-1]` upon loop termination (`left = 10` or
+ *      `right = -1`) render as auxiliary `(out of bounds)` header badges.
+ * 3. Persistent Multi-Index Badges & Vertical Badge Stacking on Collisions.
  */
 
 import React, { useRef, useEffect } from "react";
@@ -20,7 +25,14 @@ import {
   type CompoundArrayElement,
   type GraphNode,
 } from "../../types/debugger";
-import { BarChart3, Database, Grid3X3, Layers } from "lucide-react";
+import {
+  BarChart3,
+  Database,
+  Grid3X3,
+  Layers,
+  AlertCircle,
+  Maximize2,
+} from "lucide-react";
 
 export interface ArrayVisualizerProps {
   arrays: ArraySnapshot[];
@@ -43,20 +55,24 @@ interface ExtendedMatrixSnapshot extends ArraySnapshot {
 const BADGE_PALETTE = [
   "bg-sky-400 text-slate-950 border-sky-200 shadow-[0_0_10px_rgba(56,189,248,0.45)]",
   "bg-amber-400 text-slate-950 border-amber-200 shadow-[0_0_10px_rgba(251,191,36,0.45)]",
-  "bg-fuchsia-500 text-white border-fuchsia-300 shadow-[0_0_10px_rgba(217,70,239,0.45)]",
   "bg-emerald-400 text-slate-950 border-emerald-200 shadow-[0_0_10px_rgba(52,211,153,0.45)]",
-  "bg-violet-500 text-white border-violet-300",
-  "bg-cyan-400 text-slate-950 border-cyan-200",
-  "bg-orange-400 text-slate-950 border-orange-200",
-  "bg-rose-500 text-white border-rose-300",
+  "bg-fuchsia-500 text-white border-fuchsia-300 shadow-[0_0_10px_rgba(217,70,239,0.45)]",
+  "bg-violet-500 text-white border-violet-300 shadow-[0_0_10px_rgba(139,92,246,0.45)]",
+  "bg-cyan-400 text-slate-950 border-cyan-200 shadow-[0_0_10px_rgba(34,211,238,0.45)]",
+  "bg-orange-400 text-slate-950 border-orange-200 shadow-[0_0_10px_rgba(251,146,60,0.45)]",
+  "bg-rose-500 text-white border-rose-300 shadow-[0_0_10px_rgba(244,63,94,0.45)]",
 ];
 
-function getIndexBadgeStyle(pointerName: string): string {
+function getIndexBadgeStyle(
+  pointerName: string,
+  collisionOffset: number = 0
+): string {
   let hash = 0;
   for (let i = 0; i < pointerName.length; i++) {
     hash = (hash * 31 + pointerName.charCodeAt(i)) >>> 0;
   }
-  return BADGE_PALETTE[hash % BADGE_PALETTE.length];
+  const idx = (hash + collisionOffset) % BADGE_PALETTE.length;
+  return BADGE_PALETTE[idx];
 }
 
 function isCompoundElement(el: ArrayElement): el is CompoundArrayElement {
@@ -140,13 +156,111 @@ function isLikelyGarbageOrZero(val: number | string): {
   return { isZero: false, isGarbage: false, displayVal: str };
 }
 
+/**
+ * Purely generic, persistent index & bound discovery for a 1D array of length `N`:
+ * - Any scalar integer in `[0, N - 1]` is registered as an active in-bounds index cursor.
+ * - Any scalar integer whose value equals `N` (`value === arr.elements.length`) and has NOT
+ *   previously acted as an in-bounds cursor on `[0..N-1]` is classified as an
+ *   **End-Boundary / Length Chip** (`boundChips`), never placed as a bar pointer over `[N]`.
+ * - Any variable that previously acted as an in-bounds cursor and steps to `-1` or `N`
+ *   upon loop exit is classified as an `isOutOfBounds` cursor.
+ */
+function resolvePersistentArrayIndices(
+  arr: ArraySnapshot,
+  locals: Record<string, number | string> | undefined,
+  knownInBoundsCursors: Set<string>
+): {
+  inBoundsBySlot: Record<number, string[]>;
+  allTrackedIndices: Array<{
+    name: string;
+    value: number;
+    isOutOfBounds: boolean;
+  }>;
+  boundChips: Array<{ name: string; value: number }>;
+} {
+  const N = arr.elements.length;
+  const mergedMap = new Map<string, number>();
+  const boundChips: Array<{ name: string; value: number }> = [];
+
+  // 1. Seed from backend's syntactic `active_indices`
+  Object.entries(arr.active_indices || {}).forEach(([varName, idxVal]) => {
+    if (typeof idxVal === "number" && Number.isInteger(idxVal)) {
+      if (idxVal >= 0 && idxVal < N) {
+        mergedMap.set(varName, idxVal);
+        knownInBoundsCursors.add(varName);
+      } else if (idxVal === N && !knownInBoundsCursors.has(varName)) {
+        boundChips.push({ name: varName, value: idxVal });
+      } else {
+        mergedMap.set(varName, idxVal);
+      }
+    }
+  });
+
+  // 2. Scan all live frame scalar variables in `locals`
+  if (locals && N > 0) {
+    Object.entries(locals).forEach(([varName, rawVal]) => {
+      if (varName === arr.name) return;
+
+      let parsedInt: number | null = null;
+      if (typeof rawVal === "number" && Number.isInteger(rawVal)) {
+        parsedInt = rawVal;
+      } else if (
+        typeof rawVal === "string" &&
+        !rawVal.startsWith("0x") &&
+        /^-?\d+$/.test(rawVal.trim())
+      ) {
+        parsedInt = parseInt(rawVal.trim(), 10);
+      }
+
+      if (parsedInt === null) return;
+
+      if (parsedInt >= 0 && parsedInt < N) {
+        // Avoid treating a scalar value that equals an array element value as an index
+        // ONLY if the backend already provided explicit syntactic `active_indices` and
+        // `varName` is equal to `N` (handled below). For `0 <= parsedInt < N`, register it:
+        mergedMap.set(varName, parsedInt);
+        knownInBoundsCursors.add(varName);
+      } else if (parsedInt === N) {
+        if (knownInBoundsCursors.has(varName)) {
+          // A moving cursor (e.g. `i` or `left`) reached the end boundary `N`
+          mergedMap.set(varName, parsedInt);
+        } else if (!boundChips.some((b) => b.name === varName)) {
+          // Static upper-bound / length variable (`value == array.length`)
+          boundChips.push({ name: varName, value: parsedInt });
+        }
+      } else if (knownInBoundsCursors.has(varName) && parsedInt === -1) {
+        mergedMap.set(varName, parsedInt);
+      }
+    });
+  }
+
+  const inBoundsBySlot: Record<number, string[]> = {};
+  const allTrackedIndices: Array<{
+    name: string;
+    value: number;
+    isOutOfBounds: boolean;
+  }> = [];
+
+  mergedMap.forEach((val, name) => {
+    const isOob = val < 0 || val >= N;
+    allTrackedIndices.push({ name, value: val, isOutOfBounds: isOob });
+    if (!isOob) {
+      if (!inBoundsBySlot[val]) {
+        inBoundsBySlot[val] = [];
+      }
+      if (!inBoundsBySlot[val].includes(name)) {
+        inBoundsBySlot[val].push(name);
+      }
+    }
+  });
+
+  return { inBoundsBySlot, allTrackedIndices, boundChips };
+}
+
 interface MatrixGridProps {
   matrix: ExtendedMatrixSnapshot;
 }
 
-/**
- * Dedicated 2D Matrix Table / Grid Component with Strict Row (Dim 0) & Col (Dim 1) Binding.
- */
 const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
   const { gridRows, numRows, numCols } = extractMatrixGridData(matrix);
   const prevGridRef = useRef<Record<string, string>>({});
@@ -154,8 +268,6 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
   const access = matrix.access;
   const activeEntries = Object.entries(matrix.active_indices || {});
 
-  // Primary binding from explicit positional `matrix.access` metadata;
-  // fallback to ordered `active_indices` (where backend places row_var 1st, col_var 2nd).
   const rowVar: string | null =
     access?.row_var !== undefined && access?.row_var !== null
       ? access.row_var
@@ -184,9 +296,6 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
       ? activeEntries[1][1]
       : null;
 
-  // In-bounds validation for table highlighting:
-  // Dimension 0 (Row) -> vertical Y-axis [0 .. numRows - 1]
-  // Dimension 1 (Column) -> horizontal X-axis [0 .. numCols - 1]
   const activeRowIdx =
     rawRowVal !== null && rawRowVal >= 0 && rawRowVal < numRows
       ? rawRowVal
@@ -196,7 +305,6 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
       ? rawColVal
       : null;
 
-  // Detect cells modified on the current step compared to the previous render
   const modifiedCells = new Set<string>();
   const currentSnapshotMap: Record<string, string> = {};
 
@@ -224,7 +332,6 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
 
   return (
     <div className="rounded-xl bg-slate-900/95 border border-slate-800 p-5 shadow-lg">
-      {/* 1. Matrix Header Bar */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3.5 mb-4">
         <div className="flex flex-wrap items-center gap-2.5">
           <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-indigo-500/15 border border-indigo-500/40 text-indigo-300 font-mono text-xs font-semibold">
@@ -239,7 +346,6 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
           </span>
         </div>
 
-        {/* Positional Row, Column & Target Badges */}
         <div className="flex flex-wrap items-center gap-2">
           {activeRowIdx !== null && activeColIdx !== null && (
             <span
@@ -256,7 +362,8 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
                 activeRowIdx === null ? "opacity-65" : ""
               }`}
             >
-              {rowVar} = {rawRowVal} (row)
+              {rowVar} = {rawRowVal}{" "}
+              {activeRowIdx === null ? "(out of bounds)" : "(row)"}
             </span>
           )}
 
@@ -266,23 +373,21 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
                 activeColIdx === null ? "opacity-65" : ""
               }`}
             >
-              {colVar} = {rawColVal} (col)
+              {colVar} = {rawColVal}{" "}
+              {activeColIdx === null ? "(out of bounds)" : "(col)"}
             </span>
           )}
         </div>
       </div>
 
-      {/* 2. Scrollable 2D Matrix Table Container */}
       <div className="max-h-[500px] overflow-auto border border-slate-800 rounded-lg p-4 bg-slate-950/60">
         <table className="border-separate border-spacing-1.5 font-mono text-xs mx-auto">
           <thead>
             <tr>
-              {/* Top-Left Corner Axis Key */}
               <th className="sticky top-0 left-0 z-20 bg-slate-900/95 border border-slate-800 rounded-md px-2.5 py-1.5 text-[10px] text-slate-400 font-semibold">
                 [row \ col]
               </th>
 
-              {/* Column Headers [0] .. [numCols - 1] (Dimension 1 / Horizontal X-Axis) */}
               {Array.from({ length: numCols }).map((_, cIdx) => {
                 const isColActive = activeColIdx === cIdx;
                 return (
@@ -309,13 +414,11 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
           </thead>
 
           <tbody>
-            {/* Rows [0] .. [numRows - 1] (Dimension 0 / Vertical Y-Axis) */}
             {gridRows.map((rowValues, rIdx) => {
               const isRowActive = activeRowIdx === rIdx;
 
               return (
                 <tr key={`row-${rIdx}`}>
-                  {/* Sticky Row Header [0] .. [numRows - 1] */}
                   <th
                     className={`sticky left-0 z-10 min-w-[54px] px-2.5 py-1.5 rounded-md border text-center transition-colors ${
                       isRowActive
@@ -333,14 +436,12 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
                     </div>
                   </th>
 
-                  {/* Matrix Cells: cell[rIdx][cIdx] */}
                   {Array.from({ length: numCols }).map((_, cIdx) => {
                     const rawCellVal =
                       cIdx < rowValues.length ? rowValues[cIdx] : 0;
                     const { isZero, isGarbage, displayVal } =
                       isLikelyGarbageOrZero(rawCellVal);
 
-                    // Active coordinate match strictly at (rIdx === activeRowIdx && cIdx === activeColIdx)
                     const isTargetCell =
                       activeRowIdx === rIdx && activeColIdx === cIdx;
                     const isJustModified = modifiedCells.has(
@@ -394,7 +495,6 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
         </table>
       </div>
 
-      {/* Matrix Legend Footer */}
       <div className="flex flex-wrap items-center justify-between gap-3 mt-3 pt-2.5 border-t border-slate-800/70 text-[11px] font-mono text-slate-400">
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-1.5">
@@ -501,6 +601,8 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
   locals,
   graphNodes = [],
 }) => {
+  const knownIndexVarsByArrayRef = useRef<Record<string, Set<string>>>({});
+
   if (!arrays || arrays.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-slate-400 p-8 text-center">
@@ -529,6 +631,22 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
           );
         }
 
+        if (!knownIndexVarsByArrayRef.current[arr.name]) {
+          knownIndexVarsByArrayRef.current[arr.name] = new Set<string>();
+        }
+
+        const { inBoundsBySlot, allTrackedIndices, boundChips } =
+          resolvePersistentArrayIndices(
+            arr,
+            locals,
+            knownIndexVarsByArrayRef.current[arr.name]
+          );
+
+        const varColorMap = new Map<string, string>();
+        allTrackedIndices.forEach((item, idx) => {
+          varColorMap.set(item.name, getIndexBadgeStyle(item.name, idx));
+        });
+
         const isStructOwned =
           arr.name.includes("->") || arr.name.includes(".");
         const ownerVar = isStructOwned ? arr.name.split(/->|\./)[0] : null;
@@ -545,27 +663,19 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
           1
         );
 
-        const indexToPointers: Record<number, string[]> = {};
-        Object.entries(arr.active_indices || {}).forEach(([ptrName, idxVal]) => {
-          if (
-            typeof idxVal === "number" &&
-            idxVal >= 0 &&
-            idxVal < arr.elements.length
-          ) {
-            if (!indexToPointers[idxVal]) {
-              indexToPointers[idxVal] = [];
-            }
-            indexToPointers[idxVal].push(ptrName);
-          }
-        });
+        const maxStackDepth = Math.max(
+          1,
+          ...Object.values(inBoundsBySlot).map((list) => list.length)
+        );
+        const badgeStackMinHeight = Math.max(36, maxStackDepth * 26);
 
         return (
           <div
             key={arr.name}
             className="rounded-xl bg-slate-900/95 border border-slate-800 p-5 shadow-lg"
           >
-            {/* 1D Array Header */}
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3 mb-5">
+            {/* 1D Array Header & Persistent Active Index Legend */}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3.5 mb-5">
               <div className="flex flex-wrap items-center gap-2.5">
                 <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-sky-500/10 border border-sky-500/30 text-sky-400 font-mono text-xs font-semibold">
                   {isStructOwned && <Database className="w-3.5 h-3.5" />}
@@ -584,6 +694,22 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                   )
                 </span>
 
+                {/* Dedicated Upper-Bound / Array Length Chips (`value === array.length`) */}
+                {boundChips.map((b) => (
+                  <span
+                    key={`bound-${b.name}`}
+                    className="flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-slate-950 border border-slate-700 text-slate-300 text-[11px] font-mono font-semibold"
+                    title={`Upper bound / length variable (${b.name} == ${b.value}); valid slot indices are [0 .. ${
+                      arr.elements.length - 1
+                    }]`}
+                  >
+                    <Maximize2 className="w-3 h-3 text-sky-400 shrink-0" />
+                    <span>
+                      {b.name} = {b.value} (bound)
+                    </span>
+                  </span>
+                ))}
+
                 {ownerNode && (
                   <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-950 border border-slate-800 text-[11px] font-mono text-slate-300">
                     <Layers className="w-3 h-3 text-sky-400" />
@@ -595,32 +721,37 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                 )}
               </div>
 
-              {/* Syntactically Proven Active Index Legend */}
+              {/* Persistent Active & Out-of-Bounds Index Pills */}
               <div className="flex flex-wrap items-center gap-2">
-                {Object.entries(arr.active_indices || {}).map(
-                  ([ptrName, idxVal]) => {
-                    const isOutOfBounds =
-                      idxVal < 0 || idxVal >= arr.elements.length;
+                {allTrackedIndices.map(
+                  ({ name: ptrName, value: idxVal, isOutOfBounds }) => {
+                    const badgeColor =
+                      varColorMap.get(ptrName) || getIndexBadgeStyle(ptrName);
+
+                    if (isOutOfBounds) {
+                      return (
+                        <span
+                          key={ptrName}
+                          className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-md bg-rose-950/80 border border-rose-500/70 text-rose-200 text-[11px] font-mono font-bold shadow-sm"
+                          title={`Pointer ${ptrName} (${idxVal}) is currently outside valid array bounds [0, ${
+                            arr.elements.length - 1
+                          }]`}
+                        >
+                          <AlertCircle className="w-3 h-3 text-rose-400 shrink-0" />
+                          <span>
+                            {ptrName} = {idxVal} (out of bounds)
+                          </span>
+                        </span>
+                      );
+                    }
+
                     return (
                       <span
                         key={ptrName}
-                        className={`px-2.5 py-0.5 rounded text-[11px] font-mono font-bold border ${getIndexBadgeStyle(
-                          ptrName
-                        )} ${isOutOfBounds ? "opacity-65" : ""}`}
-                        title={
-                          isOutOfBounds
-                            ? `Boundary index (${idxVal}) outside [0, ${
-                                arr.elements.length - 1
-                              }]`
-                            : `Indexing ${arr.name}[${idxVal}]`
-                        }
+                        className={`px-2.5 py-0.5 rounded text-[11px] font-mono font-bold border ${badgeColor}`}
+                        title={`Active pointer ${ptrName} → ${arr.name}[${idxVal}]`}
                       >
                         {ptrName} = {idxVal}
-                        {idxVal === -1
-                          ? " (-1)"
-                          : isOutOfBounds
-                          ? " (end)"
-                          : ""}
                       </span>
                     );
                   }
@@ -628,9 +759,9 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
               </div>
             </div>
 
-            {/* 1D Bars + Element Cards Strip */}
-            <div className="overflow-x-auto pb-2">
-              <div className="inline-flex items-end gap-3.5 min-w-full pt-12 pb-2 px-2">
+            {/* Horizontal Scroll Container with Generous Non-Shrinking Bar Columns */}
+            <div className="overflow-x-auto overflow-y-hidden pb-4 scrollbar-thin scrollbar-thumb-slate-700">
+              <div className="inline-flex items-end gap-3 min-w-full pt-4 pb-2 px-2">
                 {cells.map((cell, idx) => {
                   const heightPct = cell.isInfinity
                     ? 16
@@ -638,50 +769,67 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                         12,
                         Math.round((Math.abs(cell.barMetric) / maxMetric) * 100)
                       );
-                  const activePtrs = indexToPointers[idx] || [];
+                  const activePtrs = inBoundsBySlot[idx] || [];
                   const isHighlighted = activePtrs.length > 0;
+                  const hasCollision = activePtrs.length > 1;
 
                   return (
                     <div
                       key={`${arr.name}-idx-${idx}`}
-                      className={`flex flex-col items-center group ${
-                        hasCompoundCells ? "min-w-[92px]" : "min-w-[58px]"
+                      className={`flex flex-col items-center flex-shrink-0 group overflow-visible ${
+                        hasCompoundCells
+                          ? "min-w-[96px] w-24"
+                          : "min-w-[56px] w-14"
                       }`}
                     >
-                      {/* Floating Active Index Pointer Badges */}
-                      <div className="min-h-[32px] flex flex-col items-center justify-end gap-1 mb-1.5">
-                        {activePtrs.map((ptr) => (
-                          <div
-                            key={ptr}
-                            className={`px-2 py-0.5 rounded-full text-[11px] font-mono font-extrabold border shadow-sm transition-all duration-200 whitespace-nowrap ${getIndexBadgeStyle(
-                              ptr
-                            )}`}
-                          >
-                            {ptr} ↓
-                          </div>
-                        ))}
+                      {/* Vertically Stacked Multi-Index Pointer Badges */}
+                      <div
+                        style={{ minHeight: `${badgeStackMinHeight}px` }}
+                        className="flex flex-col items-center justify-end gap-1 mb-1.5 overflow-visible z-20"
+                      >
+                        {activePtrs.map((ptr, stackOrderIdx) => {
+                          const badgeColor =
+                            varColorMap.get(ptr) ||
+                            getIndexBadgeStyle(ptr, stackOrderIdx);
+                          return (
+                            <div
+                              key={ptr}
+                              className={`px-2 py-0.5 rounded-full text-[11px] font-mono font-extrabold border shadow-md transition-all duration-200 whitespace-nowrap ${badgeColor}`}
+                            >
+                              {ptr} = {idx} ↓
+                            </div>
+                          );
+                        })}
                       </div>
 
                       {/* Vertical Magnitude Bar */}
                       <div
-                        className={`h-28 ${
-                          hasCompoundCells ? "w-16" : "w-12"
-                        } bg-slate-950/80 rounded-t-lg border border-b-0 border-slate-800/90 flex items-end p-1 overflow-hidden`}
+                        className={`h-28 w-full bg-slate-950/80 rounded-t-lg border border-b-0 flex items-end p-1.5 overflow-hidden transition-colors ${
+                          hasCollision
+                            ? "border-amber-400/90"
+                            : isHighlighted
+                            ? "border-sky-400/80"
+                            : "border-slate-800/90"
+                        }`}
                       >
                         <div
                           style={{ height: `${heightPct}%` }}
                           className={`w-full rounded-t transition-all duration-300 ease-out ${
-                            isHighlighted
+                            hasCollision
+                              ? "bg-gradient-to-t from-amber-600 via-emerald-500 to-sky-400 shadow-[0_0_14px_rgba(251,191,36,0.5)]"
+                              : isHighlighted
                               ? "bg-gradient-to-t from-sky-600 to-sky-400 shadow-[0_0_12px_rgba(56,189,248,0.45)]"
                               : "bg-gradient-to-t from-slate-700 to-slate-500"
                           }`}
                         />
                       </div>
 
-                      {/* Element Card */}
+                      {/* Element Card (Centered & Unclipped) */}
                       <div
-                        className={`w-full py-2 px-2.5 text-center font-mono border rounded-b-md transition-all duration-300 ${
-                          isHighlighted
+                        className={`w-full py-2 px-1.5 text-center font-mono border rounded-b-md transition-all duration-300 ${
+                          hasCollision
+                            ? "bg-amber-950/90 border-amber-400 text-amber-100 shadow-lg scale-105 z-10"
+                            : isHighlighted
                             ? "bg-sky-950/95 border-sky-400 text-sky-100 shadow-md scale-105 z-10"
                             : "bg-slate-950 border-slate-800 text-slate-200"
                         }`}
@@ -691,7 +839,7 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                             {cell.fields.map(([fKey, fVal], fIdx) => (
                               <div
                                 key={fKey}
-                                className={`flex items-center justify-between gap-2 px-1.5 py-0.5 rounded text-[11px] ${
+                                className={`flex items-center justify-between gap-1.5 px-1.5 py-0.5 rounded text-[11px] ${
                                   fIdx === 0
                                     ? "bg-slate-900 text-sky-300 border border-slate-800"
                                     : "text-emerald-300 font-bold"
@@ -703,16 +851,21 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                             ))}
                           </div>
                         ) : (
-                          <span className="text-sm font-bold">
+                          <span
+                            className="block text-sm font-bold truncate"
+                            title={cell.scalarText}
+                          >
                             {cell.scalarText}
                           </span>
                         )}
                       </div>
 
-                      {/* Array Index Footer `[idx]` */}
+                      {/* Centered Array Index Footer `[idx]` */}
                       <div
-                        className={`mt-1.5 text-[11px] font-mono ${
-                          isHighlighted
+                        className={`mt-1.5 text-[11px] font-mono text-center w-full ${
+                          hasCollision
+                            ? "text-amber-400 font-extrabold"
+                            : isHighlighted
                             ? "text-sky-400 font-bold"
                             : "text-slate-500"
                         }`}
