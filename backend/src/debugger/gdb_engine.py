@@ -6,18 +6,21 @@ High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memor
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Deterministic Step-Into for All User Functions (`_should_step_into_current_line`):
-     - Automatically steps into (`-exec-step`) any function call `foo(...)` defined in the
-       user's source code (`self._user_source_identifiers`) that is not a C keyword or
-       standard library routine (`STDLIB_FUNCTIONS`).
-     - If GDB enters a libc/runtime routine on a compound line, `step_next_user_line()`
-       automatically issues `-exec-finish` to return to the user frame.
-  2. Exact Pipelined Call-Stack & Recursive Frame Tracking (`_collect_fast_frame_variables`):
-     - Pipelines `-stack-list-frames` and `-stack-list-variables --simple-values` in a
-       single GDB-MI write cycle to track recursive depth changes (`quick_sort`, `insert`,
-       `cleanup`) accurately without extra IPC round-trips.
-  3. Dedicated Logical Graph Builder (`_build_logical_graph_snapshot`) with Immediate Edge Pruning.
-  4. Three-Stage Physical Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`).
+  1. Scalar Reference Pointer Suppression (`_is_scalar_reference_pointer`):
+     - Inspects local syntactic usage of `T *` parameters (e.g. `void swap(int *a, int *b)`).
+     - Pointers accessed strictly via unary dereference (`*a`, `*b`) without subscripting
+       (`a[i]`), pointer offset arithmetic (`a + i`, `a++`), or heap allocation are treated
+       strictly as scalar references and NEVER inflated into fake `ArraySnapshot` slices.
+     - Retains caller-frame arrays (`arr`) via their base stack address while stepping inside
+       helper routines like `swap`, showing live element swaps in place.
+  2. Three-Stage Physical Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`):
+     - Guarantees that on the immediate step where `free(ptr)` executes (`freed_at_step == step_count`),
+       and on any subsequent step where a dangling local/heap pointer still holds `addr`,
+       the block is emitted with `status="freed"`, `is_freed=True`, `is_dangling=True`, and
+       its frozen pre-free fields.
+     - Purges the block (`status="purged"`) only on subsequent steps after all references vanish.
+  3. Deterministic Step-Into for All User Functions (`_should_step_into_current_line`).
+  4. Dedicated Logical Graph Builder (`_build_logical_graph_snapshot`) with Immediate Edge Pruning.
   5. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`) &
      Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
 """
@@ -381,7 +384,18 @@ class GDBTracer:
 
         self._type_cache: Dict[str, DwarfTypeEntry] = {}
 
-        # Cumulative Session Heap Block Ledger
+        # Cumulative Session Heap Block Ledger:
+        # Maps canonical hex address -> {
+        #   "address": str,
+        #   "status": "active" | "freed" | "purged",
+        #   "type": str,
+        #   "fields": Dict[str, Any],
+        #   "label": str,
+        #   "self_ref_order": List[str],
+        #   "edges": List[GraphEdge],
+        #   "freed_at_step": Optional[int],
+        #   "freed_by_var": Optional[str],
+        # }
         self.heap_blocks: Dict[str, Dict[str, Any]] = {}
         self._freed_addresses: Set[str] = set()
 
@@ -395,10 +409,12 @@ class GDBTracer:
 
         # Depth-keyed call stack variable cache: depth_idx -> (func_name, vars_list)
         self._frame_vars_by_depth: Dict[int, Tuple[str, List[Dict[str, str]]]] = {}
+        self._initialized_vars_by_depth: Dict[int, Set[str]] = {}
         self._active_call_stack: List[str] = ["main"]
 
         # Syntactic analysis caches
         self._syntactic_index_cache: Dict[Tuple[str, str], Set[str]] = {}
+        self._scalar_ref_ptr_cache: Dict[Tuple[str, str], bool] = {}
         self._matrix_subscript_pairs_cache: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
         self._func_body_cache: Dict[str, str] = {}
         self._func_line_span_cache: Dict[str, Tuple[int, int]] = {}
@@ -435,14 +451,27 @@ class GDBTracer:
             return False
         return True
 
-    def _mark_address_freed(self, addr: str) -> None:
+    def _mark_address_freed(
+        self, addr: str, freed_by_var: Optional[str] = None
+    ) -> None:
+        r"""
+        Transitions `addr` to `"status": "freed"` in `self.heap_blocks`, freezes its
+        last known valid struct fields, and records `freed_at_step = self.step_count`
+        so the immediate post-free snapshot always retains the `[FREED]` card.
+        """
         self._freed_addresses.add(addr)
         self._address_bounds_ledger.pop(addr, None)
+        clean_var = (
+            freed_by_var.split("->")[-1].split(".")[-1].strip()
+            if freed_by_var
+            else None
+        )
         if addr in self.heap_blocks:
-            if self.heap_blocks[addr].get("status") != "purged":
-                self.heap_blocks[addr]["status"] = "freed"
+            self.heap_blocks[addr]["status"] = "freed"
             if self.heap_blocks[addr].get("freed_at_step") is None:
                 self.heap_blocks[addr]["freed_at_step"] = self.step_count
+            if clean_var:
+                self.heap_blocks[addr]["freed_by_var"] = clean_var
         else:
             self.heap_blocks[addr] = {
                 "address": addr,
@@ -453,6 +482,7 @@ class GDBTracer:
                 "self_ref_order": [],
                 "edges": [],
                 "freed_at_step": self.step_count,
+                "freed_by_var": clean_var,
             }
 
     def _is_address_freed(self, addr: str) -> bool:
@@ -563,10 +593,6 @@ class GDBTracer:
     def _cmd_batch_tokenized(
         self, mi_commands: List[str], timeout: float = STEP_INACTIVITY_TIMEOUT_SEC
     ) -> Dict[int, Dict[str, Any]]:
-        r"""
-        Pipelines multiple arbitrary GDB-MI commands in a single pipe write and waits
-        until every dispatched token returns its `result` record.
-        """
         self._check_budget()
         if not self.gdb or not mi_commands:
             return {}
@@ -734,6 +760,11 @@ class GDBTracer:
         return False
 
     def _record_pending_free_on_current_line(self) -> None:
+        r"""
+        Intercepts `free(expr)` on `self._current_line` BEFORE GDB steps over it,
+        evaluates the target pointer address, and marks the block as `"freed"`
+        with `freed_at_step = self.step_count` and `freed_by_var = expr`.
+        """
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line].split("//")[0]
             free_exprs = [
@@ -741,20 +772,14 @@ class GDBTracer:
             ]
             if free_exprs:
                 eval_map = self._eval_expr_batch(free_exprs)
-                for raw_addr in eval_map.values():
+                for expr_str, raw_addr in eval_map.items():
                     addr = extract_hex_address(raw_addr or "")
                     if addr and self._is_valid_heap_or_data_address(addr):
-                        self._mark_address_freed(addr)
+                        self._mark_address_freed(addr, freed_by_var=expr_str)
 
     def _get_function_line_span(
         self, func_name: str, anchor_line: int
     ) -> Tuple[int, int]:
-        r"""
-        Locates `(header_line, end_line)` for `func_name` in `self._source_lines`.
-        Searches backwards from `anchor_line` first, and if not found, searches forwards
-        across the entire source file (`1 .. total_lines - 1`) so functions defined anywhere
-        in `target.c` are always resolved.
-        """
         if func_name in self._func_line_span_cache:
             return self._func_line_span_cache[func_name]
 
@@ -857,17 +882,31 @@ class GDBTracer:
         return None
 
     def _is_uninitialized_at_line(
-        self, func_name: str, var_name: str, current_line: int
+        self, func_name: str, var_name: str, current_line: int, curr_depth: int = 0
     ) -> bool:
+        r"""
+        Returns True if `var_name` has NOT yet executed its declaration/initialization
+        in the current frame depth (`curr_depth`).
+        Once `var_name` has executed past its declaration line in `curr_depth` (e.g. on
+        iteration 1 of a `while` loop), it is recorded in `self._initialized_vars_by_depth[curr_depth]`
+        so on iteration 2+ when execution jumps back to `while (...)` or `SNode *tmp = head;`,
+        `tmp` retains its previous iteration's (potentially dangling) pointer value until
+        the declaration line executes again.
+        """
         decl_info = self._get_var_declaration_info(func_name, var_name, current_line)
         if decl_info is None:
             return False
         decl_line, has_init = decl_info
-        if current_line < decl_line:
-            return True
-        if current_line == decl_line and has_init:
-            return True
-        return False
+        init_set = self._initialized_vars_by_depth.setdefault(curr_depth, set())
+
+        if current_line > decl_line or (current_line == decl_line and not has_init):
+            init_set.add(var_name)
+            return False
+
+        if var_name in init_set:
+            return False
+
+        return True
 
     # ==========================================================================
     # Deterministic Step-Into for All User Functions
@@ -895,15 +934,6 @@ class GDBTracer:
         return inner_body
 
     def _should_step_into_current_line(self) -> bool:
-        r"""
-        Deterministic Step-Into Rule:
-        Inspects the current source line (with comments and string literals stripped).
-        If it contains ANY function call `foo(...)` where `foo` is:
-          1. NOT a C control/syntax keyword (`if`, `for`, `while`, `sizeof`, etc.),
-          2. NOT a standard library routine (`malloc`, `free`, `printf`, etc.), and
-          3. Defined in the user's source code (`self._user_source_identifiers`),
-        ALWAYS returns `True` to trigger `-exec-step`.
-        """
         if not (1 <= self._current_line < len(self._source_lines)):
             return False
 
@@ -957,6 +987,80 @@ class GDBTracer:
             and self._current_line > 0
             and self._current_func not in SYSTEM_ENTRY_FUNCTIONS
         )
+
+    # ==========================================================================
+    # Syntactic Scalar-Reference vs. Array-Pointer Classifier
+    # ==========================================================================
+
+    def _is_scalar_reference_pointer(
+        self, func_name: str, ptr_name: str, anchor_line: int
+    ) -> bool:
+        r"""
+        Determines purely from the local AST/tokens of `func_name` whether a primitive
+        pointer `T *ptr_name` (such as `int *a, int *b` in `swap(int *a, int *b)`) is a
+        scalar pass-by-reference pointer rather than an array buffer:
+          - If `ptr_name` has array subscripts (`ptr_name[...]`), pointer offset arithmetic
+            (`*(ptr_name + ...)`, `ptr_name + i`, `ptr_name++`, `ptr_name--`, `ptr_name +=`),
+            or heap allocation (`ptr_name = malloc(...)`) inside `func_name`, returns `False`
+            (it IS used as an array/buffer).
+          - If `ptr_name` has NO array subscripts or offset arithmetic in `func_name`, and
+            IS accessed via unary dereference (`*ptr_name`), returns `True` (strictly a
+            scalar pass-by-reference pointer; NEVER emit an `ArraySnapshot`).
+        """
+        clean_ptr = ptr_name.split(":")[-1].strip()
+        cache_key = (func_name, clean_ptr)
+        if cache_key in self._scalar_ref_ptr_cache:
+            return self._scalar_ref_ptr_cache[cache_key]
+
+        body = self._extract_function_body_by_name(func_name, anchor_line)
+        if not body:
+            self._scalar_ref_ptr_cache[cache_key] = False
+            return False
+
+        esc = re.escape(clean_ptr)
+
+        # 1. Check for array subscript access: `ptr[...]`
+        has_subscript = bool(re.search(rf"\b{esc}\s*\[", body))
+        if has_subscript:
+            self._scalar_ref_ptr_cache[cache_key] = False
+            return False
+
+        # 2. Check for pointer offset arithmetic or cursor increment: `*(ptr + ...)`, `ptr + offset`, `ptr++`, `++ptr`, `ptr +=`
+        has_ptr_arith = bool(
+            re.search(
+                rf"\*\s*\(\s*(?:{esc}\s*[\+\-]|[^\)]+\+\s*{esc}\b)"
+                rf"|\b{esc}\s*(?:\+\+|--|\+=|-=)"
+                rf"|(?:\+\+|--)\s*{esc}\b",
+                body,
+            )
+        )
+        if has_ptr_arith:
+            self._scalar_ref_ptr_cache[cache_key] = False
+            return False
+
+        # 3. Check for dynamic allocation: `ptr = malloc(...)`
+        has_alloc = bool(
+            re.search(
+                rf"\b{esc}\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(",
+                body,
+            )
+        )
+        if has_alloc:
+            self._scalar_ref_ptr_cache[cache_key] = False
+            return False
+
+        # 4. Check for unary dereference `*ptr` (e.g. `int t = *a; *a = *b; *b = t;`)
+        #    Note: Since `body` starts at the opening `{` of the function body, parameter
+        #    declarations like `void swap(int *a, int *b)` are already excluded.
+        has_unary_deref = bool(
+            re.search(rf"(?<![a-zA-Z0-9_])\*\s*{esc}\b(?!\s*\[)", body)
+        )
+        if has_unary_deref:
+            self._scalar_ref_ptr_cache[cache_key] = True
+            return True
+
+        self._scalar_ref_ptr_cache[cache_key] = False
+        return False
 
     # ==========================================================================
     # Syntactic Subscript, Positional 2D Matrix Access & Bound Proof Engine
@@ -1233,6 +1337,19 @@ class GDBTracer:
             array_name=array_name,
         )
 
+        # If currently inside a helper like `swap(int *a, int *b)` where `array_name` (`arr`)
+        # is not directly mentioned, also check caller functions on the active call stack
+        if not proven_index_names and len(self._active_call_stack) > 1:
+            for caller_fn in reversed(self._active_call_stack[:-1]):
+                caller_proven = self._get_syntactically_proven_indices(
+                    func_name=caller_fn,
+                    anchor_line=1,
+                    array_name=array_name,
+                )
+                if caller_proven:
+                    proven_index_names = caller_proven
+                    break
+
         active: Dict[str, int] = {}
         for var_name, val in scalar_ints.items():
             if var_name not in proven_index_names:
@@ -1293,6 +1410,7 @@ class GDBTracer:
         if ptr_leaf_name not in self._alloc_bound_expr_cache:
             candidates: List[str] = []
             esc = re.escape(ptr_leaf_name)
+            # 1. Explicit heap allocation: `ptr = malloc(BOUND * ...)`
             alloc_re = re.compile(
                 rf"\b{esc}\s*(?:\[[^\]]+\])?\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(\s*([^,\)\*]+)"
             )
@@ -1301,27 +1419,21 @@ class GDBTracer:
                     if ident not in candidates:
                         candidates.append(ident)
 
-            bound_re = re.compile(rf"<\s*([a-zA-Z_][a-zA-Z0-9_]*)\b")
-            for m in bound_re.finditer(self._full_clean_source):
-                ident = m.group(1)
-                if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
-                    candidates.append(ident)
+            # 2. Only extract `< BOUND` or `BOUND - 1` from functions that actually subscript `ptr_leaf_name`!
+            if re.search(rf"\b{esc}\s*\[", self._full_clean_source):
+                bound_re = re.compile(r"<\s*([a-zA-Z_][a-zA-Z0-9_]*)\b")
+                for m in bound_re.finditer(self._full_clean_source):
+                    ident = m.group(1)
+                    if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
+                        candidates.append(ident)
 
-            minus_one_re = re.compile(
-                r"\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*-\s*1\b"
-            )
-            for m in minus_one_re.finditer(self._full_clean_source):
-                ident = m.group(1)
-                if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
-                    candidates.append(ident)
-
-            plus_one_re = re.compile(
-            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\+\s*1\b"
-            )
-            for m in plus_one_re.finditer(self._full_clean_source):
-                ident = m.group(1)
-                if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
-                    candidates.append(ident)
+                minus_one_re = re.compile(
+                    r"\b[a-zA-Z_][a-zA-Z0-9_]*\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*-\s*1\b"
+                )
+                for m in minus_one_re.finditer(self._full_clean_source):
+                    ident = m.group(1)
+                    if ident not in C_SYNTAX_KEYWORDS and ident not in candidates:
+                        candidates.append(ident)
 
             self._alloc_bound_expr_cache[ptr_leaf_name] = candidates
 
@@ -1615,18 +1727,16 @@ class GDBTracer:
         return (False, "primitive", clean_type or "int")
 
     def _collect_fast_frame_variables(self) -> Tuple[List[str], List[Dict[str, Any]]]:
-        r"""
-        Pipelines `-stack-list-frames` and `-stack-list-variables --simple-values`
-        in a single GDB-MI write to obtain the exact recursive call stack and active
-        frame variables without extra pipe round-trips.
-        """
         batch_res = self._cmd_batch_tokenized(
             ["-stack-list-frames", "-stack-list-variables --simple-values"]
         )
 
-        # 1. Reconstruct exact user call stack from `-stack-list-frames`
         frames_record = batch_res.get(0, {})
-        raw_stack = frames_record.get("payload", {}).get("stack", []) if isinstance(frames_record.get("payload"), dict) else []
+        raw_stack = (
+            frames_record.get("payload", {}).get("stack", [])
+            if isinstance(frames_record.get("payload"), dict)
+            else []
+        )
         user_call_stack: List[str] = []
 
         for f_entry in reversed(raw_stack):
@@ -1644,11 +1754,10 @@ class GDBTracer:
         self._active_call_stack = user_call_stack
         curr_depth = len(self._active_call_stack) - 1
 
-        # Purge any cached frame variables from deeper recursive levels that have already returned
         for stale_depth in [d for d in self._frame_vars_by_depth if d > curr_depth]:
             self._frame_vars_by_depth.pop(stale_depth, None)
+            self._initialized_vars_by_depth.pop(stale_depth, None)
 
-        # 2. Extract leaf frame variables from `-stack-list-variables --simple-values`
         vars_record = batch_res.get(1, {})
         current_frame_vars: List[Dict[str, str]] = (
             vars_record.get("payload", {}).get("variables", [])
@@ -1663,7 +1772,7 @@ class GDBTracer:
             if not self._is_valid_user_symbol(v_name, v_type):
                 continue
             if self._is_uninitialized_at_line(
-                self._current_func, v_name, self._current_line
+                self._current_func, v_name, self._current_line, curr_depth
             ):
                 continue
             filtered_leaf_vars.append(v)
@@ -1686,6 +1795,7 @@ class GDBTracer:
                 seen_pointer_addrs.add(addr)
             v_copy: Dict[str, Any] = dict(v)
             v_copy["frame_level"] = 0
+            v_copy["owner_func"] = self._current_func
             merged_vars.append(v_copy)
 
         for depth_idx in range(curr_depth - 1, -1, -1):
@@ -1707,12 +1817,14 @@ class GDBTracer:
                         seen_pointer_addrs.add(addr)
                     v_copy = dict(v)
                     v_copy["frame_level"] = curr_depth - depth_idx
+                    v_copy["owner_func"] = caller_fn
                     merged_vars.append(v_copy)
                 elif addr and addr not in seen_pointer_addrs:
                     seen_pointer_addrs.add(addr)
                     v_copy = dict(v)
                     v_copy["name"] = f"{caller_fn}#{depth_idx}:{v_name}"
                     v_copy["frame_level"] = curr_depth - depth_idx
+                    v_copy["owner_func"] = caller_fn
                     merged_vars.append(v_copy)
 
         return (list(self._active_call_stack), merged_vars)
@@ -1771,6 +1883,7 @@ class GDBTracer:
                 "self_ref_order": [],
                 "edges": [],
                 "freed_at_step": None,
+                "freed_by_var": None,
             }
 
     def inspect_state(self) -> Optional[ExecutionSnapshot]:
@@ -1788,9 +1901,9 @@ class GDBTracer:
         scalar_ints: Dict[str, int] = {}
         leaf_scalar_ints: Dict[str, int] = {}
         active_struct_ptrs: Dict[str, Tuple[str, str]] = {}
-        raw_array_vars: List[Tuple[str, str, int, int]] = []
+        raw_array_vars: List[Tuple[str, str, int, int, str]] = []
         raw_2d_array_vars: List[Tuple[str, str, int, int, int]] = []
-        raw_ptr_vars: List[Tuple[str, str, str, int]] = []
+        raw_ptr_vars: List[Tuple[str, str, str, int, str]] = []
         raw_2d_ptr_vars: List[Tuple[str, str, str, int]] = []
         raw_struct_ptr_array_vars: List[Tuple[str, str, str, int]] = []
 
@@ -1802,6 +1915,7 @@ class GDBTracer:
             v_type = v.get("type", "").strip()
             v_val = v.get("value", "")
             f_level = int(v.get("frame_level", 0))
+            owner_fn = str(v.get("owner_func", self._current_func))
 
             if not self._is_valid_user_symbol(v_name, v_type):
                 continue
@@ -1821,11 +1935,11 @@ class GDBTracer:
             if arr_match:
                 elem_type = arr_match.group(1).strip()
                 arr_len = min(int(arr_match.group(2)), MAX_ARRAY_ELEMENTS)
+                clean_arr_name = v_name.split(":")[-1]
+                addr_cache_key = (owner_fn, clean_arr_name)
                 if f_level == 0:
-                    raw_array_vars.append((v_name, elem_type, arr_len, f_level))
-                    addr_cache_key = (self._current_func, v_name)
                     if addr_cache_key not in self._stack_var_addr_cache:
-                        base_addr_raw = self._eval_expr(f"&{v_name}[0]")
+                        base_addr_raw = self._eval_expr(f"&{clean_arr_name}[0]")
                         base_addr = extract_hex_address(base_addr_raw or "")
                         if base_addr:
                             self._stack_var_addr_cache[addr_cache_key] = base_addr
@@ -1833,6 +1947,7 @@ class GDBTracer:
                     else:
                         base_addr = self._stack_var_addr_cache[addr_cache_key]
                         self._address_bounds_ledger[base_addr] = arr_len
+                raw_array_vars.append((clean_arr_name, elem_type, arr_len, f_level, owner_fn))
                 continue
 
             type_kind, resolved_target = self._resolve_type_info(v_type)
@@ -1855,7 +1970,7 @@ class GDBTracer:
                     raw_2d_ptr_vars.append((v_name, resolved_target, addr, f_level))
                 continue
 
-            # 1E: Single Struct Pointer or Typedef-Pointer (`TreeNode *root`, `node head`)
+            # 1E: Single Struct Pointer or Typedef-Pointer (`SNode *head`, `SNode *tmp`, `TreeNode *root`)
             if type_kind == "struct_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
@@ -1878,16 +1993,25 @@ class GDBTracer:
                         "self_ref_order": [],
                         "edges": [],
                         "freed_at_step": None,
+                        "freed_by_var": None,
                     }
                 continue
 
-            # 1F: 1D Primitive Pointer (`const int *arr` in `binary_search`, `int *arr` in `quick_sort`)
+            # 1F: 1D Primitive Pointer (`const int *arr` in `binary_search`, or scalar `int *a` in `swap`)
             if type_kind == "primitive_ptr":
                 addr = extract_hex_address(v_val)
                 if f_level == 0:
                     locals_out[v_name] = addr if addr else "0x0"
-                if addr:
-                    raw_ptr_vars.append((v_name, resolved_target, addr, f_level))
+                if not addr:
+                    continue
+
+                # Suppress scalar pass-by-reference pointers (`*a`, `*b` in `swap`)
+                if self._is_scalar_reference_pointer(
+                    owner_fn, v_name, self._current_line if f_level == 0 else 1
+                ):
+                    continue
+
+                raw_ptr_vars.append((v_name, resolved_target, addr, f_level, owner_fn))
                 continue
 
             # 1G: Struct by Value on User Stack
@@ -1949,6 +2073,7 @@ class GDBTracer:
                                     "self_ref_order": [],
                                     "edges": [],
                                     "freed_at_step": None,
+                                    "freed_by_var": None,
                                 }
             else:
                 comp_snap = self._extract_struct_array_field(
@@ -1966,26 +2091,40 @@ class GDBTracer:
                     arrays_snapshot.append(comp_snap)
 
         # ----------------------------------------------------------------------
-        # Pass 2: Evaluate 1D Arrays (Including Decayed Stack/Heap Pointers) & 2D Matrices
+        # Pass 2: Evaluate 1D Arrays (Including Caller/Decayed Arrays) & 2D Matrices
         # ----------------------------------------------------------------------
-        array_eval_specs: List[Tuple[str, str, str, int, bool, str]] = []
+        array_eval_specs: List[Tuple[str, str, str, int, bool, str, int]] = []
         seen_array_names: Set[str] = set()
 
-        for arr_name, elem_type, arr_len, _ in raw_array_vars:
-            seen_array_names.add(arr_name)
+        for arr_name, elem_type, arr_len, f_level, owner_fn in raw_array_vars:
+            if arr_name in seen_array_names:
+                continue
             elem_kind, elem_resolved = self._resolve_type_info(elem_type)
             is_comp = elem_kind == "struct_val" and not self._has_struct_pointer_links(elem_resolved)
+            if f_level == 0:
+                expr_to_eval = arr_name
+            else:
+                cached_base = self._stack_var_addr_cache.get((owner_fn, arr_name))
+                if not cached_base:
+                    continue
+                expr_to_eval = f"*({elem_type}[{arr_len}]*)({cached_base})"
+
+            seen_array_names.add(arr_name)
             array_eval_specs.append(
-                (arr_name, arr_name, elem_type, arr_len, is_comp, elem_resolved if is_comp else elem_type)
+                (arr_name, expr_to_eval, elem_type, arr_len, is_comp, elem_resolved if is_comp else elem_type, f_level)
             )
 
-        for ptr_name, elem_type, addr, f_level in raw_ptr_vars:
+        for ptr_name, elem_type, addr, f_level, owner_fn in raw_ptr_vars:
             clean_ptr_name = ptr_name.split(":")[-1]
             if clean_ptr_name in seen_array_names:
                 continue
             if (
                 self._is_address_freed(addr)
                 or not self._is_valid_memory_buffer_address(addr)
+            ):
+                continue
+            if self._is_scalar_reference_pointer(
+                owner_fn, clean_ptr_name, self._current_line if f_level == 0 else 1
             ):
                 continue
             if f_level != 0 and clean_ptr_name in locals_out:
@@ -2001,18 +2140,19 @@ class GDBTracer:
                 seen_array_names.add(clean_ptr_name)
                 deref_expr = f"*({elem_type}[{inferred_len}]*)({addr})"
                 array_eval_specs.append(
-                    (clean_ptr_name, deref_expr, elem_type, inferred_len, False, elem_type)
+                    (clean_ptr_name, deref_expr, elem_type, inferred_len, False, elem_type, f_level)
                 )
 
         if array_eval_specs:
             batch_exprs = [spec[1] for spec in array_eval_specs]
             batch_results = self._eval_expr_batch(batch_exprs)
 
-            for arr_name, expr_key, elem_type, cap_len, is_comp, resolved_el_type in array_eval_specs:
+            for arr_name, expr_key, elem_type, cap_len, is_comp, resolved_el_type, f_level in array_eval_specs:
                 expr_val = batch_results.get(expr_key)
                 if not expr_val:
                     continue
                 raw_items = parse_gdb_array(expr_val, max_elems=cap_len)[:cap_len]
+                idx_source_scalars = leaf_scalar_ints if f_level == 0 and leaf_scalar_ints else scalar_ints
                 if is_comp:
                     compound_elems: List[Dict[str, Any]] = []
                     for item_str in raw_items:
@@ -2022,7 +2162,7 @@ class GDBTracer:
                                 compound_elems.append(rec)
                     if compound_elems:
                         active_idx = self._collect_active_indices(
-                            leaf_scalar_ints, len(compound_elems), array_name=arr_name
+                            idx_source_scalars, len(compound_elems), array_name=arr_name
                         )
                         arrays_snapshot.append(
                             ArraySnapshot(
@@ -2040,7 +2180,7 @@ class GDBTracer:
                     elements = [format_scalar_val(x) for x in raw_items]
                     if elements:
                         active_idx = self._collect_active_indices(
-                            leaf_scalar_ints, len(elements), array_name=arr_name
+                            idx_source_scalars, len(elements), array_name=arr_name
                         )
                         arrays_snapshot.append(
                             ArraySnapshot(
@@ -2174,7 +2314,6 @@ class GDBTracer:
 
         # ----------------------------------------------------------------------
         # Pass 4: Build Dedicated Mathematical Logical Graph G = (V, E)
-        #         with Immediate Deallocated Edge Pruning
         # ----------------------------------------------------------------------
         logical_payload = self._build_logical_graph_snapshot(
             physical_graph=graph_snapshot,
@@ -2535,6 +2674,16 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
+        r"""
+        Crawls all reachable struct nodes starting from `active_struct_ptrs` AND
+        any block freed on the immediate step transition (`freed_at_step == self.step_count`):
+          - Blocks freed on the immediate step (`freed_at_step == self.step_count`) or still
+            referenced by any live local/heap pointer (`reference_counts[addr] > 0`) are
+            emitted with `status="freed"`, `is_freed=True`, `is_dangling=True`, and their
+            frozen pre-free `fields`.
+          - On subsequent steps (`self.step_count > freed_at_step`), once `reference_counts[addr] == 0`,
+            the freed block transitions to `"purged"` and is omitted from the snapshot.
+        """
         emitted_node_ids: Set[str] = set()
         queued_addresses: Set[str] = set()
         reference_counts: Dict[str, int] = {}
@@ -2546,6 +2695,7 @@ class GDBTracer:
         addr_to_ptr_names: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, str, str]] = []
 
+        # 1. Seed from all live stack pointers across active call stack frames
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
@@ -2557,6 +2707,29 @@ class GDBTracer:
                 if addr not in queued_addresses:
                     queued_addresses.add(addr)
                     frontier.append((addr, s_type, display_ptr))
+
+        # 2. Seed any block freed on the IMMEDIATE step (`freed_at_step == self.step_count`)
+        #    so sequential loops like `while (head) { tmp = head; head = head->next; free(tmp); }`
+        #    ALWAYS render the `[FREED]` card on the step `free(tmp)` executes!
+        for blk_addr, blk_info in list(self.heap_blocks.items()):
+            if (
+                blk_info.get("status") == "freed"
+                and blk_info.get("freed_at_step") == self.step_count
+                and self._is_valid_heap_or_data_address(blk_addr)
+            ):
+                freed_var = blk_info.get("freed_by_var")
+                if freed_var and freed_var not in addr_to_ptr_names.get(blk_addr, []):
+                    addr_to_ptr_names.setdefault(blk_addr, []).append(freed_var)
+                reference_counts[blk_addr] = reference_counts.get(blk_addr, 0) + 1
+                if blk_addr not in queued_addresses:
+                    queued_addresses.add(blk_addr)
+                    frontier.append(
+                        (
+                            blk_addr,
+                            blk_info.get("type", "struct"),
+                            freed_var or "freed",
+                        )
+                    )
 
         while frontier and len(nodes) < MAX_GRAPH_NODES:
             current_batch = frontier[: MAX_GRAPH_NODES - len(nodes)]
@@ -2591,21 +2764,32 @@ class GDBTracer:
                     for saved_edge in blk.get("edges", []):
                         tgt = saved_edge.target
                         tgt_blk = self.heap_blocks.get(tgt)
-                        if (
-                            tgt_blk
-                            and tgt_blk.get("status") == "freed"
-                            and (tgt_blk.get("freed_at_step") or 0) <= (blk.get("freed_at_step") or self.step_count)
-                        ):
-                            reference_counts[tgt] = reference_counts.get(tgt, 0) + 1
+                        # Follow frozen edges either to active nodes (e.g. `tmp->next` pointing to new `head`)
+                        # or to previously freed child nodes in a post-order tree cleanup
+                        if tgt_blk and tgt_blk.get("status") in {"active", "freed"}:
+                            if tgt_blk.get("status") == "freed":
+                                if (tgt_blk.get("freed_at_step") or 0) <= (
+                                    blk.get("freed_at_step") or self.step_count
+                                ):
+                                    reference_counts[tgt] = (
+                                        reference_counts.get(tgt, 0) + 1
+                                    )
+                                    if (
+                                        tgt not in queued_addresses
+                                        and tgt not in emitted_node_ids
+                                    ):
+                                        queued_addresses.add(tgt)
+                                        frontier.append(
+                                            (
+                                                tgt,
+                                                tgt_blk.get("type", saved_type),
+                                                f"{owner_name}->{saved_edge.label}",
+                                            )
+                                        )
                             edge_key = (saved_edge.source, tgt, saved_edge.label)
                             if edge_key not in seen_edges:
                                 seen_edges.add(edge_key)
                                 edges.append(saved_edge)
-                            if tgt not in queued_addresses and tgt not in emitted_node_ids:
-                                queued_addresses.add(tgt)
-                                frontier.append(
-                                    (tgt, tgt_blk.get("type", saved_type), f"{owner_name}->{saved_edge.label}")
-                                )
                 else:
                     active_candidates.append((addr, struct_type, owner_name))
 
@@ -2991,6 +3175,7 @@ class GDBTracer:
                                 "self_ref_order": [],
                                 "edges": [],
                                 "freed_at_step": None,
+                                "freed_by_var": None,
                             }
 
                         if target_addr not in queued_addresses and target_addr not in emitted_node_ids:
@@ -3020,6 +3205,7 @@ class GDBTracer:
                     "self_ref_order": list(self_ref_fields_ordered),
                     "edges": list(node_outgoing_edges),
                     "freed_at_step": None,
+                    "freed_by_var": None,
                 }
 
                 nodes.append(
@@ -3040,9 +3226,20 @@ class GDBTracer:
 
             frontier.extend(next_frontier)
 
+        # Prune any edge whose target was not emitted in `nodes`
+        edges = [
+            e
+            for e in edges
+            if e.source in emitted_node_ids and e.target in emitted_node_ids
+        ]
+
+        # Transition `"freed"` blocks with 0 live references (on steps after `freed_at_step`) to `"purged"`
         for blk_addr, blk_info in self.heap_blocks.items():
             if blk_info.get("status") == "freed":
-                if reference_counts.get(blk_addr, 0) == 0:
+                if (
+                    blk_info.get("freed_at_step") != self.step_count
+                    and reference_counts.get(blk_addr, 0) == 0
+                ):
                     blk_info["status"] = "purged"
 
         return (
