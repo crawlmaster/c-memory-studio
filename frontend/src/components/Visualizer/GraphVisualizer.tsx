@@ -3,22 +3,20 @@
  * Topology-Aware DWARF Graph, Tree, Linear-List & Pointer Mesh Visualizer.
  *
  * Key Capabilities:
- * 1. Structural Separation of Stack/Header Containers from Homogeneous Heap Chains:
- *    - `partitionContainersAndBackbone()` isolates non-self-referential container structs
- *      (in-degree 0, `self_ref_order.length === 0`, pointing to a distinct struct type)
- *      from the underlying heap node backbone.
- *    - `detectTopology()` evaluates the backbone subgraph so structures like `Queue { front, rear }`
- *      pointing to both ends of a `10 -> 20 -> 30 -> 40` list are accurately classified as
- *      `'linear-list'` instead of a cyclic mesh.
- *    - In `'linear-list'` mode (`rankDir: 'LR'`), backbone nodes render in a straight horizontal
- *      sequence while container headers sit cleanly centered above their target range.
- * 2. Edge-Sensitive `topologyKey` & Automatic Animated Re-Layout:
- *    - Includes sorted `source->target:label` edge signatures in `topologyKey` across both
- *      Logical and Physical modes so edge redirections (e.g. DSU path halving `Node 2 -> Node 6`)
- *      automatically trigger a smooth 250ms animated layout update without manual clicks.
- * 3. Three-Stage Physical Heap Lifecycle & Logical Graph Pruning:
- *    - Renders `[FREED]` / `[FREED · DANGLING]` cards in Physical mode and 300ms fade-out
- *      pulses for pruned edges in Logical mode.
+ * 1. Parallel Edge Separation & Node-Position Routing:
+ *    - Uses `curve-style: 'bezier'`, `control-point-step-size: 58`, and
+ *      `edge-distances: 'node-position'` so parallel or co-directional pointers
+ *      never blend into a single line.
+ * 2. Edge Label Legibility & Z-Depth Layering:
+ *    - Offsets edge labels (`text-margin-y: -8`) with an opaque `#0f172a` pill background
+ *      (`text-background-opacity: 1`, `text-background-padding: '3px'`, `text-border-width: 1`,
+ *      `text-border-color: '#334155'`) and places edges at `z-compound-depth: 'bottom'`
+ *      beneath node cards.
+ * 3. Ample Dagre & Multi-Lane Horizontal Clearance:
+ *    - Enforces minimum `rankSep >= 110px` and `nodeSep >= 80px` border-to-border spacing.
+ *    - Positions multi-bucket container headers (e.g. `Graph` with `adj[0..V-1]`) in a
+ *      dedicated left column beside their horizontal bucket chains so outgoing bucket
+ *      arrows never run vertically through sibling cards.
  */
 
 import React, {
@@ -172,13 +170,7 @@ function normalizeStructType(node: ExtendedGraphNode): string {
 
 /**
  * Purely structural partition separating stack/header container structs from
- * homogeneous heap backbone nodes (Zero Hardcoded Names):
- * A node is classified as a container header iff:
- *   1. It has `inDegree === 0` (no other struct points to it),
- *   2. It has `outDegree >= 1`,
- *   3. It has no self-referential pointer fields (`(n.self_ref_order?.length ?? 0) === 0`), and
- *   4. All of its outgoing edges target structs of a DIFFERENT C type (or structs that
- *      possess self-referential pointer fields `self_ref_order.length > 0`).
+ * homogeneous heap backbone nodes (Zero Hardcoded Names).
  */
 function partitionContainersAndBackbone(
   nodes: ExtendedGraphNode[],
@@ -242,7 +234,6 @@ function partitionContainersAndBackbone(
     }
   });
 
-  // Never classify all nodes as containers
   if (containerIds.size === 0 || containerIds.size >= nodes.length) {
     return {
       containerNodes: [],
@@ -269,12 +260,7 @@ function partitionContainersAndBackbone(
 }
 
 /**
- * Automatic Dynamic Topology Classifier (Zero Hardcoding):
- * 1. Filters out external container headers (e.g. `Queue` with `front`/`rear` pointers)
- *    so multi-pointer container links do not create false undirected cycles in a 1D chain.
- * 2. Collapses symmetric pointer pairs (`u -> v` and `v -> u`, e.g. doubly-linked lists)
- *    into single bidirectional links.
- * 3. Classifies the backbone into `'linear-list'`, `'tree'`, or `'general-graph'`.
+ * Automatic Dynamic Topology Classifier (Zero Hardcoding).
  */
 export function detectTopology(
   nodes: ExtendedGraphNode[],
@@ -400,8 +386,10 @@ export function detectTopology(
 
 /**
  * Dimension-Aware Dagre Hierarchical Layout Engine (`rankDir: 'LR'` & `rankDir: 'TB'`).
- * In `'LR'` mode, lays out the homogeneous backbone chain in a straight horizontal line
- * and positions any container headers (`Queue`, `List`, etc.) cleanly centered above the chain.
+ * Enforces minimum `rankSep >= 110px` and `nodeSep >= 80px` border-to-border clearance.
+ * When a container header fans out to multiple horizontal chains (e.g. `Graph` -> `adj[0..V-1]`),
+ * places the container in a dedicated left column so fan-out edges never cut vertically through
+ * bucket cards.
  */
 function computeDagreHierarchicalPositions(
   nodes: ExtendedGraphNode[],
@@ -415,6 +403,9 @@ function computeDagreHierarchicalPositions(
 ): Record<string, { x: number; y: number }> {
   const positions: Record<string, { x: number; y: number }> = {};
   if (nodes.length === 0) return positions;
+
+  const effectiveNodeSep = Math.max(80, config.nodeSep);
+  const effectiveRankSep = Math.max(110, config.rankSep);
 
   const nodeMap = new Map<string, ExtendedGraphNode>();
   const nodeDims = new Map<string, { width: number; height: number }>();
@@ -431,7 +422,7 @@ function computeDagreHierarchicalPositions(
     (e) => nodeMap.has(e.source) && nodeMap.has(e.target) && e.source !== e.target
   );
 
-  // Mode 1: Horizontal 1D Linear List (`rankDir: 'LR'`) with Container Isolation
+  // Mode 1: Horizontal 1D Linear List / Multi-Lane Bucket Chains (`rankDir: 'LR'`)
   if (config.rankDir === "LR") {
     const { containerNodes, backboneNodes, backboneEdges } =
       partitionContainersAndBackbone(nodes, allValidEdges);
@@ -462,11 +453,28 @@ function computeDagreHierarchicalPositions(
       }
     });
 
+    // If a container has indexed outgoing edges (`adj[0]`, `adj[1]`, ...), preserve bucket index order
+    const bucketOrderByNodeId = new Map<string, number>();
+    containerNodes.forEach((cNode) => {
+      allValidEdges
+        .filter((e) => e.source === cNode.id)
+        .forEach((e, idx) => {
+          const m = INDEXED_EDGE_RE.exec(e.label || "");
+          const orderVal = m ? Number(m[2]) : e.field_order_idx ?? idx;
+          if (!bucketOrderByNodeId.has(e.target)) {
+            bucketOrderByNodeId.set(e.target, orderVal);
+          }
+        });
+    });
+
     const visited = new Set<string>();
-    const baseRowY = containerNodes.length > 0 ? 250 : 180;
-    let currentRowY = baseRowY;
+    const chains: string[][] = [];
 
     const sortedCandidates = [...chainNodes].sort((a, b) => {
+      const aBucket = bucketOrderByNodeId.get(a.id) ?? 9999;
+      const bBucket = bucketOrderByNodeId.get(b.id) ?? 9999;
+      if (aBucket !== bBucket) return aBucket - bBucket;
+
       const aIn = forwardInDeg.get(a.id) ?? 0;
       const bIn = forwardInDeg.get(b.id) ?? 0;
       if (aIn !== bIn) return aIn - bIn;
@@ -505,50 +513,74 @@ function computeDagreHierarchicalPositions(
           curr = fallbackNbr;
         }
       }
+      chains.push(chain);
+    }
 
-      let cursorX = 140;
+    // Distinguish between a multi-lane container (e.g. `Graph` pointing to >=2 separate bucket chains)
+    // vs. a single-chain header (e.g. `Queue` with `front`/`rear` pointing to 1 horizontal chain)
+    const isMultiLaneContainer =
+      containerNodes.length > 0 && chains.length >= 2;
+    const chainStartX = isMultiLaneContainer
+      ? 140 + 160 + effectiveRankSep + 30
+      : 140;
+    let currentRowY = containerNodes.length > 0 && !isMultiLaneContainer ? 260 : 140;
+
+    chains.forEach((chain) => {
+      let cursorX = chainStartX;
       let maxChainHeight = 76;
 
       chain.forEach((nodeId, idx) => {
         const dim = nodeDims.get(nodeId) || { width: 160, height: 76 };
         maxChainHeight = Math.max(maxChainHeight, dim.height);
         if (idx === 0) {
-          positions[nodeId] = { x: cursorX, y: currentRowY };
+          positions[nodeId] = { x: cursorX, y: currentRowY + dim.height / 2 };
         } else {
           const prevId = chain[idx - 1];
           const prevDim = nodeDims.get(prevId) || { width: 160, height: 76 };
           const stepX =
-            prevDim.width / 2 +
-            Math.max(config.rankSep, config.nodeSep + 30) +
-            dim.width / 2;
+            prevDim.width / 2 + effectiveRankSep + dim.width / 2;
           cursorX += stepX;
-          positions[nodeId] = { x: Math.round(cursorX), y: currentRowY };
+          positions[nodeId] = {
+            x: Math.round(cursorX),
+            y: currentRowY + dim.height / 2,
+          };
         }
       });
 
-      currentRowY += maxChainHeight + config.nodeSep + 24;
-    }
+      currentRowY += maxChainHeight + effectiveNodeSep;
+    });
 
-    // Position container header structs cleanly ABOVE the horizontal backbone chain
     if (containerNodes.length > 0) {
       containerNodes.forEach((cNode, cIdx) => {
         const cTargets = allValidEdges
-          .filter((e) => e.source === cNode.id && positions[e.target] !== undefined)
+          .filter(
+            (e) => e.source === cNode.id && positions[e.target] !== undefined
+          )
           .map((e) => positions[e.target]);
 
-        if (cTargets.length > 0) {
+        const cDim = nodeDims.get(cNode.id) || { width: 160, height: 84 };
+
+        if (isMultiLaneContainer && cTargets.length > 0) {
+          // Place multi-lane container in a dedicated LEFT column, vertically centered across its buckets
+          const minY = Math.min(...cTargets.map((pos) => pos.y));
+          const maxY = Math.max(...cTargets.map((pos) => pos.y));
+          positions[cNode.id] = {
+            x: 140,
+            y: Math.round((minY + maxY) / 2 + cIdx * (cDim.height + effectiveNodeSep)),
+          };
+        } else if (cTargets.length > 0) {
+          // Single-chain container (e.g. `Queue` with `front` and `rear`): center cleanly ABOVE the horizontal chain
           const avgX =
             cTargets.reduce((sum, pos) => sum + pos.x, 0) / cTargets.length;
           const minY = Math.min(...cTargets.map((pos) => pos.y));
-          const cDim = nodeDims.get(cNode.id) || { width: 160, height: 80 };
           positions[cNode.id] = {
-            x: Math.round(avgX + cIdx * 20),
-            y: Math.round(minY - cDim.height / 2 - config.rankSep - 35),
+            x: Math.round(avgX + cIdx * 220),
+            y: Math.round(minY - cDim.height / 2 - effectiveRankSep),
           };
         } else {
           positions[cNode.id] = {
-            x: 140 + cIdx * 220,
-            y: 80,
+            x: 140 + cIdx * 240,
+            y: 100,
           };
         }
       });
@@ -661,7 +693,7 @@ function computeDagreHierarchicalPositions(
   }
 
   const CARD_WIDTH = 160;
-  const UNIT_SLOT = CARD_WIDTH + config.nodeSep;
+  const UNIT_SLOT = CARD_WIDTH + effectiveNodeSep;
   const subtreeWidth = new Map<string, number>();
   const visitedWidth = new Set<string>();
 
@@ -714,11 +746,11 @@ function computeDagreHierarchicalPositions(
         height: 76,
       };
       const childW = subtreeWidth.get(onlyChild.childId) || UNIT_SLOT;
-      const offset = Math.max(95, childW * 0.35);
+      const offset = Math.max(105, childW * 0.35);
       const childCenterX =
         onlyChild.slotIdx === 0 ? centerX - offset : centerX + offset;
       const childCenterY =
-        centerY + uDim.height / 2 + config.rankSep + childDim.height / 2;
+        centerY + uDim.height / 2 + effectiveRankSep + childDim.height / 2;
       assignCoords(onlyChild.childId, childCenterX, childCenterY);
       return;
     }
@@ -734,18 +766,22 @@ function computeDagreHierarchicalPositions(
       const childDim = nodeDims.get(c.childId) || { width: 160, height: 76 };
       const cCenterX = currentLeft + cW / 2;
       const cCenterY =
-        centerY + uDim.height / 2 + config.rankSep + childDim.height / 2;
+        centerY + uDim.height / 2 + effectiveRankSep + childDim.height / 2;
       assignCoords(c.childId, cCenterX, cCenterY);
       currentLeft += cW;
     });
   };
 
-  const baseRootY = containerNodes.length > 0 ? 240 : 110;
-  let cursorX = 140;
+  const isMultiTreeContainer =
+    containerNodes.length > 0 && roots.length >= 2;
+  const baseRootY =
+    containerNodes.length > 0 && !isMultiTreeContainer ? 260 : 120;
+  let cursorX = isMultiTreeContainer ? 140 + 160 + effectiveRankSep + 30 : 140;
+
   roots.forEach((rId) => {
     const rW = subtreeWidth.get(rId) || UNIT_SLOT;
     assignCoords(rId, cursorX + rW / 2, baseRootY);
-    cursorX += rW + config.nodeSep;
+    cursorX += rW + effectiveNodeSep;
   });
 
   if (containerNodes.length > 0) {
@@ -753,15 +789,22 @@ function computeDagreHierarchicalPositions(
       const cTargets = allValidEdges
         .filter((e) => e.source === cNode.id && positions[e.target] !== undefined)
         .map((e) => positions[e.target]);
+      const cDim = nodeDims.get(cNode.id) || { width: 160, height: 84 };
 
-      if (cTargets.length > 0) {
+      if (isMultiTreeContainer && cTargets.length > 0) {
+        const minY = Math.min(...cTargets.map((pos) => pos.y));
+        const maxY = Math.max(...cTargets.map((pos) => pos.y));
+        positions[cNode.id] = {
+          x: 140,
+          y: Math.round((minY + maxY) / 2 + cIdx * (cDim.height + effectiveNodeSep)),
+        };
+      } else if (cTargets.length > 0) {
         const avgX =
           cTargets.reduce((sum, pos) => sum + pos.x, 0) / cTargets.length;
         const minY = Math.min(...cTargets.map((pos) => pos.y));
-        const cDim = nodeDims.get(cNode.id) || { width: 160, height: 80 };
         positions[cNode.id] = {
-          x: Math.round(avgX + cIdx * 20),
-          y: Math.round(minY - cDim.height / 2 - config.rankSep),
+          x: Math.round(avgX + cIdx * 220),
+          y: Math.round(minY - cDim.height / 2 - effectiveRankSep),
         };
       } else {
         positions[cNode.id] = {
@@ -817,8 +860,8 @@ function ensureDagreLayoutRegistered(): void {
 
       const computed = computeDagreHierarchicalPositions(rawNodes, rawEdges, {
         rankDir: options.rankDir || "TB",
-        nodeSep: options.nodeSep ?? 90,
-        rankSep: options.rankSep ?? 110,
+        nodeSep: Math.max(80, options.nodeSep ?? 90),
+        rankSep: Math.max(110, options.rankSep ?? 110),
         edgeSep: options.edgeSep ?? 40,
       });
 
@@ -1418,8 +1461,8 @@ function computeGeneralMeshSeedPositions(
 
   const visited = new Set<string>();
   let currentLaneY = 120;
-  const HORIZONTAL_PITCH = 250;
-  const VERTICAL_MARGIN = 58;
+  const HORIZONTAL_PITCH = 280; // 160px card + 120px open horizontal corridor for edge labels
+  const VERTICAL_MARGIN = 90;   // Ample vertical separation between horizontal lanes
 
   roots.forEach((rootId) => {
     if (visited.has(rootId)) return;
@@ -1429,7 +1472,7 @@ function computeGeneralMeshSeedPositions(
     const rootHeight = nodeHeights.get(rootId) || 72;
 
     if (rootOut.length === 0) {
-      positions[rootId] = { x: 130, y: currentLaneY + rootHeight / 2 };
+      positions[rootId] = { x: 140, y: currentLaneY + rootHeight / 2 };
       currentLaneY += rootHeight + VERTICAL_MARGIN;
       return;
     }
@@ -1447,7 +1490,7 @@ function computeGeneralMeshSeedPositions(
         maxRowHeight = Math.max(maxRowHeight, currH);
 
         positions[currId] = {
-          x: 130 + depthX * HORIZONTAL_PITCH,
+          x: 140 + depthX * HORIZONTAL_PITCH,
           y: currentLaneY + currH / 2,
         };
         const nextEdges: ExtendedGraphEdge[] = adj[currId] || [];
@@ -1464,11 +1507,11 @@ function computeGeneralMeshSeedPositions(
       currentLaneY - VERTICAL_MARGIN
     );
     positions[rootId] = {
-      x: 130,
+      x: 140,
       y: (startGroupY + endGroupY) / 2,
     };
 
-    currentLaneY += 36;
+    currentLaneY += 45;
   });
 
   let leftoverIdx = 0;
@@ -1476,7 +1519,7 @@ function computeGeneralMeshSeedPositions(
     if (!visited.has(n.id)) {
       const h = nodeHeights.get(n.id) || 72;
       positions[n.id] = {
-        x: 130 + (leftoverIdx % 3) * HORIZONTAL_PITCH,
+        x: 140 + (leftoverIdx % 3) * HORIZONTAL_PITCH,
         y: currentLaneY + Math.floor(leftoverIdx / 3) * (h + VERTICAL_MARGIN),
       };
       leftoverIdx += 1;
@@ -1488,7 +1531,7 @@ function computeGeneralMeshSeedPositions(
 
 function enforceMinimumNodeSeparation(
   positions: Record<string, { x: number; y: number }>,
-  minDist: number = 95
+  minDist: number = 110
 ): Record<string, { x: number; y: number }> {
   const result: Record<string, { x: number; y: number }> = {};
   const ids = Object.keys(positions);
@@ -1511,7 +1554,7 @@ function enforceMinimumNodeSeparation(
             dist < 10
               ? (2 * Math.PI * j) / Math.max(1, ids.length)
               : Math.atan2(dy, dx);
-          const push = (minDist - dist) / 2 + 12;
+          const push = (minDist - dist) / 2 + 14;
           pA.x = Math.round(pA.x - push * Math.cos(angle));
           pA.y = Math.round(pA.y - push * Math.sin(angle));
           pB.x = Math.round(pB.x + push * Math.cos(angle));
@@ -1615,31 +1658,31 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     if (effectiveMode === "logical" && !isForestTopology) {
       return enforceMinimumNodeSeparation(
         computeLogicalCirclePositions(nodes),
-        95
+        105
       );
     }
 
     if (detectedTopology === "linear-list") {
       return computeDagreHierarchicalPositions(nodes, edges, {
         rankDir: "LR",
-        nodeSep: 60,
-        rankSep: 80,
-        edgeSep: 30,
+        nodeSep: 85,
+        rankSep: 115,
+        edgeSep: 40,
       });
     }
 
     if (detectedTopology === "tree" || isForestTopology) {
       return computeDagreHierarchicalPositions(nodes, edges, {
         rankDir: "TB",
-        nodeSep: 90,
-        rankSep: 110,
-        edgeSep: 40,
+        nodeSep: 95,
+        rankSep: 120,
+        edgeSep: 45,
       });
     }
 
     return enforceMinimumNodeSeparation(
       computeGeneralMeshSeedPositions(nodes, edges),
-      95
+      115
     );
   }, [effectiveMode, isForestTopology, detectedTopology, nodes, edges]);
 
@@ -1674,9 +1717,9 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         const lrConfig: DagreLayoutConfig = {
           name: "dagre",
           rankDir: "LR",
-          nodeSep: 60,
-          rankSep: 80,
-          edgeSep: 30,
+          nodeSep: 85,
+          rankSep: 115,
+          edgeSep: 40,
           animate,
           animationDuration: animate ? 250 : 0,
           fit: true,
@@ -1692,9 +1735,9 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         const tbConfig: DagreLayoutConfig = {
           name: "dagre",
           rankDir: "TB",
-          nodeSep: 90,
-          rankSep: 110,
-          edgeSep: 40,
+          nodeSep: 95,
+          rankSep: 120,
+          edgeSep: 45,
           ranker: "network-simplex",
           animate,
           animationDuration: animate ? 250 : 0,
@@ -1722,10 +1765,12 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         fit: true,
         padding: 60,
         nodeDimensionsIncludeLabels: true,
-        nodeRepulsion: () => 8000,
-        idealEdgeLength: () => 120,
-        componentSpacing: 100,
-        nodeOverlap: 40,
+        nodeRepulsion: () => 450000,
+        idealEdgeLength: () => 220,
+        edgeElasticity: () => 0.25,
+        componentSpacing: 120,
+        nodeOverlap: 60,
+        gravity: 0.15,
         randomize: false,
       });
       coseLayout.on("layoutstop", () => clampCameraFit(cy));
@@ -1740,10 +1785,6 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     ]
   );
 
-  // Sensitive `topologyKey` for dynamic edge mutation:
-  // Always includes `eKeys` (`${e.source}->${e.target}`) in both Logical and Physical modes
-  // so edge target changes (e.g. DSU path halving `Node 2 -> Node 6` or pointer rotations)
-  // immediately trigger an animated layout update.
   const topologyKey = useMemo(() => {
     if (nodes.length === 0) return "";
     const nKeys = nodes
@@ -1777,6 +1818,8 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
             "background-image": "data(svgUri)",
             "background-fit": "contain",
             "background-clip": "none",
+            "z-compound-depth": "top",
+            "z-index": 10,
           },
         },
         {
@@ -1820,20 +1863,24 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
             "target-arrow-shape": "triangle",
             "arrow-scale": 1.15,
             "curve-style": "bezier",
-            "control-point-step-size": 52,
+            "control-point-step-size": 58,
+            "edge-distances": "node-position",
             label: "data(label)",
             "text-rotation": "autorotate",
+            "text-margin-y": -8,
             "font-family": "'JetBrains Mono', monospace",
             "font-size": 10,
             "font-weight": "bold",
             color: "#f8fafc",
             "text-background-color": "#0f172a",
             "text-background-opacity": 1,
-            "text-background-padding": "4px",
+            "text-background-padding": "3px",
             "text-background-shape": "roundrectangle",
             "text-border-width": 1,
             "text-border-color": "#334155",
             "text-border-opacity": 1,
+            "z-compound-depth": "bottom",
+            "z-index": 1,
           },
         },
         {
@@ -1917,7 +1964,6 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     const hadPreviousNodes = cy.nodes().length > 0 && !modeChanged;
 
     if (isNewTopology) {
-      // Clear cached drag positions when topology/edges mutate so re-layout is never blocked
       userDraggedPositionsRef.current = {};
     }
 
@@ -1928,8 +1974,8 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
       finalPositions[n.id] =
         userDraggedPositionsRef.current[n.id] ||
         deterministicPositions[n.id] || {
-          x: 160 + (idx % 4) * 240,
-          y: 160 + Math.floor(idx / 4) * 150,
+          x: 160 + (idx % 4) * 260,
+          y: 160 + Math.floor(idx / 4) * 165,
         };
     });
 
