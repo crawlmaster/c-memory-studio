@@ -2677,7 +2677,7 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
           },
         },
       ],
-      minZoom: 0.35,
+      minZoom: 0.15,
       maxZoom: 2.0,
     });
 
