@@ -175,7 +175,7 @@ PRIMITIVE_TYPES = {
     "long long", "unsigned long long", "signed long long",
     "int8_t", "int16_t", "int32_t", "int64_t",
     "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-    "size_t", "ssize_t", "ptrdiff_t", "bool", "_Bool"
+    "size_t", "ssize_t", "ptrdiff_t", "intptr_t", "bool", "_Bool"
 }
 
 USER_FUNC_CALL_RE = re.compile(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
