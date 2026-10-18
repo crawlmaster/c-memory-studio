@@ -295,8 +295,8 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
             <Gauge className="w-3.5 h-3.5 text-slate-400" />
             <input
               type="range"
-              min={50}
-              max={1500}
+              min={20}
+              max={2000}
               step={50}
               value={playbackSpeedMs}
               onChange={(e) => onSpeedChange(Number(e.target.value))}

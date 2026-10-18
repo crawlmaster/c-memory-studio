@@ -3,15 +3,17 @@
  * Topology-Aware DWARF Graph, Tree, Linear-List, Circular-List & Pointer Mesh Visualizer.
  *
  * Key Capabilities:
- * 1. Topological Ring Walk & Perimeter Ordering (`computeOrderedCycleIds`):
- *    - Walks each circular component continuously from a single start node (preferring a
- *      stack-pointer anchor) along consistent outgoing/neighbor links (`nbr !== prev`) to
- *      produce `orderedCycleIds = [id0, id1, id2, ...]`.
- *    - Passes the `orderedCycleIds` comparator directly to Cytoscape's `circle` layout
- *      with `avoidOverlap: true` and `spacingFactor: 1.6` so adjacent nodes in the cycle
- *      sit consecutively along the perimeter with zero diagonal 'X' edge crossings.
- * 2. Native Bundled Bezier Multi-Edge Separation (`curve-style: "bezier"`, `control-point-step-size: 50`).
- * 3. Realistic Physical Card Dimensions (`width: 210`, `height: 95`, `shape: 'round-rectangle'`).
+ * 1. Quote-Aware Discrete Struct Field Rendering (`extractDiscreteFieldRows` & `buildSvgMemoryCard`):
+ *    - Tokenizes struct fields using `splitBalancedStructTokens`, respecting single/double quotes
+ *      and character literals containing braces (e.g., `data = 123 '{'`), ensuring `next:` and
+ *      other fields render on independent discrete rows with row dividers.
+ * 2. Hybrid Layout Strategy (Hierarchy/Tree/DSU vs. General/Cyclic Cose Physics):
+ *    - Automatically selects Dagre (`rankDir: 'TB'`, `nodeSep: 90`, `rankSep: 110`) for trees
+ *      and forests, and Cose (`cose`, `nodeRepulsion: 520000`, `idealEdgeLength: 250`,
+ *      `edgeElasticity: 0.25`, `avoidOverlap: true`) for general/dense graphs.
+ * 3. Stable Active Heap Node Retention & Collision Guards:
+ *    - Prevents node blinking or dropping when edges momentarily fluctuate, and enforces
+ *      non-overlapping bounding-box separations (`deoverlapNodePositions` & `resolveLiveCanvasOverlaps`).
  * 4. Explicit `⏚ NULL` Grounded Pointer Terminals & Atomic Active Edge Metric Binding.
  */
 
@@ -177,6 +179,75 @@ function normalizeStructType(node: ExtendedGraphNode): string {
     .trim();
 }
 
+function computeGeneralMeshSeedPositions(
+  nodes: ExtendedGraphNode[],
+  edges: ExtendedGraphEdge[]
+): Record<string, { x: number; y: number }> {
+  const positions: Record<string, { x: number; y: number }> = {};
+  if (nodes.length === 0) return positions;
+
+  // Utilize `edges` to build undirected adjacency mappings for connected clustering
+  const validEdges = edges.filter((e) => isValidGraphEdge(e));
+  const adj = new Map<string, string[]>();
+  nodes.forEach((n) => adj.set(n.id, []));
+  
+  validEdges.forEach((e) => {
+    adj.get(e.source)?.push(e.target);
+    adj.get(e.target)?.push(e.source);
+  });
+
+  const visited = new Set<string>();
+  const centerX = 400;
+  const centerY = 300;
+
+  nodes.forEach((n, idx) => {
+    if (visited.has(n.id)) return;
+
+    const queue: Array<{ id: string; depth: number; angle: number }> = [
+      { id: n.id, depth: 0, angle: (idx * 2 * Math.PI) / Math.max(1, nodes.length) },
+    ];
+    visited.add(n.id);
+
+    positions[n.id] = {
+      x: Math.round(centerX + (idx % 3) * 220),
+      y: Math.round(centerY + Math.floor(idx / 3) * 180),
+    };
+
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      const nbrs = adj.get(curr.id) || [];
+      const nbrAngleStep = (2 * Math.PI) / Math.max(1, nbrs.length);
+
+      nbrs.forEach((nbrId, nbrIdx) => {
+        if (!visited.has(nbrId)) {
+          visited.add(nbrId);
+          const parentPos = positions[curr.id] || { x: centerX, y: centerY };
+          const radius = 150 + curr.depth * 50;
+          const angle = curr.angle + (nbrIdx - nbrs.length / 2) * nbrAngleStep;
+
+          positions[nbrId] = {
+            x: Math.round(parentPos.x + radius * Math.cos(angle)),
+            y: Math.round(parentPos.y + radius * Math.sin(angle)),
+          };
+          queue.push({ id: nbrId, depth: curr.depth + 1, angle });
+        }
+      });
+    }
+  });
+
+  // Fallback for any disconnected nodes
+  nodes.forEach((n, idx) => {
+    if (!positions[n.id]) {
+      positions[n.id] = {
+        x: 160 + (idx % 4) * 300,
+        y: 160 + Math.floor(idx / 4) * 185,
+      };
+    }
+  });
+
+  return deoverlapNodePositions(positions, nodes, 36);
+}
+
 function isNullAddressToken(val: string | undefined | null): boolean {
   if (val === undefined || val === null) return true;
   const trimmed = String(val).trim();
@@ -218,6 +289,125 @@ function isValidGraphEdge(
   return true;
 }
 
+export interface StructFieldRow {
+  key: string;
+  value: string;
+}
+
+/**
+ * Splits a top-level comma-separated GDB struct body into individual "key = value"
+ * tokens while respecting single-quoted char literals (e.g., `123 '{'`), double-quoted
+ * strings, and balanced braces/brackets.
+ */
+export function splitBalancedStructTokens(rawInner: string): string[] {
+  const tokens: string[] = [];
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let startIdx = 0;
+
+  for (let i = 0; i < rawInner.length; i++) {
+    const ch = rawInner[i];
+
+    if (ch === "\\" && (inSingleQuote || inDoubleQuote)) {
+      i += 1;
+      continue;
+    }
+
+    if (ch === "'" && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      continue;
+    }
+
+    if (ch === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      continue;
+    }
+
+    if (inSingleQuote || inDoubleQuote) {
+      continue;
+    }
+
+    if (ch === "{") braceDepth += 1;
+    else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
+    else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
+    else if (ch === "(") parenDepth += 1;
+    else if (ch === ")") parenDepth = Math.max(0, parenDepth - 1);
+    else if (
+      ch === "," &&
+      braceDepth === 0 &&
+      bracketDepth === 0 &&
+      parenDepth === 0
+    ) {
+      const piece = rawInner.slice(startIdx, i).trim();
+      if (piece) tokens.push(piece);
+      startIdx = i + 1;
+    }
+  }
+
+  const tail = rawInner.slice(startIdx).trim();
+  if (tail) tokens.push(tail);
+  return tokens;
+}
+
+/**
+ * Quote-Aware Discrete Struct Field Extractor:
+ * Parses node fields into explicit `{ key, value }` rows without breaking on character
+ * or string literals containing commas or braces (`123 '{'`).
+ */
+export function extractDiscreteFieldRows(
+  node: ExtendedGraphNode
+): StructFieldRow[] {
+  const rawFields = node.fields || {};
+  const rows: StructFieldRow[] = [];
+  const seenKeys = new Set<string>();
+
+  const pushRow = (k: string, v: string) => {
+    const cleanKey = k.trim();
+    const cleanVal = v.trim();
+    if (!cleanKey) return;
+    if (seenKeys.has(cleanKey)) {
+      const idx = rows.findIndex((r) => r.key === cleanKey);
+      if (idx !== -1) rows[idx] = { key: cleanKey, value: cleanVal };
+      return;
+    }
+    seenKeys.add(cleanKey);
+    rows.push({ key: cleanKey, value: cleanVal });
+  };
+
+  Object.entries(rawFields).forEach(([rawKey, rawVal]) => {
+    const valStr = Array.isArray(rawVal)
+      ? `[${rawVal.join(", ")}]`
+      : String(rawVal ?? "").trim();
+
+    const segments = splitBalancedStructTokens(valStr);
+    if (segments.length <= 1) {
+      pushRow(rawKey, valStr);
+      return;
+    }
+
+    const firstValParts: string[] = [segments[0]];
+    for (let i = 1; i < segments.length; i++) {
+      const seg = segments[i];
+      const kvMatch = /^([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=|:)\s*(.+)$/.exec(seg);
+      if (kvMatch) {
+        pushRow(rawKey, firstValParts.join(", "));
+        pushRow(kvMatch[1], kvMatch[2]);
+      } else {
+        firstValParts.push(seg);
+      }
+    }
+    if (!seenKeys.has(rawKey.trim())) {
+      pushRow(rawKey, firstValParts.join(", "));
+    }
+  });
+
+  return rows;
+}
+
 function getEstimatedNodeDimensions(node: ExtendedGraphNode): {
   width: number;
   height: number;
@@ -225,19 +415,13 @@ function getEstimatedNodeDimensions(node: ExtendedGraphNode): {
   if (node.type === "LogicalVertex") {
     return { width: 84, height: 84 };
   }
-  const fCount = Object.keys(node.fields || {}).length;
+  const fCount = extractDiscreteFieldRows(node).length;
   return {
     width: HEAP_CARD_WIDTH,
-    height: Math.max(HEAP_CARD_MIN_HEIGHT, 42 + fCount * 18),
+    height: Math.max(HEAP_CARD_MIN_HEIGHT, 44 + fCount * 20),
   };
 }
 
-/**
- * Prevent Co-located Node Overlap Guard:
- * Checks all node pairs for intersecting bounding boxes (`width + minGap`, `height + minGap`).
- * Whenever two distinct nodes intersect, applies an automatic positional nudge of at least
- * `+230px` along the X-axis (`MIN_X_NUDGE_PX`) so cards never render on top of each other.
- */
 function deoverlapNodePositions(
   positions: Record<string, { x: number; y: number }>,
   nodes: ExtendedGraphNode[],
@@ -314,10 +498,6 @@ function deoverlapNodePositions(
   return result;
 }
 
-/**
- * Post-layout live canvas overlap guard for non-circular layouts.
- * Inspects rendered Cytoscape node positions and nudges any intersecting node by `+230px` along X.
- */
 function resolveLiveCanvasOverlaps(cy: Core, skipHorizontalSortNudge: boolean = false): void {
   if (skipHorizontalSortNudge) return;
   const cyNodes = cy.nodes().filter((n) => !n.data("isDeleting"));
@@ -372,10 +552,6 @@ function resolveLiveCanvasOverlaps(cy: Core, skipHorizontalSortNudge: boolean = 
   }
 }
 
-/**
- * Purely structural partition separating stack/header container structs from
- * homogeneous heap backbone nodes (Zero Hardcoded Names).
- */
 function partitionContainersAndBackbone(
   nodes: ExtendedGraphNode[],
   edges: ExtendedGraphEdge[]
@@ -469,9 +645,6 @@ function partitionContainersAndBackbone(
   };
 }
 
-/**
- * Automatic Dynamic Topology Classifier (Zero Hardcoding).
- */
 export function detectTopology(
   nodes: ExtendedGraphNode[],
   edges: ExtendedGraphEdge[]
@@ -632,16 +805,6 @@ export function detectTopology(
   return "tree";
 }
 
-/**
- * Topological Walk along the Ring (`computeOrderedCycleIds`):
- * 1. Picks a starting node in the cycle (preferring a node pointed to by a stack/root pointer).
- * 2. Walks the connected cycle step-by-step following a consistent outgoing pointer slot
- *    (`field_order_idx === 0` or primary outgoing edge label) and undirected 2-regular cycle
- *    adjacency (`nbr !== prevId`), collecting node IDs in linear perimeter order:
- *    `orderedCycleIds = [id0, id1, id2, ...]`.
- * 3. Guarantees that consecutive nodes in `orderedCycleIds` are directly connected along
- *    the cycle perimeter, eliminating internal diagonal 'X' crossings.
- */
 function computeOrderedCycleIds(
   nodes: ExtendedGraphNode[],
   edges: ExtendedGraphEdge[]
@@ -657,7 +820,6 @@ function computeOrderedCycleIds(
     backboneNodes.length > 0 ? backboneEdges : edges
   ).filter((e) => isValidGraphEdge(e, ringIds) && e.source !== e.target);
 
-  // Build outgoing edge list per node sorted by `field_order_idx` so slot 0 (primary link) comes first
   const outEdgesByNode = new Map<string, ExtendedGraphEdge[]>();
   const undirAdj = new Map<string, string[]>();
 
@@ -681,7 +843,6 @@ function computeOrderedCycleIds(
     );
   });
 
-  // Prefer starting at the first node pointed to by a stack pointer (preserving allocation/input order)
   const anchorCandidates = [...ringNodes].sort((a, b) => {
     const aHasPtr = (a.pointers?.length ?? 0) > 0 ? 0 : 1;
     const bHasPtr = (b.pointers?.length ?? 0) > 0 ? 0 : 1;
@@ -694,8 +855,6 @@ function computeOrderedCycleIds(
   for (const startNode of anchorCandidates) {
     if (visited.has(startNode.id)) continue;
 
-    // Determine the primary link label from `startNode` (slot 0) so we walk consistently
-    // in one direction around doubly-linked rings instead of bouncing back along slot 1.
     const startOuts = outEdgesByNode.get(startNode.id) || [];
     const primaryLabel: string | undefined =
       startOuts.length > 0 ? startOuts[0].label : undefined;
@@ -711,7 +870,6 @@ function computeOrderedCycleIds(
       const prevId: string | undefined = prev;
       const outs: ExtendedGraphEdge[] = outEdgesByNode.get(currId) || [];
 
-      // 1. Prefer outgoing edge matching `primaryLabel` (or `field_order_idx === 0`) that isn't `prevId`
       let chosenNext: string | undefined;
       if (primaryLabel !== undefined) {
         const matchPrimary: ExtendedGraphEdge | undefined = outs.find(
@@ -725,7 +883,6 @@ function computeOrderedCycleIds(
         }
       }
 
-      // 2. Otherwise pick the first unvisited outgoing edge that isn't `prevId`
       if (!chosenNext) {
         const anyOut: ExtendedGraphEdge | undefined = outs.find(
           (e) => !visited.has(e.target) && e.target !== prevId
@@ -735,7 +892,6 @@ function computeOrderedCycleIds(
         }
       }
 
-      // 3. Fallback to any unvisited undirected neighbor in the 2-regular cycle
       if (!chosenNext) {
         const nbrs: string[] = undirAdj.get(currId) || [];
         const fallbackUndir: string | undefined = nbrs.find(
@@ -782,18 +938,17 @@ function computeCircularListPositions(
   });
 
   const N = orderedRing.length;
-  const centerX = 420;
-  const centerY = 300;
+  const centerX = 400;
+  const centerY = 280;
 
-  // Ensure generous chord distance (>= 350px) so 210x95 cards never touch on the perimeter
-  const minChord = 350;
+  const minChord = 330;
   const computedRadius =
     N <= 1
       ? 0
       : N === 2
-      ? 230
+      ? 220
       : Math.max(
-          230,
+          220,
           Math.round(minChord / (2 * Math.sin(Math.PI / N)))
         );
 
@@ -1326,7 +1481,8 @@ function ensureDagreLayoutRegistered(): void {
       return this;
     };
 
-    cytoscape("layout", "dagre", CustomDagreLayout as unknown as cytoscape.Ext);
+    // cytoscape("layout", "dagre", CustomDagreLayout as unknown as cytoscape.Ext);
+    cytoscape("layout", "dagre", CustomDagreLayout as unknown as any);
     isDagreRegistered = true;
   } catch {
     isDagreRegistered = true;
@@ -1334,8 +1490,8 @@ function ensureDagreLayoutRegistered(): void {
 }
 
 /**
- * Builds an SVG memory card for a physical C struct node matching the explicit
- * `210px` width and `95px` minimum height footprint.
+ * Builds an SVG memory card for a physical C struct node with robust quote-aware
+ * field tokenization and discrete row placement.
  */
 function buildSvgMemoryCard(node: ExtendedGraphNode): {
   svgDataUri: string;
@@ -1352,16 +1508,15 @@ function buildSvgMemoryCard(node: ExtendedGraphNode): {
     .trim();
   const shortType = rawType.length > 14 ? `${rawType.slice(0, 13)}…` : rawType;
 
-  const entries = Object.entries(node.fields || {});
-  const fieldCount = entries.length;
+  const fieldRows: StructFieldRow[] = extractDiscreteFieldRows(node);
+  const fieldCount = fieldRows.length;
+  const headerHeight = 28;
+  const rowHeight = 20;
   const calculatedWidth = HEAP_CARD_WIDTH;
   const calculatedHeight = Math.max(
     HEAP_CARD_MIN_HEIGHT,
-    42 + fieldCount * 18
+    headerHeight + 16 + Math.max(1, fieldCount) * rowHeight
   );
-
-  const headerHeight = 28;
-  const rowHeight = 18;
 
   const borderColor = isFreed
     ? "#ef4444"
@@ -1385,13 +1540,17 @@ function buildSvgMemoryCard(node: ExtendedGraphNode): {
   if (fieldCount === 0) {
     const fallbackText = escapeXml(node.label || "(empty)");
     rowsSvg += `<text x="12" y="${
-      headerHeight + 20
+      headerHeight + 22
     }" font-family="JetBrains Mono, monospace" font-size="10.5" fill="#94a3b8">${fallbackText}</text>`;
   } else {
-    entries.forEach(([k, v], idx) => {
-      const yPos = headerHeight + 17 + idx * rowHeight;
-      const keyText = escapeXml(k.length > 13 ? `${k.slice(0, 12)}…` : k);
-      const rawValStr = String(v).trim();
+    fieldRows.forEach(({ key, value }, idx) => {
+      const rowTopY = headerHeight + 4 + idx * rowHeight;
+      const baselineY = rowTopY + 14;
+      const keyText = escapeXml(
+        key.length > 12 ? `${key.slice(0, 11)}…` : key
+      );
+      const rawValStr = value.trim();
+
       const isNullPointerField =
         rawValStr === "NULL" ||
         rawValStr === "0x0" ||
@@ -1420,20 +1579,30 @@ function buildSvgMemoryCard(node: ExtendedGraphNode): {
         ? calculatedWidth - 17
         : calculatedWidth - 12;
 
+      const rowDividerSvg =
+        idx > 0
+          ? `<line x1="8" y1="${rowTopY}" x2="${
+              calculatedWidth - 8
+            }" y2="${rowTopY}" stroke="#1e293b" stroke-width="1"/>`
+          : "";
+
       const groundPinSvg = isNullPointerField
         ? `<circle cx="${calculatedWidth - 9}" cy="${
-            yPos - 3.5
+            baselineY - 3.5
           }" r="2.4" fill="#1e293b" stroke="#64748b" stroke-width="1.2"/>`
         : "";
 
       rowsSvg += `
-        <text x="12" y="${yPos}" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="600" fill="${
-          isFreed ? "#f87171" : "#38bdf8"
-        }">${keyText}:</text>
-        <text x="${valRightX}" y="${yPos}" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="700" ${strikeAttr} fill="${
-          isFreed ? "#fca5a5" : valColor
-        }">${escapeXml(formattedVal)}</text>
-        ${groundPinSvg}
+        <g>
+          ${rowDividerSvg}
+          <text x="12" y="${baselineY}" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="600" fill="${
+            isFreed ? "#f87171" : "#38bdf8"
+          }">${keyText}:</text>
+          <text x="${valRightX}" y="${baselineY}" text-anchor="end" font-family="JetBrains Mono, monospace" font-size="10.5" font-weight="700" ${strikeAttr} fill="${
+            isFreed ? "#fca5a5" : valColor
+          }">${escapeXml(formattedVal)}</text>
+          ${groundPinSvg}
+        </g>
       `;
     });
   }
@@ -1530,9 +1699,6 @@ interface DiscoveredPhysicalEdge {
   traversalPtrs: string[];
 }
 
-/**
- * Atomic Traversal-Pointer Driven Logical Graph & Edge-Metric Projection.
- */
 function projectLogicalGraphFromMesh(
   physicalGraph: ExtendedGraphData,
   explicitLogicalGraph: LogicalGraphPayload | null | undefined,
@@ -1551,7 +1717,6 @@ function projectLogicalGraphFromMesh(
     (e) => isValidGraphEdge(e)
   );
 
-  // Case 1: Index-Buffer Forest Topology (e.g. Disjoint Set Union parent[] array)
   if (
     (backendLogical && backendLogical.is_forest) ||
     (pNodes.length > 0 && pNodes.every((n) => n.type === "IndexNode"))
@@ -1601,7 +1766,6 @@ function projectLogicalGraphFromMesh(
     };
   }
 
-  // Case 2: Adjacency-List Graph Projection & Atomic Traversal-Pointer Edge Activation
   const nodeById = new Map<string, ExtendedGraphNode>();
   pNodes.forEach((n) => {
     if (isValidEdgeEndpoint(n.id)) {
@@ -2101,124 +2265,7 @@ function computeLogicalCirclePositions(
     positions[node.id] = { x, y };
   });
 
-  return positions;
-}
-
-function computeGeneralMeshSeedPositions(
-  nodes: ExtendedGraphNode[],
-  edges: ExtendedGraphEdge[]
-): Record<string, { x: number; y: number }> {
-  const positions: Record<string, { x: number; y: number }> = {};
-  if (nodes.length === 0) return positions;
-
-  const nodeMap = new Map<string, ExtendedGraphNode>();
-  const nodeHeights = new Map<string, number>();
-
-  nodes.forEach((n) => {
-    if (!isValidEdgeEndpoint(n.id)) return;
-    nodeMap.set(n.id, n);
-    const dim = getEstimatedNodeDimensions(n);
-    nodeHeights.set(n.id, dim.height);
-  });
-
-  const inDegree: Record<string, number> = {};
-  const adj: Record<string, ExtendedGraphEdge[]> = {};
-
-  nodes.forEach((n) => {
-    inDegree[n.id] = 0;
-    adj[n.id] = [];
-  });
-
-  edges.forEach((e) => {
-    if (
-      isValidEdgeEndpoint(e.source) &&
-      isValidEdgeEndpoint(e.target) &&
-      nodeMap.has(e.source) &&
-      nodeMap.has(e.target) &&
-      e.source !== e.target
-    ) {
-      adj[e.source].push(e);
-      inDegree[e.target] = (inDegree[e.target] || 0) + 1;
-    }
-  });
-
-  const roots = nodes
-    .filter((n) => inDegree[n.id] === 0)
-    .map((n) => n.id);
-  if (roots.length === 0) {
-    roots.push(nodes[0].id);
-  }
-
-  const visited = new Set<string>();
-  let currentLaneY = 130;
-  const HORIZONTAL_PITCH = 330;
-  const VERTICAL_MARGIN = 105;
-
-  roots.forEach((rootId) => {
-    if (visited.has(rootId)) return;
-    visited.add(rootId);
-
-    const rootOut = adj[rootId] || [];
-    const rootHeight = nodeHeights.get(rootId) || HEAP_CARD_MIN_HEIGHT;
-
-    if (rootOut.length === 0) {
-      positions[rootId] = { x: 160, y: currentLaneY + rootHeight / 2 };
-      currentLaneY += rootHeight + VERTICAL_MARGIN;
-      return;
-    }
-
-    const startGroupY = currentLaneY;
-
-    rootOut.forEach((branchEdge) => {
-      let currId: string | undefined = branchEdge.target;
-      let depthX = 1;
-      let maxRowHeight = HEAP_CARD_MIN_HEIGHT;
-
-      while (currId && isValidEdgeEndpoint(currId) && !visited.has(currId)) {
-        visited.add(currId);
-        const currH = nodeHeights.get(currId) || HEAP_CARD_MIN_HEIGHT;
-        maxRowHeight = Math.max(maxRowHeight, currH);
-
-        positions[currId] = {
-          x: 160 + depthX * HORIZONTAL_PITCH,
-          y: currentLaneY + currH / 2,
-        };
-        const nextEdges: ExtendedGraphEdge[] = adj[currId] || [];
-        const firstNext: ExtendedGraphEdge | undefined = nextEdges.find((ne) =>
-          isValidEdgeEndpoint(ne.target)
-        );
-        currId = firstNext ? firstNext.target : undefined;
-        depthX += 1;
-      }
-
-      currentLaneY += maxRowHeight + VERTICAL_MARGIN;
-    });
-
-    const endGroupY = Math.max(
-      startGroupY + rootHeight,
-      currentLaneY - VERTICAL_MARGIN
-    );
-    positions[rootId] = {
-      x: 160,
-      y: (startGroupY + endGroupY) / 2,
-    };
-
-    currentLaneY += 50;
-  });
-
-  let leftoverIdx = 0;
-  nodes.forEach((n) => {
-    if (!visited.has(n.id)) {
-      const h = nodeHeights.get(n.id) || HEAP_CARD_MIN_HEIGHT;
-      positions[n.id] = {
-        x: 160 + (leftoverIdx % 3) * HORIZONTAL_PITCH,
-        y: currentLaneY + Math.floor(leftoverIdx / 3) * (h + VERTICAL_MARGIN),
-      };
-      leftoverIdx += 1;
-    }
-  });
-
-  return deoverlapNodePositions(positions, nodes, 36);
+  return deoverlapNodePositions(positions, nodes, 32);
 }
 
 export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
@@ -2336,6 +2383,11 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
     [isCircleMode, syncBadgePositions]
   );
 
+  /**
+   * Topology-Adaptive Layout Strategy:
+   * - Condition A (Hierarchy / Tree / DSU / Forest): Uses `dagre` layout (`rankDir: 'TB'`, `nodeSep: 90`, `rankSep: 110`).
+   * - Condition B (General / Dense / Cyclic Graph): Uses `cose` (Compound Spring Embedder) with planar physics parameters.
+   */
   const computeInitialPositionsForTopology = useCallback((): Record<
     string,
     { x: number; y: number }
@@ -2480,6 +2532,7 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         return;
       }
 
+      // Condition B: General / Dense / Cyclic Graph -> Use `cose` with planar physics parameters
       const seeded = computeInitialPositionsForTopology();
       cy.batch(() => {
         cy.nodes().forEach((n) => {
@@ -2490,20 +2543,21 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
 
       const coseLayout = cy.layout({
         name: "cose",
-        avoidOverlap: true,
-        spacingFactor: 1.4,
         animate,
         animationDuration: animate ? 250 : 0,
         fit: true,
-        padding: 60,
+        padding: 40,
         nodeDimensionsIncludeLabels: true,
-        nodeRepulsion: () => 520000,
-        idealEdgeLength: () => 250,
-        edgeElasticity: () => 0.25,
-        componentSpacing: 130,
-        nodeOverlap: 90,
-        gravity: 0.15,
+        nodeRepulsion: 450000,
+        idealEdgeLength: 120,
+        edgeElasticity: 0.45,
+        gravity: 0.25,
+        numIter: 1000,
+        initialTemp: 200,
+        coolingFactor: 0.95,
+        minTemp: 1.0,
         randomize: false,
+        avoidOverlap: true,
       } as unknown as LayoutOptions);
       coseLayout.on("layoutstop", () => clampCameraFit(cy));
       coseLayout.run();
@@ -2759,8 +2813,6 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         };
     });
 
-    // Do not apply left-to-right X-nudging when in circle mode (`circular-list` or `logical` circle),
-    // because circular layouts already space nodes radially around the perimeter.
     const finalPositions = isCircleMode
       ? rawCandidatePositions
       : deoverlapNodePositions(rawCandidatePositions, nodes, 36);
@@ -3149,9 +3201,8 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
           )}
 
           <div className="space-y-1.5 max-h-48 overflow-y-auto">
-            {Object.entries(selectedNode.fields || {}).map(
-              ([fieldKey, fieldVal]) => {
-                const rawStr = String(fieldVal).trim();
+            {extractDiscreteFieldRows(selectedNode).map(
+              ({ key: fieldKey, value: rawStr }) => {
                 const isNullVal =
                   rawStr === "NULL" ||
                   rawStr === "0x0" ||
