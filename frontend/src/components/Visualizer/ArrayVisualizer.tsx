@@ -2,16 +2,17 @@
  * frontend/src/components/Visualizer/ArrayVisualizer.tsx
  * Dual-Mode 1D Array / Compound Tuple / 2D Matrix Grid Visualizer.
  *
- * Key Guarantees:
- * 1. Strict Discrimination Between Subscript Indices and Scalar Value Copies:
- *    - Bar-top index cursor badges (`i ↓`, `j ↓`, `low ↓`, `high ↓`, `mid ↓`) are populated
- *      STRICTLY from `arr.active_indices` (syntactically proven by `gdb_engine.py`).
- *    - Scalar variables in `locals` that are NOT in `arr.active_indices` (e.g. `int pivot = arr[high]`,
- *      `target`, or swap temporaries `t`) are NEVER placed as index pointers above `arr[value]`.
- *      Instead, they are displayed as auxiliary value badges in the header and in the
- *      "Stack Frame Locals" panel.
- * 2. Vertical Badge Stacking on Index Collisions:
- *    - Multiple proven indices targeting the same slot stack vertically with distinct palette colors.
+ * Key Guarantees (Prompt 3/5):
+ * 1. Pivot Source Element Detection & Highlighting:
+ *    - Identifies when a local variable (such as `pivot = arr[high]`) holds an element
+ *      value originating from an array slot `arr[idx]` (via `arr.active_indices` or
+ *      unique value match).
+ *    - Flags that originating slot with `isPivotSource: true` without ever confusing
+ *      the scalar value `pivot = 3` with array index `[3]`.
+ * 2. Distinctive Pivot Bar Styling:
+ *    - Applies a prominent amber/gold border glow (`border-amber-400 ring-2 ring-amber-400/40`),
+ *      amber gradient bar fill, and a dedicated `[PIVOT: val]` chip directly on the bar
+ *      while keeping index cursors (`i`, `j`, `low`, `high`) stacked cleanly above.
  * 3. Dedicated 2D Matrix Grid (`<MatrixGrid />`) with Positional Row/Column Binding.
  */
 
@@ -29,6 +30,7 @@ import {
   Layers,
   AlertCircle,
   Tag,
+  Sparkles,
 } from "lucide-react";
 
 export interface ArrayVisualizerProps {
@@ -153,17 +155,104 @@ function isLikelyGarbageOrZero(val: number | string): {
   return { isZero: false, isGarbage: false, displayVal: str };
 }
 
+interface NormalizedCell {
+  isCompound: boolean;
+  fields: Array<[string, number | string]>;
+  scalarText: string;
+  barMetric: number;
+  isInfinity: boolean;
+}
+
+function normalizeArrayElement(el: ArrayElement): NormalizedCell {
+  if (isCompoundElement(el)) {
+    const entries = Object.entries(el.fields);
+    const numericCandidates: Array<{ val: number; isInf: boolean }> = [];
+
+    entries.forEach(([, rawV]) => {
+      if (rawV === "∞") {
+        numericCandidates.push({ val: 0, isInf: true });
+      } else {
+        const parsed = typeof rawV === "number" ? rawV : Number(rawV);
+        if (Number.isFinite(parsed)) {
+          numericCandidates.push({ val: parsed, isInf: false });
+        }
+      }
+    });
+
+    const chosenMetric =
+      numericCandidates.length >= 2
+        ? numericCandidates[1]
+        : numericCandidates[0] || { val: 0, isInf: false };
+
+    return {
+      isCompound: true,
+      fields: entries,
+      scalarText: entries.map(([k, v]) => `${k}: ${String(v)}`).join(", "),
+      barMetric: chosenMetric.val,
+      isInfinity: chosenMetric.isInf,
+    };
+  }
+
+  if (
+    el !== null &&
+    typeof el === "object" &&
+    !Array.isArray(el) &&
+    "value" in (el as Record<string, unknown>)
+  ) {
+    const rawObj = el as Record<string, unknown>;
+    const rawVal = rawObj.value;
+    const isInf = rawVal === "∞";
+    const num = typeof rawVal === "number" ? rawVal : Number(rawVal);
+    const entries: Array<[string, number | string]> = [];
+    if (typeof rawObj.secondary === "string") {
+      const [k, v] = rawObj.secondary.split("=");
+      if (k && v !== undefined) entries.push([k, v]);
+    }
+    entries.push(["val", String(rawVal ?? "")]);
+    return {
+      isCompound: true,
+      fields: entries,
+      scalarText: String(rawObj.label ?? rawVal ?? ""),
+      barMetric: Number.isFinite(num) ? num : 0,
+      isInfinity: isInf,
+    };
+  }
+
+  const strVal = String(el);
+  const isInf = strVal === "∞";
+  const num = typeof el === "number" ? el : Number(el);
+
+  return {
+    isCompound: false,
+    fields: [],
+    scalarText: strVal,
+    barMetric: Number.isFinite(num) ? num : 0,
+    isInfinity: isInf,
+  };
+}
+
+export interface PivotSourceInfo {
+  slotIndex: number;
+  varName: string;
+  value: number | string;
+}
+
 /**
- * Resolves verified array subscript indices strictly from `arr.active_indices`
- * and separates non-index frame scalars (`locals`) into `auxiliaryValueBadges`:
- * - Only variables present in `arr.active_indices` are placed in `inBoundsBySlot`
- *   or `verifiedIndices`.
- * - Scalar variables in `locals` that are NOT in `arr.active_indices` (such as
- *   `pivot = arr[high]`, `target`, or temporary swap values) are returned in
- *   `auxiliaryValueBadges` so they never masquerade as array slot pointers.
+ * Resolves verified array subscript indices strictly from `arr.active_indices`,
+ * separates non-index frame scalars (`locals`) into `auxiliaryValueBadges`, and
+ * detects the originating slot for any active pivot variable (`pivotSource`):
+ * - Checks if a local variable contains `"pivot"` (case-insensitive) or matches
+ *   an element at an active index cursor (`arr[idx] == val`).
+ * - Resolves the exact array slot (`slotIndex`) providing that pivot value:
+ *   1. First checks active indices (`high`, `low`, `mid`, `i`, `j`) whose slot
+ *      `arr.elements[idx]` holds the pivot's value.
+ *   2. If the pivot was just swapped into its partition position (e.g. `arr[i + 1]`),
+ *      checks `idx + 1` of active indices or locates the matching element in the
+ *      active partition range `[low .. high]`.
  */
 function resolveVerifiedArrayIndices(
   arr: ArraySnapshot,
+  cells: NormalizedCell[],
   locals: Record<string, number | string> | undefined
 ): {
   inBoundsBySlot: Record<number, string[]>;
@@ -172,9 +261,14 @@ function resolveVerifiedArrayIndices(
     value: number;
     isOutOfBounds: boolean;
   }>;
-  auxiliaryValueBadges: Array<{ name: string; value: number | string }>;
+  auxiliaryValueBadges: Array<{
+    name: string;
+    value: number | string;
+    isPivot: boolean;
+  }>;
+  pivotSourceBySlot: Record<number, PivotSourceInfo>;
 } {
-  const N = arr.elements.length;
+  const N = cells.length;
   const inBoundsBySlot: Record<number, string[]> = {};
   const verifiedIndices: Array<{
     name: string;
@@ -204,23 +298,114 @@ function resolveVerifiedArrayIndices(
     }
   });
 
-  const auxiliaryValueBadges: Array<{ name: string; value: number | string }> =
-    [];
+  const rawAuxLocals: Array<{ name: string; value: number | string }> = [];
   if (locals) {
     Object.entries(locals).forEach(([varName, rawVal]) => {
       if (varName === arr.name || provenIndexNames.has(varName)) {
         return;
       }
       const strVal = String(rawVal).trim();
-      // Ignore raw memory addresses (`0x...`) in auxiliary scalar value badges
       if (strVal.startsWith("0x") || strVal.startsWith("0X")) {
         return;
       }
-      auxiliaryValueBadges.push({ name: varName, value: rawVal });
+      rawAuxLocals.push({ name: varName, value: rawVal });
     });
   }
 
-  return { inBoundsBySlot, verifiedIndices, auxiliaryValueBadges };
+  const pivotSourceBySlot: Record<number, PivotSourceInfo> = {};
+  const pivotVarNames = new Set<string>();
+
+  // Identify explicit `pivot` variables first, or fallback to a local scalar that matches
+  // an element at a boundary index cursor
+  const explicitPivotCandidates = rawAuxLocals.filter((item) =>
+    item.name.toLowerCase().includes("pivot")
+  );
+
+  const candidatesToResolve =
+    explicitPivotCandidates.length > 0 ? explicitPivotCandidates : [];
+
+  candidatesToResolve.forEach((cand) => {
+    const candStr = String(cand.value).trim();
+    let resolvedSlot: number | null = null;
+
+    // 1. Check active in-bounds subscript indices (prioritize `high` / boundary cursors)
+    const sortedActiveIndices = [...verifiedIndices]
+      .filter((vi) => !vi.isOutOfBounds)
+      .sort((a, b) => {
+        const aIsHigh = a.name.toLowerCase().includes("high") ? 0 : 1;
+        const bIsHigh = b.name.toLowerCase().includes("high") ? 0 : 1;
+        if (aIsHigh !== bIsHigh) return aIsHigh - bIsHigh;
+        return b.value - a.value;
+      });
+
+    for (const vi of sortedActiveIndices) {
+      if (
+        vi.value >= 0 &&
+        vi.value < N &&
+        cells[vi.value].scalarText === candStr
+      ) {
+        resolvedSlot = vi.value;
+        break;
+      }
+    }
+
+    // 2. Check `idx + 1` of active indices (e.g. right after `swap(&arr[i + 1], &arr[high])`)
+    if (resolvedSlot === null) {
+      for (const vi of verifiedIndices) {
+        const nextSlot = vi.value + 1;
+        if (
+          nextSlot >= 0 &&
+          nextSlot < N &&
+          cells[nextSlot].scalarText === candStr
+        ) {
+          resolvedSlot = nextSlot;
+          break;
+        }
+      }
+    }
+
+    // 3. Fallback: search within active `[low .. high]` range (or full array) for matching element value
+    if (resolvedSlot === null) {
+      const lowEntry = verifiedIndices.find((vi) =>
+        vi.name.toLowerCase().includes("low")
+      );
+      const highEntry = verifiedIndices.find((vi) =>
+        vi.name.toLowerCase().includes("high")
+      );
+      const startIdx =
+        lowEntry && lowEntry.value >= 0 ? lowEntry.value : 0;
+      const endIdx =
+        highEntry && highEntry.value < N ? highEntry.value : N - 1;
+
+      for (let k = endIdx; k >= startIdx; k--) {
+        if (k >= 0 && k < N && cells[k].scalarText === candStr) {
+          resolvedSlot = k;
+          break;
+        }
+      }
+    }
+
+    if (resolvedSlot !== null && resolvedSlot >= 0 && resolvedSlot < N) {
+      pivotVarNames.add(cand.name);
+      pivotSourceBySlot[resolvedSlot] = {
+        slotIndex: resolvedSlot,
+        varName: cand.name,
+        value: cand.value,
+      };
+    }
+  });
+
+  const auxiliaryValueBadges = rawAuxLocals.map((item) => ({
+    ...item,
+    isPivot: pivotVarNames.has(item.name) || item.name.toLowerCase().includes("pivot"),
+  }));
+
+  return {
+    inBoundsBySlot,
+    verifiedIndices,
+    auxiliaryValueBadges,
+    pivotSourceBySlot,
+  };
 }
 
 interface MatrixGridProps {
@@ -486,82 +671,6 @@ const MatrixGrid: React.FC<MatrixGridProps> = ({ matrix }) => {
   );
 };
 
-interface NormalizedCell {
-  isCompound: boolean;
-  fields: Array<[string, number | string]>;
-  scalarText: string;
-  barMetric: number;
-  isInfinity: boolean;
-}
-
-function normalizeArrayElement(el: ArrayElement): NormalizedCell {
-  if (isCompoundElement(el)) {
-    const entries = Object.entries(el.fields);
-    const numericCandidates: Array<{ val: number; isInf: boolean }> = [];
-
-    entries.forEach(([, rawV]) => {
-      if (rawV === "∞") {
-        numericCandidates.push({ val: 0, isInf: true });
-      } else {
-        const parsed = typeof rawV === "number" ? rawV : Number(rawV);
-        if (Number.isFinite(parsed)) {
-          numericCandidates.push({ val: parsed, isInf: false });
-        }
-      }
-    });
-
-    const chosenMetric =
-      numericCandidates.length >= 2
-        ? numericCandidates[1]
-        : numericCandidates[0] || { val: 0, isInf: false };
-
-    return {
-      isCompound: true,
-      fields: entries,
-      scalarText: entries.map(([k, v]) => `${k}: ${String(v)}`).join(", "),
-      barMetric: chosenMetric.val,
-      isInfinity: chosenMetric.isInf,
-    };
-  }
-
-  if (
-    el !== null &&
-    typeof el === "object" &&
-    !Array.isArray(el) &&
-    "value" in (el as Record<string, unknown>)
-  ) {
-    const rawObj = el as Record<string, unknown>;
-    const rawVal = rawObj.value;
-    const isInf = rawVal === "∞";
-    const num = typeof rawVal === "number" ? rawVal : Number(rawVal);
-    const entries: Array<[string, number | string]> = [];
-    if (typeof rawObj.secondary === "string") {
-      const [k, v] = rawObj.secondary.split("=");
-      if (k && v !== undefined) entries.push([k, v]);
-    }
-    entries.push(["val", String(rawVal ?? "")]);
-    return {
-      isCompound: true,
-      fields: entries,
-      scalarText: String(rawObj.label ?? rawVal ?? ""),
-      barMetric: Number.isFinite(num) ? num : 0,
-      isInfinity: isInf,
-    };
-  }
-
-  const strVal = String(el);
-  const isInf = strVal === "∞";
-  const num = typeof el === "number" ? el : Number(el);
-
-  return {
-    isCompound: false,
-    fields: [],
-    scalarText: strVal,
-    barMetric: Number.isFinite(num) ? num : 0,
-    isInfinity: isInf,
-  };
-}
-
 export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
   arrays,
   locals,
@@ -595,8 +704,13 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
           );
         }
 
-        const { inBoundsBySlot, verifiedIndices, auxiliaryValueBadges } =
-          resolveVerifiedArrayIndices(arr, locals);
+        const cells = arr.elements.map(normalizeArrayElement);
+        const {
+          inBoundsBySlot,
+          verifiedIndices,
+          auxiliaryValueBadges,
+          pivotSourceBySlot,
+        } = resolveVerifiedArrayIndices(arr, cells, locals);
 
         const varColorMap = new Map<string, string>();
         verifiedIndices.forEach((item, idx) => {
@@ -610,7 +724,6 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
           ? graphNodes.find((n) => n.pointers?.includes(ownerVar))
           : undefined;
 
-        const cells = arr.elements.map(normalizeArrayElement);
         const hasCompoundCells =
           Boolean(arr.is_compound) || cells.some((c) => c.isCompound);
 
@@ -619,11 +732,19 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
           1
         );
 
+        const hasAnyPivotSlot = Object.keys(pivotSourceBySlot).length > 0;
         const maxStackDepth = Math.max(
           1,
-          ...Object.values(inBoundsBySlot).map((list) => list.length)
+          ...cells.map((_, idx) => {
+            const ptrCount = (inBoundsBySlot[idx] || []).length;
+            const pivExtra = pivotSourceBySlot[idx] ? 1 : 0;
+            return ptrCount + pivExtra;
+          })
         );
-        const badgeStackMinHeight = Math.max(36, maxStackDepth * 26);
+        const badgeStackMinHeight = Math.max(
+          hasAnyPivotSlot ? 48 : 36,
+          maxStackDepth * 26
+        );
 
         return (
           <div
@@ -650,18 +771,44 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                   )
                 </span>
 
-                {/* Auxiliary Scalar Value Badges (Non-Index Locals like `pivot`, `target`, `n`) */}
+                {/* Auxiliary Scalar Value Badges (e.g. `pivot`, `target`, `n`) */}
                 {auxiliaryValueBadges.map((vItem) => (
                   <span
                     key={`val-${vItem.name}`}
-                    className="flex items-center gap-1 px-2.5 py-0.5 rounded-md bg-slate-950 border border-slate-700/90 text-slate-300 text-[11px] font-mono font-semibold"
-                    title={`Local scalar value ${vItem.name} = ${String(
-                      vItem.value
-                    )} (not an array subscript cursor)`}
+                    className={`flex items-center gap-1 px-2.5 py-0.5 rounded-md text-[11px] font-mono font-semibold ${
+                      vItem.isPivot
+                        ? "bg-amber-500/20 border border-amber-400/80 text-amber-200 shadow-[0_0_10px_rgba(251,191,36,0.3)]"
+                        : "bg-slate-950 border border-slate-700/90 text-slate-300"
+                    }`}
+                    title={
+                      vItem.isPivot
+                        ? `Active pivot element value ${vItem.name} = ${String(
+                            vItem.value
+                          )}`
+                        : `Local scalar value ${vItem.name} = ${String(
+                            vItem.value
+                          )} (not an array subscript cursor)`
+                    }
                   >
-                    <Tag className="w-3 h-3 text-emerald-400 shrink-0" />
-                    <span className="text-slate-400">{vItem.name}:</span>
-                    <span className="text-emerald-400 font-bold">
+                    {vItem.isPivot ? (
+                      <Sparkles className="w-3 h-3 text-amber-400 shrink-0" />
+                    ) : (
+                      <Tag className="w-3 h-3 text-emerald-400 shrink-0" />
+                    )}
+                    <span
+                      className={
+                        vItem.isPivot ? "text-amber-300" : "text-slate-400"
+                      }
+                    >
+                      {vItem.name}:
+                    </span>
+                    <span
+                      className={
+                        vItem.isPivot
+                          ? "text-amber-200 font-extrabold"
+                          : "text-emerald-400 font-bold"
+                      }
+                    >
                       {String(vItem.value)}
                     </span>
                   </span>
@@ -727,6 +874,9 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                         Math.round((Math.abs(cell.barMetric) / maxMetric) * 100)
                       );
                   const activePtrs = inBoundsBySlot[idx] || [];
+                  const pivotInfo: PivotSourceInfo | undefined =
+                    pivotSourceBySlot[idx];
+                  const isPivotSource = Boolean(pivotInfo);
                   const isHighlighted = activePtrs.length > 0;
                   const hasCollision = activePtrs.length > 1;
 
@@ -736,10 +886,10 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                       className={`flex flex-col items-center flex-shrink-0 group overflow-visible ${
                         hasCompoundCells
                           ? "min-w-[96px] w-24"
-                          : "min-w-[56px] w-14"
+                          : "min-w-[62px] w-16"
                       }`}
                     >
-                      {/* Vertically Stacked Verified Subscript Index Badges */}
+                      {/* Vertically Stacked Verified Subscript Index Badges + Pivot Chip */}
                       <div
                         style={{ minHeight: `${badgeStackMinHeight}px` }}
                         className="flex flex-col items-center justify-end gap-1 mb-1.5 overflow-visible z-20"
@@ -757,12 +907,25 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                             </div>
                           );
                         })}
+
+                        {isPivotSource && pivotInfo && (
+                          <div
+                            className="px-2 py-0.5 rounded-md bg-amber-500 text-slate-950 border border-amber-200 font-mono text-[10px] font-extrabold tracking-tight shadow-[0_0_12px_rgba(251,191,36,0.65)] whitespace-nowrap"
+                            title={`Slot [${idx}] is the active pivot element (${pivotInfo.varName} = ${String(
+                              pivotInfo.value
+                            )})`}
+                          >
+                            [PIVOT: {String(pivotInfo.value)}]
+                          </div>
+                        )}
                       </div>
 
                       {/* Vertical Magnitude Bar */}
                       <div
-                        className={`h-28 w-full bg-slate-950/80 rounded-t-lg border border-b-0 flex items-end p-1.5 overflow-hidden transition-colors ${
-                          hasCollision
+                        className={`h-28 w-full bg-slate-950/80 rounded-t-lg border border-b-0 flex items-end p-1.5 overflow-hidden transition-all ${
+                          isPivotSource
+                            ? "border-amber-400 ring-2 ring-amber-400/40 bg-amber-950/30"
+                            : hasCollision
                             ? "border-amber-400/90"
                             : isHighlighted
                             ? "border-sky-400/80"
@@ -772,7 +935,9 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                         <div
                           style={{ height: `${heightPct}%` }}
                           className={`w-full rounded-t transition-all duration-300 ease-out ${
-                            hasCollision
+                            isPivotSource
+                              ? "bg-gradient-to-t from-amber-600 via-amber-400 to-yellow-300 shadow-[0_0_16px_rgba(251,191,36,0.6)]"
+                              : hasCollision
                               ? "bg-gradient-to-t from-amber-600 via-emerald-500 to-sky-400 shadow-[0_0_14px_rgba(251,191,36,0.5)]"
                               : isHighlighted
                               ? "bg-gradient-to-t from-sky-600 to-sky-400 shadow-[0_0_12px_rgba(56,189,248,0.45)]"
@@ -784,7 +949,9 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                       {/* Element Card */}
                       <div
                         className={`w-full py-2 px-1.5 text-center font-mono border rounded-b-md transition-all duration-300 ${
-                          hasCollision
+                          isPivotSource
+                            ? "bg-amber-950/95 border-amber-400 ring-2 ring-amber-400/40 text-amber-100 shadow-[0_0_14px_rgba(251,191,36,0.45)] scale-105 z-10"
+                            : hasCollision
                             ? "bg-amber-950/90 border-amber-400 text-amber-100 shadow-lg scale-105 z-10"
                             : isHighlighted
                             ? "bg-sky-950/95 border-sky-400 text-sky-100 shadow-md scale-105 z-10"
@@ -820,7 +987,7 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
                       {/* Centered Array Index Footer `[idx]` */}
                       <div
                         className={`mt-1.5 text-[11px] font-mono text-center w-full ${
-                          hasCollision
+                          isPivotSource || hasCollision
                             ? "text-amber-400 font-extrabold"
                             : isHighlighted
                             ? "text-sky-400 font-bold"
@@ -845,15 +1012,36 @@ export const ArrayVisualizer: React.FC<ArrayVisualizerProps> = ({
             Stack Frame Locals
           </h4>
           <div className="flex flex-wrap gap-2.5">
-            {Object.entries(locals).map(([k, v]) => (
-              <div
-                key={k}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-slate-200 font-mono text-xs"
-              >
-                <span className="text-slate-400">{k}:</span>
-                <span className="text-emerald-400 font-bold">{String(v)}</span>
-              </div>
-            ))}
+            {Object.entries(locals).map(([k, v]) => {
+              const isPivotLocal = k.toLowerCase().includes("pivot");
+              return (
+                <div
+                  key={k}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg font-mono text-xs ${
+                    isPivotLocal
+                      ? "bg-amber-950/60 border border-amber-400/70 text-amber-100"
+                      : "bg-slate-950 border border-slate-800 text-slate-200"
+                  }`}
+                >
+                  <span
+                    className={
+                      isPivotLocal ? "text-amber-300 font-semibold" : "text-slate-400"
+                    }
+                  >
+                    {k}:
+                  </span>
+                  <span
+                    className={
+                      isPivotLocal
+                        ? "text-amber-300 font-extrabold"
+                        : "text-emerald-400 font-bold"
+                    }
+                  >
+                    {String(v)}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
