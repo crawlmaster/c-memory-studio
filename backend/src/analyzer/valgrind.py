@@ -1,601 +1,606 @@
 #!/usr/bin/env python3
-"""
+r"""
 backend/src/analyzer/valgrind.py
 
-Automated Valgrind Memcheck Auditor for C-Memory-Studio.
-Fixes the Docker container crash (`NameError: name 'app' is not defined`)
-by using FastAPI's `APIRouter` while exporting `run_memory_audit` and
-`ValgrindAuditResponse` for `src/main.py`.
+Valgrind Memcheck & Heap Leak Audit Engine for C-Memory-Studio.
+Compiles user C code with full DWARF-3 symbols in an isolated workspace,
+executes Valgrind Memcheck (both XML protocol 4 and human-readable log summary),
+and returns a comprehensive JSON audit payload.
 """
 
-import asyncio
+import concurrent.futures
 import os
 import re
-import signal
+import shutil
 import subprocess
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-# ==============================================================================
-# Constants & Configuration
-# ==============================================================================
+TMPFS_ROOT = Path(os.getenv("TMPFS_PATH", "/sandbox/workspace"))
+COMPILE_TIMEOUT_SEC = 5.0
+VALGRIND_TIMEOUT_SEC = 8.0
 
-WORKSPACE_DIR = Path(os.getenv("TMPFS_PATH", "/sandbox/workspace"))
-SOURCE_FILENAME = "valgrind_target.c"
-BINARY_FILENAME = "valgrind_target"
-XML_FILENAME = "valgrind.xml"
-XTREE_FILENAME = "valgrind_xtree.kcg"
-
-EXECUTION_TIMEOUT_SEC = 5
-
-VALGRIND_KIND_MAP: Dict[str, str] = {
-    "Leak_DefinitelyLost": "DEFINITELY_LOST",
-    "Leak_IndirectlyLost": "INDIRECTLY_LOST",
-    "Leak_PossiblyLost": "POSSIBLY_LOST",
-    "Leak_StillReachable": "STILL_REACHABLE",
-    "InvalidRead": "INVALID_ACCESS",
-    "InvalidWrite": "INVALID_ACCESS",
-    "InvalidJump": "INVALID_ACCESS",
-    "UninitCondition": "UNINITIALIZED_READ",
-    "UninitValue": "UNINITIALIZED_READ",
-    "InvalidFree": "INVALID_FREE",
-    "MismatchedFree": "INVALID_FREE",
-    "Overlap": "INVALID_ACCESS",
-    "SyscallParam": "INVALID_ACCESS",
-}
-
-HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
-WHAT_SIZE_RE = re.compile(r"size\s+(\d+)", re.IGNORECASE)
-AUXWHAT_BLOCK_SIZE_RE = re.compile(r"block of size\s+([\d,]+)", re.IGNORECASE)
-HEAP_USAGE_RE = re.compile(
-    r"total heap usage:\s*([\d,]+)\s+allocs,\s*([\d,]+)\s+frees,\s*([\d,]+)\s+bytes allocated",
+# Regex parsers for Valgrind's human-readable HEAP SUMMARY and LEAK SUMMARY blocks
+IN_USE_AT_EXIT_RE = re.compile(
+    r"in use at exit:\s*([\d,]+)\s*bytes\s+in\s+([\d,]+)\s*blocks",
     re.IGNORECASE,
 )
-XTREE_TOTALS_RE = re.compile(
-    r"^totals:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$",
-    re.MULTILINE,
+TOTAL_HEAP_USAGE_RE = re.compile(
+    r"total heap usage:\s*([\d,]+)\s*allocs,\s*([\d,]+)\s*frees,\s*([\d,]+)\s*bytes allocated",
+    re.IGNORECASE,
 )
+LEAK_CATEGORY_RE = {
+    "definitely_lost": re.compile(
+        r"definitely lost:\s*([\d,]+)\s*bytes\s+in\s+([\d,]+)\s*blocks",
+        re.IGNORECASE,
+    ),
+    "indirectly_lost": re.compile(
+        r"indirectly lost:\s*([\d,]+)\s*bytes\s+in\s+([\d,]+)\s*blocks",
+        re.IGNORECASE,
+    ),
+    "possibly_lost": re.compile(
+        r"possibly lost:\s*([\d,]+)\s*bytes\s+in\s+([\d,]+)\s*blocks",
+        re.IGNORECASE,
+    ),
+    "still_reachable": re.compile(
+        r"still reachable:\s*([\d,]+)\s*bytes\s+in\s+([\d,]+)\s*blocks",
+        re.IGNORECASE,
+    ),
+    "suppressed": re.compile(
+        r"suppressed:\s*([\d,]+)\s*bytes\s+in\s+([\d,]+)\s*blocks",
+        re.IGNORECASE,
+    ),
+}
+PID_PREFIX_RE = re.compile(r"^==\d+==\s?", re.MULTILINE)
 
-# Standalone APIRouter (Eliminates NameError: name 'app' is not defined)
-router = APIRouter()
+
+class ValgrindFrame(BaseModel):
+    ip: str = ""
+    fn: str = "??"
+    file: str = ""
+    line: int = 0
+    is_user_code: bool = False
 
 
-# ==============================================================================
-# Pydantic Output Models
-# ==============================================================================
-
-class SourceLocation(BaseModel):
-    file: str = Field(default="valgrind_target.c")
-    function: str = Field(default="unknown")
-    line: int = Field(default=0)
-
-
-class MemoryBlockReport(BaseModel):
+class ValgrindErrorItem(BaseModel):
     id: str
-    address: str
-    size_bytes: int
-    block_count: int = Field(default=1)
-    state: str
-    allocated_at: Optional[SourceLocation] = None
-    detected_at: Optional[SourceLocation] = None
+    kind: str
+    type: str
+    what: str
+    message: str
     description: str
+    bytes_leaked: int = 0
+    blocks_leaked: int = 0
+    file: str = ""
+    line: int = 0
+    function: str = ""
+    auxwhat: List[str] = Field(default_factory=list)
+    stack: List[ValgrindFrame] = Field(default_factory=list)
+    frames: List[ValgrindFrame] = Field(default_factory=list)
 
 
-class AuditSummary(BaseModel):
-    total_allocated_bytes: int
-    total_freed_bytes: int
-    total_alloc_calls: int = 0
-    total_free_calls: int = 0
-    leaked_bytes: int
-    leak_count: int
-    has_fatal_errors: bool
-    exit_code: int = 0
-    signal: Optional[str] = None
+class HeapSummaryStats(BaseModel):
+    in_use_at_exit_bytes: int = 0
+    in_use_at_exit_blocks: int = 0
+    total_allocs: int = 0
+    total_frees: int = 0
+    total_bytes_allocated: int = 0
 
 
-class ValgrindAuditResponse(BaseModel):
-    success: bool
-    compilation_error: Optional[str] = None
-    runtime_error: Optional[str] = None
-    summary: Optional[AuditSummary] = None
-    blocks: List[MemoryBlockReport] = Field(default_factory=list)
+class LeakSummaryStats(BaseModel):
+    definitely_lost_bytes: int = 0
+    definitely_lost_blocks: int = 0
+    indirectly_lost_bytes: int = 0
+    indirectly_lost_blocks: int = 0
+    possibly_lost_bytes: int = 0
+    possibly_lost_blocks: int = 0
+    still_reachable_bytes: int = 0
+    still_reachable_blocks: int = 0
+    suppressed_bytes: int = 0
+    suppressed_blocks: int = 0
 
 
-class MemoryAnalyzeRequest(BaseModel):
-    code: str = Field(..., min_length=1, description="C source code to compile and audit")
-    stdin: str = Field(default="", description="Optional standard input passed to the binary")
-
-
-# ==============================================================================
-# Compilation & Execution Pipeline
-# ==============================================================================
-
-def compile_valgrind_target(
-    source_code: str,
-    workspace: Path = WORKSPACE_DIR,
-) -> Tuple[bool, Path, Path, str]:
-    workspace.mkdir(parents=True, exist_ok=True)
-    source_path = workspace / SOURCE_FILENAME
-    binary_path = workspace / BINARY_FILENAME
-
-    if binary_path.exists():
-        binary_path.unlink()
-
-    source_path.write_text(source_code, encoding="utf-8")
-
-    compile_cmd = [
-        "gcc",
-        "-g3",
-        "-O0",
-        "-no-pie",
-        "-fno-builtin",
-        "-Wall",
-        "-o",
-        str(binary_path),
-        str(source_path),
-    ]
-
-    proc = subprocess.run(
-        compile_cmd,
-        capture_output=True,
-        text=True,
-        timeout=EXECUTION_TIMEOUT_SEC,
-    )
-
-    if proc.returncode != 0:
-        return (False, binary_path, source_path, proc.stderr.strip())
-
-    return (True, binary_path, source_path, "")
-
-
-def execute_valgrind(
-    binary_path: Path,
-    xml_path: Path,
-    xtree_path: Path,
-    stdin_data: str = "",
-) -> Tuple[int, str, str, bool]:
-    for p in (xml_path, xtree_path):
-        if p.exists():
-            p.unlink()
-
-    valgrind_cmd = [
-        "valgrind",
-        "--tool=memcheck",
-        "--leak-check=full",
-        "--show-leak-kinds=all",
-        "--track-origins=yes",
-        "--xtree-memory=full",
-        f"--xtree-memory-file={xtree_path}",
-        "--xml=yes",
-        f"--xml-file={xml_path}",
-        str(binary_path),
-    ]
-
+def _parse_int_commas(raw: str) -> int:
     try:
-        proc = subprocess.run(
-            valgrind_cmd,
-            input=stdin_data,
-            capture_output=True,
-            text=True,
-            timeout=EXECUTION_TIMEOUT_SEC,
-        )
-        return (proc.returncode, proc.stdout, proc.stderr, False)
-    except subprocess.TimeoutExpired as exc:
-        stderr_partial = (
-            exc.stderr.decode("utf-8", errors="replace")
-            if isinstance(exc.stderr, bytes)
-            else (exc.stderr or "")
-        )
-        stdout_partial = (
-            exc.stdout.decode("utf-8", errors="replace")
-            if isinstance(exc.stdout, bytes)
-            else (exc.stdout or "")
-        )
-        return (-1, stdout_partial, stderr_partial, True)
+        return int(raw.replace(",", "").strip())
+    except (ValueError, AttributeError):
+        return 0
 
 
-def parse_xtree_heap_totals(xtree_path: Path) -> Tuple[int, int, int, int]:
-    if not xtree_path.exists():
-        return (0, 0, 0, 0)
+def _parse_valgrind_text_summary(
+    raw_log: str,
+) -> Tuple[HeapSummaryStats, LeakSummaryStats]:
+    heap_stats = HeapSummaryStats()
+    leak_stats = LeakSummaryStats()
 
-    try:
-        content = xtree_path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return (0, 0, 0, 0)
+    in_use_m = IN_USE_AT_EXIT_RE.search(raw_log)
+    if in_use_m:
+        heap_stats.in_use_at_exit_bytes = _parse_int_commas(in_use_m.group(1))
+        heap_stats.in_use_at_exit_blocks = _parse_int_commas(in_use_m.group(2))
 
-    match = XTREE_TOTALS_RE.search(content)
-    if match:
-        tot_b = int(match.group(3))
-        tot_bk = int(match.group(4))
-        tot_fd_b = int(match.group(5))
-        tot_fd_bk = int(match.group(6))
-        return (tot_b, tot_bk, tot_fd_b, tot_fd_bk)
+    usage_m = TOTAL_HEAP_USAGE_RE.search(raw_log)
+    if usage_m:
+        heap_stats.total_allocs = _parse_int_commas(usage_m.group(1))
+        heap_stats.total_frees = _parse_int_commas(usage_m.group(2))
+        heap_stats.total_bytes_allocated = _parse_int_commas(usage_m.group(3))
 
-    return (0, 0, 0, 0)
+    for key, pattern in LEAK_CATEGORY_RE.items():
+        m = pattern.search(raw_log)
+        if m:
+            b_val = _parse_int_commas(m.group(1))
+            blk_val = _parse_int_commas(m.group(2))
+            setattr(leak_stats, f"{key}_bytes", b_val)
+            setattr(leak_stats, f"{key}_blocks", blk_val)
 
-
-# ==============================================================================
-# XML Parsing & Stack Frame Extraction
-# ==============================================================================
-
-def _extract_user_frame(
-    stack_elem: Optional[ET.Element], target_file: str = SOURCE_FILENAME
-) -> Tuple[SourceLocation, str]:
-    if stack_elem is None:
-        return (SourceLocation(), "0x0")
-
-    frames = stack_elem.findall("frame")
-    first_ip = "0x0"
-
-    for idx, frame in enumerate(frames):
-        ip_text = (frame.findtext("ip") or "0x0").strip().lower()
-        if idx == 0:
-            first_ip = ip_text
-
-        fn_text = (frame.findtext("fn") or "unknown").strip()
-        file_text = (frame.findtext("file") or "").strip()
-        line_text = (frame.findtext("line") or "0").strip()
-
-        if Path(file_text).name == target_file:
-            try:
-                line_num = int(line_text)
-            except ValueError:
-                line_num = 0
-            return (
-                SourceLocation(
-                    file=target_file,
-                    function=fn_text,
-                    line=line_num,
-                ),
-                first_ip,
-            )
-
-    if frames:
-        top = frames[0]
-        fn_text = (top.findtext("fn") or "unknown").strip()
-        file_text = Path(top.findtext("file") or target_file).name
-        try:
-            line_num = int(top.findtext("line") or 0)
-        except ValueError:
-            line_num = 0
-        return (
-            SourceLocation(file=file_text, function=fn_text, line=line_num),
-            first_ip,
-        )
-
-    return (SourceLocation(), first_ip)
+    return (heap_stats, leak_stats)
 
 
-def _extract_bytes_and_blocks(
-    error_elem: ET.Element, what_text: str, auxwhat_texts: List[str]
-) -> Tuple[int, int]:
-    xwhat = error_elem.find("xwhat")
-    if xwhat is not None:
-        bytes_str = (
-            xwhat.findtext("leakedbytes") or xwhat.findtext("bytes") or "0"
-        ).strip()
-        blocks_str = (
-            xwhat.findtext("leakedblocks") or xwhat.findtext("blocks") or "1"
-        ).strip()
-        try:
-            b_val = int(bytes_str.replace(",", ""))
-        except ValueError:
-            b_val = 0
-        try:
-            blk_val = int(blocks_str.replace(",", ""))
-        except ValueError:
-            blk_val = 1
-        return (b_val, blk_val)
-
-    for aux in auxwhat_texts:
-        m_blk = AUXWHAT_BLOCK_SIZE_RE.search(aux)
-        if m_blk:
-            return (int(m_blk.group(1).replace(",", "")), 1)
-
-    m_what = WHAT_SIZE_RE.search(what_text)
-    if m_what:
-        return (int(m_what.group(1)), 1)
-
-    return (0, 1)
-
-
-def _extract_target_address(auxwhat_texts: List[str], fallback_ip: str) -> str:
-    for aux in auxwhat_texts:
-        match = HEX_ADDR_RE.search(aux)
-        if match:
-            return match.group(1).lower()
-    return fallback_ip
-
-
-def _sanitize_or_recover_xml(xml_path: Path) -> Optional[ET.Element]:
+def _parse_valgrind_xml(
+    xml_path: Path, user_source_filename: str = "target.c"
+) -> List[ValgrindErrorItem]:
     if not xml_path.exists():
-        return None
+        return []
 
     raw_xml = xml_path.read_text(encoding="utf-8", errors="replace").strip()
     if not raw_xml:
-        return None
+        return []
+
+    # If the target crashed mid-write before closing `</valgrindoutput>`, repair the tail
+    if "</valgrindoutput>" not in raw_xml:
+        raw_xml += "\n</valgrindoutput>"
 
     try:
-        return ET.fromstring(raw_xml)
+        root = ET.fromstring(raw_xml)
     except ET.ParseError:
-        if "<valgrindoutput>" in raw_xml and not raw_xml.endswith("</valgrindoutput>"):
-            last_close = raw_xml.rfind("</error>")
-            if last_close != -1:
-                repaired = (
-                    raw_xml[: last_close + len("</error>")] + "\n</valgrindoutput>"
-                )
-            else:
-                repaired = raw_xml + "\n</valgrindoutput>"
-            try:
-                return ET.fromstring(repaired)
-            except ET.ParseError:
-                return None
-        return None
+        return []
 
+    errors: List[ValgrindErrorItem] = []
 
-def parse_valgrind_report(
-    xml_path: Path,
-    xtree_path: Path,
-    stderr_text: str,
-    exit_code: int,
-) -> Tuple[AuditSummary, List[MemoryBlockReport]]:
-    root = _sanitize_or_recover_xml(xml_path)
-    blocks: List[MemoryBlockReport] = []
+    for idx, err_elem in enumerate(root.findall("error")):
+        unique_id = (err_elem.findtext("unique") or f"err-{idx}").strip()
+        kind = (err_elem.findtext("kind") or "MemoryError").strip()
 
-    leaked_bytes_total = 0
-    leak_count = 0
-    has_fatal_errors = False
-    alloc_counter = 0
-
-    if root is not None:
-        for error_elem in root.findall("error"):
-            raw_kind = (error_elem.findtext("kind") or "").strip()
-            if not raw_kind:
-                continue
-
-            if raw_kind in VALGRIND_KIND_MAP:
-                mapped_state = VALGRIND_KIND_MAP[raw_kind]
-            elif raw_kind.startswith("Leak_"):
-                mapped_state = raw_kind.replace("Leak_", "").upper()
-            else:
-                mapped_state = "INVALID_ACCESS"
-
-            xwhat_elem = error_elem.find("xwhat")
-            if xwhat_elem is not None and xwhat_elem.findtext("text"):
-                description = xwhat_elem.findtext("text", "").strip()
-            else:
-                description = (error_elem.findtext("what") or raw_kind).strip()
-
-            description = re.sub(r"\s+", " ", description)
-
-            auxwhat_texts = [
-                (aux.text or "").strip()
-                for aux in error_elem.findall("auxwhat")
-                if aux.text
-            ]
-
-            size_bytes, blk_count = _extract_bytes_and_blocks(
-                error_elem, description, auxwhat_texts
+        xwhat_elem = err_elem.find("xwhat")
+        if xwhat_elem is not None:
+            what_text = (xwhat_elem.findtext("text") or "").strip()
+            leaked_bytes = _parse_int_commas(
+                xwhat_elem.findtext("leakedbytes") or "0"
             )
-
-            stacks = error_elem.findall("stack")
-            allocated_at: Optional[SourceLocation] = None
-            detected_at: Optional[SourceLocation] = None
-            fallback_ip = "0x0"
-
-            is_leak = raw_kind.startswith("Leak_")
-
-            if is_leak:
-                if stacks:
-                    allocated_at, fallback_ip = _extract_user_frame(stacks[0])
-                if mapped_state in {
-                    "DEFINITELY_LOST",
-                    "INDIRECTLY_LOST",
-                    "POSSIBLY_LOST",
-                }:
-                    leaked_bytes_total += size_bytes
-                    leak_count += blk_count
-            else:
-                has_fatal_errors = True
-                if len(stacks) >= 1:
-                    detected_at, fallback_ip = _extract_user_frame(stacks[0])
-                if len(stacks) >= 2:
-                    allocated_at, _ = _extract_user_frame(stacks[1])
-                else:
-                    allocated_at = detected_at
-
-            address = _extract_target_address(auxwhat_texts, fallback_ip)
-            alloc_counter += 1
-
-            blocks.append(
-                MemoryBlockReport(
-                    id=f"alloc-{alloc_counter}",
-                    address=address,
-                    size_bytes=size_bytes,
-                    block_count=blk_count,
-                    state=mapped_state,
-                    allocated_at=allocated_at,
-                    detected_at=detected_at,
-                    description=description,
-                )
+            leaked_blocks = _parse_int_commas(
+                xwhat_elem.findtext("leakedblocks") or "0"
             )
+        else:
+            what_text = (err_elem.findtext("what") or kind).strip()
+            leaked_bytes = 0
+            leaked_blocks = 0
 
-        fatal_sig_elem = root.find("fatal_signal")
-        if fatal_sig_elem is not None:
-            has_fatal_errors = True
-            sig_name = (fatal_sig_elem.findtext("signame") or "SIGSEGV").strip()
-            sig_stack = fatal_sig_elem.find("stack")
-            det_loc, sig_ip = _extract_user_frame(sig_stack)
-            alloc_counter += 1
-            blocks.append(
-                MemoryBlockReport(
-                    id=f"alloc-{alloc_counter}",
-                    address=sig_ip,
-                    size_bytes=0,
-                    block_count=1,
-                    state="INVALID_ACCESS",
-                    allocated_at=det_loc,
-                    detected_at=det_loc,
-                    description=f"Process terminated with fatal signal {sig_name}",
+        auxwhat_list: List[str] = []
+        for aux_el in err_elem.findall("auxwhat"):
+            if aux_el.text and aux_el.text.strip():
+                auxwhat_list.append(aux_el.text.strip())
+        for xaux_el in err_elem.findall("xauxwhat"):
+            txt = xaux_el.findtext("text")
+            if txt and txt.strip():
+                auxwhat_list.append(txt.strip())
+
+        frames: List[ValgrindFrame] = []
+        primary_file = ""
+        primary_line = 0
+        primary_fn = ""
+
+        # Parse all stack traces (primary stack first)
+        stacks = err_elem.findall("stack")
+        if stacks:
+            for fr_el in stacks[0].findall("frame"):
+                ip_str = (fr_el.findtext("ip") or "").strip()
+                fn_str = (fr_el.findtext("fn") or "??").strip()
+                file_str = (fr_el.findtext("file") or "").strip()
+                line_str = (fr_el.findtext("line") or "0").strip()
+                try:
+                    line_int = int(line_str)
+                except ValueError:
+                    line_int = 0
+
+                is_user = (
+                    file_str == user_source_filename
+                    or file_str.endswith(f"/{user_source_filename}")
                 )
+                if is_user and primary_line == 0 and line_int > 0:
+                    primary_file = user_source_filename
+                    primary_line = line_int
+                    primary_fn = fn_str
+
+                frames.append(
+                    ValgrindFrame(
+                        ip=ip_str,
+                        fn=fn_str,
+                        file=file_str,
+                        line=line_int,
+                        is_user_code=is_user,
+                    )
+                )
+
+        if not primary_fn and frames:
+            primary_fn = frames[0].fn
+            primary_file = frames[0].file
+            primary_line = frames[0].line
+
+        errors.append(
+            ValgrindErrorItem(
+                id=f"{unique_id}-{idx}",
+                kind=kind,
+                type=kind,
+                what=what_text,
+                message=what_text,
+                description=what_text,
+                bytes_leaked=leaked_bytes,
+                blocks_leaked=leaked_blocks,
+                file=primary_file,
+                line=primary_line,
+                function=primary_fn,
+                auxwhat=auxwhat_list,
+                stack=frames,
+                frames=frames,
             )
+        )
 
-    signal_name: Optional[str] = None
-    if exit_code < 0:
-        has_fatal_errors = True
-        sig_num = -exit_code
-        try:
-            signal_name = signal.Signals(sig_num).name
-        except ValueError:
-            signal_name = f"SIG({sig_num})"
-    elif exit_code in {134, 139}:
-        has_fatal_errors = True
-        signal_name = "SIGABRT" if exit_code == 134 else "SIGSEGV"
+    return errors
 
-    xtree_alloc_b, xtree_alloc_bk, xtree_freed_b, xtree_freed_bk = (
-        parse_xtree_heap_totals(xtree_path)
-    )
 
-    unfreed_bytes_in_xml = sum(
-        b.size_bytes
-        for b in blocks
-        if b.state
-        in {
-            "DEFINITELY_LOST",
-            "INDIRECTLY_LOST",
-            "POSSIBLY_LOST",
-            "STILL_REACHABLE",
+def run_valgrind_audit(
+    source_code: str, stdin_text: Optional[str] = None
+) -> Dict[str, Any]:
+    r"""
+    Compiles `source_code` in an isolated workspace and runs Valgrind Memcheck.
+    Returns a unified dictionary compatible with all frontend audit views.
+    """
+    if not source_code or not source_code.strip():
+        return {
+            "status": "compile_error",
+            "success": False,
+            "is_clean": False,
+            "compile_error": "No C source code was provided for Valgrind analysis.",
+            "stderr": "No C source code was provided for Valgrind analysis.",
+            "stdout": "",
+            "raw_output": "",
+            "valgrind_output": "",
+            "log": "",
+            "errors": [],
+            "leaks": [],
+            "summary": {
+                "total_allocs": 0,
+                "total_frees": 0,
+                "bytes_allocated": 0,
+                "definitely_lost": 0,
+                "indirectly_lost": 0,
+                "possibly_lost": 0,
+                "still_reachable": 0,
+                "error_count": 0,
+                "is_clean": False,
+            },
         }
-    )
 
-    total_allocated_bytes = max(xtree_alloc_b, unfreed_bytes_in_xml)
-    total_freed_bytes = xtree_freed_b
+    workdir = TMPFS_ROOT / f"valgrind_{uuid.uuid4().hex[:12]}"
+    workdir.mkdir(parents=True, exist_ok=True)
 
-    m_heap = HEAP_USAGE_RE.search(stderr_text)
-    if m_heap:
-        try:
-            stderr_alloc_b = int(m_heap.group(3).replace(",", ""))
-            total_allocated_bytes = max(total_allocated_bytes, stderr_alloc_b)
-        except ValueError:
-            pass
-
-    if total_freed_bytes == 0 and total_allocated_bytes > unfreed_bytes_in_xml:
-        total_freed_bytes = total_allocated_bytes - unfreed_bytes_in_xml
-
-    summary = AuditSummary(
-        total_allocated_bytes=total_allocated_bytes,
-        total_freed_bytes=total_freed_bytes,
-        total_alloc_calls=xtree_alloc_bk,
-        total_free_calls=xtree_freed_bk,
-        leaked_bytes=leaked_bytes_total,
-        leak_count=leak_count,
-        has_fatal_errors=has_fatal_errors,
-        exit_code=exit_code,
-        signal=signal_name,
-    )
-
-    return (summary, blocks)
-
-
-# ==============================================================================
-# High-Level Entrypoint Function & APIRouter Route
-# ==============================================================================
-
-def run_memory_audit(source_code: str, stdin_data: str = "") -> ValgrindAuditResponse:
-    compiled_ok, binary_path, _, gcc_stderr = compile_valgrind_target(source_code)
-    if not compiled_ok:
-        return ValgrindAuditResponse(
-            success=False,
-            compilation_error=gcc_stderr,
-        )
-
-    xml_path = WORKSPACE_DIR / XML_FILENAME
-    xtree_path = WORKSPACE_DIR / XTREE_FILENAME
-
-    exit_code, _, valgrind_stderr, timed_out = execute_valgrind(
-        binary_path=binary_path,
-        xml_path=xml_path,
-        xtree_path=xtree_path,
-        stdin_data=stdin_data,
-    )
-
-    summary, blocks = parse_valgrind_report(
-        xml_path=xml_path,
-        xtree_path=xtree_path,
-        stderr_text=valgrind_stderr,
-        exit_code=exit_code,
-    )
-
-    if timed_out:
-        summary.has_fatal_errors = True
-        return ValgrindAuditResponse(
-            success=True,
-            runtime_error=f"Execution timed out after {EXECUTION_TIMEOUT_SEC} seconds.",
-            summary=summary,
-            blocks=blocks,
-        )
-
-    return ValgrindAuditResponse(
-        success=True,
-        summary=summary,
-        blocks=blocks,
-    )
-
-
-@router.post(
-    "/api/analyze/memory",
-    response_model=ValgrindAuditResponse,
-    responses={
-        200: {"description": "Valgrind analysis completed successfully"},
-        400: {"description": "GCC compilation failed"},
-        500: {"description": "Internal execution failure"},
-    },
-)
-async def analyze_memory_route(
-    payload: MemoryAnalyzeRequest,
-    request: Request,
-) -> JSONResponse:
-    origin = request.headers.get("origin") or "*"
-    cors_headers = {
-        "Access-Control-Allow-Origin": origin,
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
-    }
+    source_path = workdir / "target.c"
+    binary_path = workdir / "target"
+    xml_path = workdir / "valgrind.xml"
+    log_path = workdir / "valgrind.log"
 
     try:
-        result: ValgrindAuditResponse = await asyncio.to_thread(
-            run_memory_audit,
-            payload.code,
-            payload.stdin,
+        source_path.write_text(source_code, encoding="utf-8")
+
+        compile_cmd = [
+            "gcc",
+            "-g3",
+            "-O0",
+            "-fno-inline",
+            "-fno-omit-frame-pointer",
+            "-no-pie",
+            "-Wall",
+            "-o",
+            str(binary_path),
+            str(source_path),
+        ]
+
+        compile_proc = subprocess.run(
+            compile_cmd,
+            capture_output=True,
+            text=True,
+            timeout=COMPILE_TIMEOUT_SEC,
         )
 
-        if not result.success:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={
-                    "success": False,
-                    "compilation_error": result.compilation_error,
+        if compile_proc.returncode != 0:
+            err_msg = compile_proc.stderr or "Compilation failed."
+            return {
+                "status": "compile_error",
+                "success": False,
+                "is_clean": False,
+                "compile_error": err_msg,
+                "stderr": err_msg,
+                "stdout": compile_proc.stdout or "",
+                "raw_output": err_msg,
+                "valgrind_output": err_msg,
+                "log": err_msg,
+                "errors": [],
+                "leaks": [],
+                "summary": {
+                    "total_allocs": 0,
+                    "total_frees": 0,
+                    "bytes_allocated": 0,
+                    "definitely_lost": 0,
+                    "indirectly_lost": 0,
+                    "possibly_lost": 0,
+                    "still_reachable": 0,
+                    "error_count": 0,
+                    "is_clean": False,
                 },
-                headers=cors_headers,
+            }
+
+        stdin_bytes = stdin_text.encode("utf-8") if stdin_text else None
+
+        xml_cmd = [
+            "valgrind",
+            "--tool=memcheck",
+            "--leak-check=full",
+            "--show-leak-kinds=all",
+            "--track-origins=yes",
+            "--xml=yes",
+            f"--xml-file={xml_path}",
+            str(binary_path),
+        ]
+
+        log_cmd = [
+            "valgrind",
+            "--tool=memcheck",
+            "--leak-check=full",
+            "--show-leak-kinds=all",
+            "--track-origins=yes",
+            f"--log-file={log_path}",
+            str(binary_path),
+        ]
+
+        def _exec_cmd(cmd: List[str]) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                cmd,
+                input=stdin_bytes,
+                capture_output=True,
+                timeout=VALGRIND_TIMEOUT_SEC,
+                cwd=str(workdir),
             )
 
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content=result.model_dump(exclude_none=True),
-            headers=cors_headers,
+        # Execute XML and human-readable log runs concurrently (~70ms total)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            fut_xml = pool.submit(_exec_cmd, xml_cmd)
+            fut_log = pool.submit(_exec_cmd, log_cmd)
+            xml_proc = fut_xml.result()
+            log_proc = fut_log.result()
+
+        prog_stdout = (log_proc.stdout or b"").decode("utf-8", errors="replace")
+        prog_stderr = (log_proc.stderr or b"").decode("utf-8", errors="replace")
+
+        raw_log_text = (
+            log_path.read_text(encoding="utf-8", errors="replace")
+            if log_path.exists()
+            else ""
         )
-    except Exception as exc:
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "runtime_error": f"Valgrind execution failed: {type(exc).__name__}: {exc}",
+        clean_log_text = PID_PREFIX_RE.sub("", raw_log_text).strip()
+
+        heap_stats, leak_stats = _parse_valgrind_text_summary(raw_log_text)
+        parsed_errors = _parse_valgrind_xml(xml_path, user_source_filename="target.c")
+
+        # Separate leak records vs non-leak memory errors (e.g. InvalidRead, InvalidWrite, InvalidFree, UninitCondition)
+        leak_items = [
+            e.model_dump()
+            for e in parsed_errors
+            if e.kind.startswith("Leak_")
+        ]
+        all_error_items = [e.model_dump() for e in parsed_errors]
+
+        # Backfill leak summary from XML if text summary was truncated by a signal
+        if leak_stats.definitely_lost_bytes == 0:
+            for e in parsed_errors:
+                if e.kind == "Leak_DefinitelyLost":
+                    leak_stats.definitely_lost_bytes += e.bytes_leaked
+                    leak_stats.definitely_lost_blocks += e.blocks_leaked
+                elif e.kind == "Leak_IndirectlyLost":
+                    leak_stats.indirectly_lost_bytes += e.bytes_leaked
+                    leak_stats.indirectly_lost_blocks += e.blocks_leaked
+                elif e.kind == "Leak_PossiblyLost":
+                    leak_stats.possibly_lost_bytes += e.bytes_leaked
+                    leak_stats.possibly_lost_blocks += e.blocks_leaked
+                elif e.kind == "Leak_StillReachable":
+                    leak_stats.still_reachable_bytes += e.bytes_leaked
+                    leak_stats.still_reachable_blocks += e.blocks_leaked
+
+        total_leaked_bytes = (
+            leak_stats.definitely_lost_bytes
+            + leak_stats.indirectly_lost_bytes
+            + leak_stats.possibly_lost_bytes
+            + leak_stats.still_reachable_bytes
+        )
+        is_clean = (
+            len(parsed_errors) == 0
+            and total_leaked_bytes == 0
+            and heap_stats.in_use_at_exit_bytes == 0
+        )
+
+        summary_payload = {
+            "total_allocs": heap_stats.total_allocs,
+            "total_frees": heap_stats.total_frees,
+            "bytes_allocated": heap_stats.total_bytes_allocated,
+            "total_bytes_allocated": heap_stats.total_bytes_allocated,
+            "in_use_at_exit_bytes": heap_stats.in_use_at_exit_bytes,
+            "in_use_at_exit_blocks": heap_stats.in_use_at_exit_blocks,
+            "definitely_lost": leak_stats.definitely_lost_bytes,
+            "definitely_lost_bytes": leak_stats.definitely_lost_bytes,
+            "definitely_lost_blocks": leak_stats.definitely_lost_blocks,
+            "indirectly_lost": leak_stats.indirectly_lost_bytes,
+            "indirectly_lost_bytes": leak_stats.indirectly_lost_bytes,
+            "indirectly_lost_blocks": leak_stats.indirectly_lost_blocks,
+            "possibly_lost": leak_stats.possibly_lost_bytes,
+            "possibly_lost_bytes": leak_stats.possibly_lost_bytes,
+            "possibly_lost_blocks": leak_stats.possibly_lost_blocks,
+            "still_reachable": leak_stats.still_reachable_bytes,
+            "still_reachable_bytes": leak_stats.still_reachable_bytes,
+            "still_reachable_blocks": leak_stats.still_reachable_blocks,
+            "suppressed_bytes": leak_stats.suppressed_bytes,
+            "suppressed_blocks": leak_stats.suppressed_blocks,
+            "error_count": len(parsed_errors),
+            "is_clean": is_clean,
+        }
+
+        return {
+            "status": "completed",
+            "success": True,
+            "is_clean": is_clean,
+            "compile_error": None,
+            "exit_code": xml_proc.returncode,
+            "stdout": prog_stdout,
+            "stderr": prog_stderr,
+            "raw_output": raw_log_text,
+            "valgrind_output": raw_log_text,
+            "clean_log": clean_log_text,
+            "log": raw_log_text,
+            "heap_summary": heap_stats.model_dump(),
+            "leak_summary": leak_stats.model_dump(),
+            "summary": summary_payload,
+            "total_allocs": heap_stats.total_allocs,
+            "total_frees": heap_stats.total_frees,
+            "bytes_allocated": heap_stats.total_bytes_allocated,
+            "in_use_at_exit_bytes": heap_stats.in_use_at_exit_bytes,
+            "in_use_at_exit_blocks": heap_stats.in_use_at_exit_blocks,
+            "definitely_lost": leak_stats.definitely_lost_bytes,
+            "indirectly_lost": leak_stats.indirectly_lost_bytes,
+            "possibly_lost": leak_stats.possibly_lost_bytes,
+            "still_reachable": leak_stats.still_reachable_bytes,
+            "error_count": len(parsed_errors),
+            "errors": all_error_items,
+            "leaks": leak_items,
+        }
+
+    except subprocess.TimeoutExpired:
+        timeout_msg = f"Valgrind execution timed out after {VALGRIND_TIMEOUT_SEC:.0f}s."
+        return {
+            "status": "timeout",
+            "success": False,
+            "is_clean": False,
+            "compile_error": None,
+            "stderr": timeout_msg,
+            "stdout": "",
+            "raw_output": timeout_msg,
+            "valgrind_output": timeout_msg,
+            "log": timeout_msg,
+            "errors": [
+                {
+                    "id": "timeout-0",
+                    "kind": "TimeoutError",
+                    "type": "TimeoutError",
+                    "what": timeout_msg,
+                    "message": timeout_msg,
+                    "description": timeout_msg,
+                    "bytes_leaked": 0,
+                    "blocks_leaked": 0,
+                    "file": "target.c",
+                    "line": 1,
+                    "function": "main",
+                    "auxwhat": [],
+                    "stack": [],
+                    "frames": [],
+                }
+            ],
+            "leaks": [],
+            "summary": {
+                "total_allocs": 0,
+                "total_frees": 0,
+                "bytes_allocated": 0,
+                "definitely_lost": 0,
+                "indirectly_lost": 0,
+                "possibly_lost": 0,
+                "still_reachable": 0,
+                "error_count": 1,
+                "is_clean": False,
             },
-            headers=cors_headers,
-        )
+        }
+    except Exception as exc:
+        err_str = f"Internal Valgrind analyzer error: {exc}"
+        return {
+            "status": "error",
+            "success": False,
+            "is_clean": False,
+            "compile_error": err_str,
+            "stderr": err_str,
+            "stdout": "",
+            "raw_output": err_str,
+            "valgrind_output": err_str,
+            "log": err_str,
+            "errors": [],
+            "leaks": [],
+            "summary": {
+                "total_allocs": 0,
+                "total_frees": 0,
+                "bytes_allocated": 0,
+                "definitely_lost": 0,
+                "indirectly_lost": 0,
+                "possibly_lost": 0,
+                "still_reachable": 0,
+                "error_count": 0,
+                "is_clean": False,
+            },
+        }
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# FastAPI Router for modular inclusion
+router = APIRouter()
+
+
+async def _extract_audit_request(request: Request) -> Tuple[str, Optional[str]]:
+    raw_bytes = await request.body()
+    raw_text = raw_bytes.decode("utf-8", errors="replace")
+    try:
+        import json
+
+        data = json.loads(raw_text)
+        if isinstance(data, dict):
+            code = (
+                data.get("code")
+                or data.get("source_code")
+                or data.get("source")
+                or data.get("c_code")
+                or ""
+            )
+            stdin_val = data.get("stdin") or data.get("input")
+            return (
+                str(code),
+                str(stdin_val) if stdin_val is not None else None,
+            )
+    except Exception:
+        pass
+    return (raw_text, None)
+
+
+@router.post("/api/analyze/memory")
+@router.post("/analyze/memory")
+@router.post("/api/valgrind")
+@router.post("/valgrind")
+@router.post("/api/analyze/valgrind")
+@router.post("/analyze/valgrind")
+@router.post("/api/audit")
+@router.post("/audit")
+async def handle_valgrind_audit_http(request: Request) -> Dict[str, Any]:
+    import asyncio
+
+    source_code, stdin_text = await _extract_audit_request(request)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, run_valgrind_audit, source_code, stdin_text
+    )
+    return result

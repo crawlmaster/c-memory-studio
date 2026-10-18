@@ -3,8 +3,11 @@ r"""
 backend/src/main.py
 
 FastAPI WebSocket & REST Entrypoint for C-Memory-Studio.
-Streams DWARF/GDB-MI execution snapshots asynchronously via `asyncio.Queue`
-without blocking the event loop, and tears down the GDB subprocess cleanly on disconnect.
+1. Mounts the Valgrind Memcheck & Leak Audit router (`src.analyzer.valgrind.router`)
+   across `/api/analyze/memory`, `/analyze/memory`, `/api/valgrind`, `/valgrind`,
+   `/api/analyze/valgrind`, and `/api/audit`.
+2. Streams DWARF/GDB-MI execution snapshots asynchronously via `/ws/trace` and
+   `/api/ws/trace` without blocking the FastAPI event loop.
 """
 
 import asyncio
@@ -19,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.analyzer.valgrind import router as valgrind_router
 from src.debugger.gdb_engine import (
     GDBTracer,
     TMPFS_ROOT,
@@ -34,8 +38,8 @@ logger = logging.getLogger("c-memory-studio.main")
 
 app = FastAPI(
     title="C-Memory-Studio Backend",
-    version="2.1.0",
-    description="Deterministic DWARF/GDB-MI Memory & Topology Visualizer Engine",
+    version="2.2.0",
+    description="Deterministic DWARF/GDB-MI Memory Visualizer & Valgrind Audit Engine",
 )
 
 app.add_middleware(
@@ -45,6 +49,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register Valgrind Memcheck & Leak Audit HTTP POST routes
+app.include_router(valgrind_router)
 
 
 def _extract_code_and_stdin(raw_message: str) -> Tuple[str, Optional[str]]:

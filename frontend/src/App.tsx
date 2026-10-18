@@ -369,10 +369,16 @@ export const App: React.FC = () => {
             {activeTab === "valgrind" && (
               <HeapVisualizer
                 key={`valgrind-${sessionId}`}
-                valgrindData={valgrindData}
+                valgrindData={valgrindData as unknown as Record<string, unknown> | null}
                 isAuditing={isAuditingValgrind}
                 onRunAudit={handleRunValgrind}
-                onSelectLine={setHighlightedLine}
+                onSelectLine={(line: number) => {
+                  setHighlightedLine({
+                    line,
+                    type: "warning",
+                    timestamp: Date.now(),
+                  });
+                }}
               />
             )}
           </div>

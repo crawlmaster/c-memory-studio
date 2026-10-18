@@ -1,451 +1,949 @@
 /**
- * frontend/src/components/HeapView/HeapVisualizer.tsx
- * Academic slide-style Valgrind Heap Memory Block Visualizer.
- * - Top summary bar: Total Allocated, Total Freed, Total Leaked, Fatal Error alert badge
- * - Proportional sequential memory block strip:
- *   * Renders a full 100% Emerald Green strip when `blocks` is empty and `total_allocated_bytes == total_freed_bytes > 0`
- *   * Renders a clear "Stack-Only Execution (0 Heap Bytes)" state if no heap allocations occurred
- * - Color-coded states for leaks and invalid accesses with click-to-jump in Monaco
+ * frontend/src/components/Visualizer/HeapVisualizer.tsx
+ * Null-Safe Valgrind Memcheck, Heap Allocation Balance & Leak Stack-Trace Visualizer.
+ *
+ * Key Guarantees:
+ * 1. Never Returns `null`:
+ *    - Renders clear, visible states for Loading (`isLoading` / `isAuditing`),
+ *      Error (`error` / `compile_error`), Empty State (`!resolvedData`), and
+ *      Full Audit Report (KPI cards, Leak Summary breakdown, Stack Traces, stdout, Raw Log).
+ * 2. Universal Prop & Envelope Unwrapping:
+ *    - Accepts `data`, `report`, `audit`, `valgrind`, `result`, `analysis`, `valgrindData`,
+ *      or `auditData`, and unwraps nested `{ audit: ... }` / `{ data: ... }` envelopes.
+ * 3. Safe Numerical Formatting:
+ *    - Every metric is sanitized through `safeNum(val, 0)` and `(val ?? 0).toLocaleString()`
+ *      so undefined fields can never throw a TypeError.
  */
 
-import React from "react";
+import React, { Component, useState } from "react";
+import type { ErrorInfo, ReactNode } from "react";
 import {
-  type ValgrindAuditResponse,
-  type MemoryBlock,
-  type HighlightTarget,
-} from "../../types/debugger";
-import {
-  ShieldAlert,
   ShieldCheck,
+  ShieldAlert,
   AlertTriangle,
-  Flame,
-  ArrowUpRight,
-  Cpu,
+  Terminal,
   Layers,
+  Cpu,
+  FileWarning,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  RotateCcw,
+  Activity,
+  Play,
 } from "lucide-react";
 
-export interface HeapVisualizerProps {
-  valgrindData: ValgrindAuditResponse | null;
-  isAuditing: boolean;
-  onRunAudit: () => void;
-  onSelectLine: (target: HighlightTarget) => void;
+export interface ValgrindStackFrame {
+  ip?: string;
+  fn?: string;
+  func?: string;
+  function?: string;
+  file?: string;
+  line?: number;
+  is_user_code?: boolean;
 }
 
-const DIAGONAL_RED_STRIPE_STYLE: React.CSSProperties = {
-  backgroundImage:
-    "repeating-linear-gradient(135deg, rgba(239, 68, 68, 0.25) 0px, rgba(239, 68, 68, 0.25) 10px, rgba(127, 29, 29, 0.45) 10px, rgba(127, 29, 29, 0.45) 20px)",
-};
+export interface ValgrindDiagnosticItem {
+  id?: string;
+  kind?: string;
+  type?: string;
+  what?: string;
+  message?: string;
+  description?: string;
+  bytes_leaked?: number;
+  blocks_leaked?: number;
+  file?: string;
+  line?: number;
+  function?: string;
+  auxwhat?: string[];
+  stack?: ValgrindStackFrame[];
+  frames?: ValgrindStackFrame[];
+}
 
-export const HeapVisualizer: React.FC<HeapVisualizerProps> = ({
-  valgrindData,
-  isAuditing,
-  onRunAudit,
-  onSelectLine,
-}) => {
-  if (isAuditing) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full bg-slate-950 text-slate-300 p-8">
-        <div className="w-10 h-10 border-3 border-amber-500 border-t-transparent rounded-full animate-spin mb-4" />
-        <p className="text-sm font-mono font-semibold">
-          Executing Valgrind Memcheck (--leak-check=full --xtree-memory=full)...
-        </p>
-        <p className="text-xs text-slate-500 mt-1">
-          Inspecting synthetic CPU shadow memory and heap allocation ledger
-        </p>
-      </div>
-    );
+export interface HeapVisualizerProps {
+  data?: Record<string, unknown> | null;
+  report?: Record<string, unknown> | null;
+  audit?: Record<string, unknown> | null;
+  valgrind?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
+  analysis?: Record<string, unknown> | null;
+  valgrindData?: Record<string, unknown> | null;
+  auditData?: Record<string, unknown> | null;
+  isLoading?: boolean;
+  isAnalyzing?: boolean;
+  isAuditing?: boolean;
+  error?: string | null;
+  onJumpToLine?: (line: number) => void;
+  onSelectLine?: (line: number) => void;
+  onRunAudit?: () => void;
+}
+
+function safeNum(val: unknown, fallback: number = 0): number {
+  if (typeof val === "number" && Number.isFinite(val)) {
+    return val;
   }
-
-  if (!valgrindData || !valgrindData.summary) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full bg-slate-950 text-slate-400 p-8 text-center">
-        <Layers className="w-12 h-12 text-slate-600 mb-3 stroke-[1.5]" />
-        <p className="text-sm font-medium text-slate-200">
-          No Valgrind Heap Audit Executed Yet
-        </p>
-        <p className="text-xs text-slate-500 max-w-md mt-1 mb-5">
-          Run the automated Valgrind Memcheck auditor to inspect physical heap
-          allocations, definitely lost blocks, and out-of-bounds memory accesses.
-        </p>
-        <button
-          type="button"
-          onClick={onRunAudit}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs transition shadow-md cursor-pointer"
-        >
-          <ShieldAlert className="w-4 h-4" />
-          <span>Run Valgrind Audit Now</span>
-        </button>
-      </div>
-    );
+  if (typeof val === "string") {
+    const cleaned = val.replace(/,/g, "").trim();
+    if (cleaned !== "") {
+      const parsed = Number(cleaned);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
   }
+  return fallback;
+}
 
-  const { summary, blocks = [] } = valgrindData;
-  const freedBytes = Math.max(0, summary.total_freed_bytes);
-  const totalArenaBytes = Math.max(
-    summary.total_allocated_bytes,
-    freedBytes + summary.leaked_bytes,
-    1
+function formatNum(val: unknown): string {
+  return safeNum(val, 0).toLocaleString();
+}
+
+function asRecord(val: unknown): Record<string, unknown> {
+  if (val !== null && typeof val === "object" && !Array.isArray(val)) {
+    return val as Record<string, unknown>;
+  }
+  return {};
+}
+
+interface NormalizedAuditData {
+  status: string;
+  isClean: boolean;
+  compileError: string | null;
+  stdout: string;
+  stderr: string;
+  rawLog: string;
+  totalAllocs: number;
+  totalFrees: number;
+  totalBytesAllocated: number;
+  inUseAtExitBytes: number;
+  inUseAtExitBlocks: number;
+  definitelyLostBytes: number;
+  definitelyLostBlocks: number;
+  indirectlyLostBytes: number;
+  indirectlyLostBlocks: number;
+  possiblyLostBytes: number;
+  possiblyLostBlocks: number;
+  stillReachableBytes: number;
+  stillReachableBlocks: number;
+  suppressedBytes: number;
+  suppressedBlocks: number;
+  errorCount: number;
+  diagnostics: ValgrindDiagnosticItem[];
+}
+
+function normalizeValgrindPayload(
+  incoming: Record<string, unknown>
+): NormalizedAuditData {
+  // Unwrap nested envelopes (`data.audit ?? data.data ?? data.result ?? data`)
+  const unwrapped =
+    incoming.audit && typeof incoming.audit === "object"
+      ? asRecord(incoming.audit)
+      : incoming.data && typeof incoming.data === "object"
+      ? asRecord(incoming.data)
+      : incoming.result && typeof incoming.result === "object"
+      ? asRecord(incoming.result)
+      : incoming;
+
+  const summary = asRecord(unwrapped.summary);
+  const heapSummary = asRecord(unwrapped.heap_summary);
+  const leakSummary = asRecord(unwrapped.leak_summary);
+
+  const status = String(unwrapped.status ?? "completed");
+  const compileError =
+    typeof unwrapped.compile_error === "string" &&
+    unwrapped.compile_error.trim() !== ""
+      ? unwrapped.compile_error
+      : status === "compile_error" && typeof unwrapped.stderr === "string"
+      ? unwrapped.stderr
+      : status === "compile_error" && typeof unwrapped.detail === "string"
+      ? unwrapped.detail
+      : null;
+
+  const totalAllocs = safeNum(
+    summary.total_allocs ??
+      heapSummary.total_allocs ??
+      unwrapped.total_allocs ??
+      summary.allocs ??
+      unwrapped.allocs,
+    0
   );
 
-  const isCompletelyCleanWithHeapUsage =
-    blocks.length === 0 &&
-    !summary.has_fatal_errors &&
-    summary.total_allocated_bytes > 0 &&
-    freedBytes > 0;
+  const totalFrees = safeNum(
+    summary.total_frees ??
+      heapSummary.total_frees ??
+      unwrapped.total_frees ??
+      summary.frees ??
+      unwrapped.frees,
+    0
+  );
 
-  const isZeroHeapUsage =
-    blocks.length === 0 &&
-    summary.total_allocated_bytes === 0 &&
-    freedBytes === 0;
+  const totalBytesAllocated = safeNum(
+    summary.bytes_allocated ??
+      summary.total_bytes_allocated ??
+      summary.total_bytes ??
+      heapSummary.total_bytes_allocated ??
+      heapSummary.bytes_allocated ??
+      unwrapped.bytes_allocated ??
+      unwrapped.total_bytes_allocated ??
+      unwrapped.total_bytes,
+    0
+  );
 
-  const handleBlockClick = (block: MemoryBlock, preferDetected: boolean = false) => {
-    const targetLoc =
-      preferDetected && block.detected_at?.line
-        ? block.detected_at
-        : block.allocated_at || block.detected_at;
+  const inUseAtExitBytes = safeNum(
+    summary.in_use_at_exit_bytes ??
+      summary.in_use_bytes ??
+      heapSummary.in_use_at_exit_bytes ??
+      unwrapped.in_use_at_exit_bytes ??
+      unwrapped.in_use_bytes,
+    0
+  );
 
-    if (targetLoc && targetLoc.line > 0) {
-      onSelectLine({
-        line: targetLoc.line,
-        type:
-          block.state === "INVALID_ACCESS" ||
-          block.state === "INVALID_FREE" ||
-          block.state === "DEFINITELY_LOST"
-            ? "error"
-            : "warning",
-        message: `${block.state}: ${block.description}`,
-        timestamp: Date.now(),
-      });
+  const inUseAtExitBlocks = safeNum(
+    summary.in_use_at_exit_blocks ??
+      summary.in_use_blocks ??
+      heapSummary.in_use_at_exit_blocks ??
+      unwrapped.in_use_at_exit_blocks ??
+      unwrapped.in_use_blocks,
+    0
+  );
+
+  const definitelyLostBytes = safeNum(
+    summary.definitely_lost_bytes ??
+      summary.definitely_lost ??
+      leakSummary.definitely_lost_bytes ??
+      leakSummary.definitely_lost ??
+      unwrapped.definitely_lost_bytes ??
+      unwrapped.definitely_lost,
+    0
+  );
+
+  const definitelyLostBlocks = safeNum(
+    summary.definitely_lost_blocks ??
+      leakSummary.definitely_lost_blocks ??
+      unwrapped.definitely_lost_blocks,
+    0
+  );
+
+  const indirectlyLostBytes = safeNum(
+    summary.indirectly_lost_bytes ??
+      summary.indirectly_lost ??
+      leakSummary.indirectly_lost_bytes ??
+      leakSummary.indirectly_lost ??
+      unwrapped.indirectly_lost_bytes ??
+      unwrapped.indirectly_lost,
+    0
+  );
+
+  const indirectlyLostBlocks = safeNum(
+    summary.indirectly_lost_blocks ??
+      leakSummary.indirectly_lost_blocks ??
+      unwrapped.indirectly_lost_blocks,
+    0
+  );
+
+  const possiblyLostBytes = safeNum(
+    summary.possibly_lost_bytes ??
+      summary.possibly_lost ??
+      leakSummary.possibly_lost_bytes ??
+      leakSummary.possibly_lost ??
+      unwrapped.possibly_lost_bytes ??
+      unwrapped.possibly_lost,
+    0
+  );
+
+  const possiblyLostBlocks = safeNum(
+    summary.possibly_lost_blocks ??
+      leakSummary.possibly_lost_blocks ??
+      unwrapped.possibly_lost_blocks,
+    0
+  );
+
+  const stillReachableBytes = safeNum(
+    summary.still_reachable_bytes ??
+      summary.still_reachable ??
+      leakSummary.still_reachable_bytes ??
+      leakSummary.still_reachable ??
+      unwrapped.still_reachable_bytes ??
+      unwrapped.still_reachable,
+    0
+  );
+
+  const stillReachableBlocks = safeNum(
+    summary.still_reachable_blocks ??
+      leakSummary.still_reachable_blocks ??
+      unwrapped.still_reachable_blocks,
+    0
+  );
+
+  const suppressedBytes = safeNum(
+    summary.suppressed_bytes ??
+      leakSummary.suppressed_bytes ??
+      unwrapped.suppressed_bytes,
+    0
+  );
+
+  const suppressedBlocks = safeNum(
+    summary.suppressed_blocks ??
+      leakSummary.suppressed_blocks ??
+      unwrapped.suppressed_blocks,
+    0
+  );
+
+  const rawErrors = Array.isArray(unwrapped.errors) ? unwrapped.errors : [];
+  const rawLeaks = Array.isArray(unwrapped.leaks) ? unwrapped.leaks : [];
+  const combinedList = [...rawErrors];
+  const seenIds = new Set<string>(
+    rawErrors
+      .map((e) =>
+        e && typeof e === "object"
+          ? String((e as Record<string, unknown>).id ?? "")
+          : ""
+      )
+      .filter(Boolean)
+  );
+
+  rawLeaks.forEach((lk, idx) => {
+    if (lk && typeof lk === "object") {
+      const lkId = String((lk as Record<string, unknown>).id ?? `leak-${idx}`);
+      if (!seenIds.has(lkId)) {
+        seenIds.add(lkId);
+        combinedList.push(lk);
+      }
     }
+  });
+
+  const diagnostics: ValgrindDiagnosticItem[] = combinedList
+    .filter(
+      (item): item is Record<string, unknown> =>
+        item !== null && typeof item === "object"
+    )
+    .map((item, idx) => {
+      const rawStack = Array.isArray(item.stack)
+        ? item.stack
+        : Array.isArray(item.frames)
+        ? item.frames
+        : [];
+      const stack: ValgrindStackFrame[] = rawStack
+        .filter(
+          (f): f is Record<string, unknown> =>
+            f !== null && typeof f === "object"
+        )
+        .map((f) => ({
+          ip: String(f.ip ?? ""),
+          fn: String(f.fn ?? f.func ?? f.function ?? "??"),
+          file: String(f.file ?? ""),
+          line: safeNum(f.line, 0),
+          is_user_code: Boolean(f.is_user_code),
+        }));
+
+      const auxwhat = Array.isArray(item.auxwhat)
+        ? item.auxwhat.map((a) => String(a))
+        : [];
+
+      const kindStr = String(item.kind ?? item.type ?? "MemoryDiagnostic");
+      const whatStr = String(
+        item.what ?? item.message ?? item.description ?? kindStr
+      );
+
+      return {
+        id: String(item.id ?? `diag-${idx}`),
+        kind: kindStr,
+        type: kindStr,
+        what: whatStr,
+        message: whatStr,
+        description: whatStr,
+        bytes_leaked: safeNum(
+          item.bytes_leaked ?? item.leaked_bytes ?? item.bytes,
+          0
+        ),
+        blocks_leaked: safeNum(
+          item.blocks_leaked ?? item.leaked_blocks ?? item.blocks,
+          0
+        ),
+        file: String(item.file ?? ""),
+        line: safeNum(item.line, 0),
+        function: String(item.function ?? item.fn ?? ""),
+        auxwhat,
+        stack,
+        frames: stack,
+      };
+    });
+
+  const errorCount = Math.max(
+    diagnostics.length,
+    safeNum(summary.error_count ?? unwrapped.error_count, 0)
+  );
+
+  const totalLeaked =
+    definitelyLostBytes +
+    indirectlyLostBytes +
+    possiblyLostBytes +
+    stillReachableBytes;
+
+  const isClean =
+    compileError === null &&
+    status !== "error" &&
+    status !== "timeout" &&
+    status !== "compile_error" &&
+    (typeof unwrapped.is_clean === "boolean"
+      ? unwrapped.is_clean
+      : typeof summary.is_clean === "boolean"
+      ? summary.is_clean
+      : errorCount === 0 && totalLeaked === 0 && inUseAtExitBytes === 0);
+
+  const rawLog = String(
+    unwrapped.clean_log ??
+      unwrapped.raw_output ??
+      unwrapped.valgrind_output ??
+      unwrapped.log ??
+      ""
+  );
+
+  return {
+    status,
+    isClean,
+    compileError,
+    stdout: String(unwrapped.stdout ?? ""),
+    stderr: String(unwrapped.stderr ?? ""),
+    rawLog,
+    totalAllocs,
+    totalFrees,
+    totalBytesAllocated,
+    inUseAtExitBytes,
+    inUseAtExitBlocks,
+    definitelyLostBytes,
+    definitelyLostBlocks,
+    indirectlyLostBytes,
+    indirectlyLostBlocks,
+    possiblyLostBytes,
+    possiblyLostBlocks,
+    stillReachableBytes,
+    stillReachableBlocks,
+    suppressedBytes,
+    suppressedBlocks,
+    errorCount,
+    diagnostics,
+  };
+}
+
+interface ErrorBoundaryProps {
+  children: ReactNode;
+}
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  errorMessage: string;
+}
+
+class HeapVisualizerErrorBoundary extends Component<
+  ErrorBoundaryProps,
+  ErrorBoundaryState
+> {
+  constructor(props: ErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, errorMessage: "" };
+  }
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return {
+      hasError: true,
+      errorMessage:
+        error?.message || "Unexpected rendering error in HeapVisualizer.",
+    };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo): void {
+    console.error("HeapVisualizer caught an error:", error, errorInfo);
+  }
+
+  render(): ReactNode {
+    if (this.state.hasError) {
+      return (
+        <div className="flex flex-col items-center justify-center h-full p-8 bg-slate-950 text-center">
+          <div className="max-w-md w-full rounded-xl bg-rose-950/40 border border-rose-500/50 p-6 shadow-xl">
+            <AlertTriangle className="w-10 h-10 text-rose-400 mx-auto mb-3" />
+            <h3 className="text-sm font-mono font-bold text-rose-200">
+              Valgrind Audit View Recovery
+            </h3>
+            <p className="text-xs font-mono text-rose-300/80 mt-2 break-words">
+              {this.state.errorMessage}
+            </p>
+            <button
+              type="button"
+              onClick={() =>
+                this.setState({ hasError: false, errorMessage: "" })
+              }
+              className="mt-4 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-400/50 text-rose-100 text-xs font-mono font-semibold transition cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset Audit View</span>
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const HeapVisualizerContent: React.FC<HeapVisualizerProps> = (props) => {
+  const [showRawLog, setShowRawLog] = useState<boolean>(true);
+
+  const isBusy = Boolean(
+    props.isLoading || props.isAnalyzing || props.isAuditing
+  );
+
+  // Resolve payload across all possible prop aliases
+  const rawPayload =
+    props.data ??
+    props.report ??
+    props.audit ??
+    props.valgrind ??
+    props.result ??
+    props.analysis ??
+    props.valgrindData ??
+    props.auditData ??
+    null;
+
+  const handleLineClick = (line: number) => {
+    if (line <= 0) return;
+    if (props.onJumpToLine) props.onJumpToLine(line);
+    else if (props.onSelectLine) props.onSelectLine(line);
   };
 
-  return (
-    <div className="flex flex-col gap-6 p-5 h-full overflow-y-auto bg-slate-950">
-      {/* 1. Top Summary Metrics Bar */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <div className="rounded-xl bg-slate-900 border border-slate-800 p-3.5">
-          <div className="text-[11px] font-mono uppercase text-slate-400">
-            Total Allocated
-          </div>
-          <div className="text-xl font-mono font-bold text-slate-100 mt-1">
-            {summary.total_allocated_bytes.toLocaleString()}{" "}
-            <span className="text-xs font-normal text-slate-400">bytes</span>
-          </div>
-        </div>
+  if (isBusy) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-slate-950 text-slate-300 p-8 text-center">
+        <Activity className="w-10 h-10 text-sky-400 animate-pulse mb-3" />
+        <p className="text-sm font-mono font-semibold">
+          Running Valgrind Memcheck &amp; Heap Leak Audit...
+        </p>
+        <p className="text-xs text-slate-500 mt-1">
+          Instrumenting allocations, frees, and uninitialized memory origins
+        </p>
+      </div>
+    );
+  }
 
-        <div className="rounded-xl bg-emerald-950/30 border border-emerald-800/50 p-3.5">
-          <div className="text-[11px] font-mono uppercase text-emerald-400">
-            Total Freed (Clean)
+  if (props.error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-slate-950 p-6">
+        <div className="max-w-2xl w-full rounded-xl bg-rose-950/35 border border-rose-500/50 p-5 shadow-lg">
+          <div className="flex items-center gap-2.5 text-rose-300 font-mono text-sm font-bold mb-2">
+            <FileWarning className="w-5 h-5 text-rose-400 shrink-0" />
+            <span>Compilation / Valgrind Error</span>
           </div>
-          <div className="text-xl font-mono font-bold text-emerald-300 mt-1">
-            {freedBytes.toLocaleString()}{" "}
-            <span className="text-xs font-normal text-emerald-400/80">bytes</span>
-          </div>
-        </div>
-
-        <div
-          className={`rounded-xl p-3.5 border ${
-            summary.leaked_bytes > 0
-              ? "bg-rose-950/40 border-rose-700/70"
-              : "bg-slate-900 border-slate-800"
-          }`}
-        >
-          <div className="text-[11px] font-mono uppercase text-rose-400">
-            Total Leaked
-          </div>
-          <div className="text-xl font-mono font-bold text-rose-300 mt-1">
-            {summary.leaked_bytes.toLocaleString()}{" "}
-            <span className="text-xs font-normal text-rose-400/80">
-              bytes ({summary.leak_count} blocks)
-            </span>
-          </div>
-        </div>
-
-        <div
-          className={`rounded-xl p-3.5 border flex flex-col justify-between ${
-            summary.has_fatal_errors
-              ? "bg-red-950/60 border-red-500 shadow-[0_0_20px_rgba(239,68,68,0.2)]"
-              : "bg-emerald-950/30 border-emerald-700/50"
-          }`}
-        >
-          <div className="flex items-center justify-between">
-            <span className="text-[11px] font-mono uppercase text-slate-300">
-              Auditor Verdict
-            </span>
-            {summary.has_fatal_errors ? (
-              <Flame className="w-4 h-4 text-red-400 animate-pulse" />
-            ) : (
-              <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            )}
-          </div>
-          <div className="mt-1 flex items-center gap-2">
-            {summary.has_fatal_errors ? (
-              <span className="px-2 py-0.5 rounded bg-red-500 text-white font-mono text-xs font-extrabold tracking-wide">
-                FATAL MEMORY ERROR
-              </span>
-            ) : summary.leaked_bytes > 0 ? (
-              <span className="px-2 py-0.5 rounded bg-amber-500 text-slate-950 font-mono text-xs font-bold">
-                LEAKS DETECTED
-              </span>
-            ) : (
-              <span className="px-2 py-0.5 rounded bg-emerald-500 text-slate-950 font-mono text-xs font-bold">
-                HEAP CLEAN
-              </span>
-            )}
-          </div>
+          <pre className="text-xs font-mono text-rose-200/90 bg-slate-950/80 border border-rose-500/30 rounded-lg p-3.5 overflow-x-auto whitespace-pre-wrap">
+            {props.error}
+          </pre>
         </div>
       </div>
+    );
+  }
 
-      {/* 2. Academic Slide-Style Proportional Physical Heap Strip */}
-      <div className="rounded-xl bg-slate-900 border border-slate-800 p-5">
-        <div className="flex items-center justify-between mb-3">
+  if (!rawPayload || Object.keys(rawPayload).length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full bg-slate-950 text-slate-400 p-12 text-center">
+        <Cpu className="w-12 h-12 text-slate-600 mb-3 stroke-[1.5]" />
+        <p className="text-sm font-medium text-slate-300">
+          No memory audit data available.
+        </p>
+        <p className="text-xs text-slate-500 max-w-md mt-1">
+          Click{" "}
+          <span className="text-emerald-400 font-mono font-semibold">
+            Run Valgrind Audit
+          </span>{" "}
+          to analyze allocations, frees, and memory leaks.
+        </p>
+        {props.onRunAudit && (
+          <button
+            type="button"
+            onClick={props.onRunAudit}
+            className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-mono text-xs font-bold shadow-lg transition cursor-pointer"
+          >
+            <Play className="w-3.5 h-3.5" />
+            <span>Run Valgrind Audit Now</span>
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  const audit = normalizeValgrindPayload(rawPayload);
+
+  if (audit.compileError) {
+    return (
+      <div className="flex flex-col gap-4 p-5 overflow-y-auto h-full bg-slate-950">
+        <div className="rounded-xl bg-rose-950/40 border border-rose-500/60 p-5 shadow-lg">
+          <div className="flex items-center gap-2.5 text-rose-300 font-mono text-sm font-bold mb-3">
+            <FileWarning className="w-5 h-5 text-rose-400 shrink-0" />
+            <span>GCC Compilation Failed</span>
+          </div>
+          <pre className="text-xs font-mono text-rose-200 bg-slate-950/90 border border-rose-500/30 rounded-lg p-4 overflow-x-auto whitespace-pre-wrap">
+            {audit.compileError}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  const unfreedBlocksCount = Math.max(0, audit.totalAllocs - audit.totalFrees);
+  const freeRatioPct =
+    audit.totalAllocs > 0
+      ? Math.min(100, Math.round((audit.totalFrees / audit.totalAllocs) * 100))
+      : 100;
+
+  const leakCategories = [
+    {
+      label: "Definitely Lost",
+      bytes: audit.definitelyLostBytes,
+      blocks: audit.definitelyLostBlocks,
+      activeClass:
+        "bg-rose-950/60 border-rose-500/70 text-rose-200 shadow-[0_0_12px_rgba(244,63,94,0.2)]",
+      badgeClass: "text-rose-400",
+    },
+    {
+      label: "Indirectly Lost",
+      bytes: audit.indirectlyLostBytes,
+      blocks: audit.indirectlyLostBlocks,
+      activeClass: "bg-orange-950/60 border-orange-500/70 text-orange-200",
+      badgeClass: "text-orange-400",
+    },
+    {
+      label: "Possibly Lost",
+      bytes: audit.possiblyLostBytes,
+      blocks: audit.possiblyLostBlocks,
+      activeClass: "bg-amber-950/60 border-amber-500/70 text-amber-200",
+      badgeClass: "text-amber-400",
+    },
+    {
+      label: "Still Reachable",
+      bytes: audit.stillReachableBytes,
+      blocks: audit.stillReachableBlocks,
+      activeClass: "bg-sky-950/60 border-sky-500/70 text-sky-200",
+      badgeClass: "text-sky-400",
+    },
+  ];
+
+  return (
+    <div className="flex flex-col gap-5 p-5 overflow-y-auto h-full bg-slate-950 text-slate-100">
+      {/* 1. Top Audit Verdict Banner */}
+      <div
+        className={`rounded-xl border p-4 shadow-lg flex flex-wrap items-center justify-between gap-4 ${
+          audit.isClean
+            ? "bg-emerald-950/35 border-emerald-500/50 text-emerald-200"
+            : "bg-rose-950/40 border-rose-500/60 text-rose-200"
+        }`}
+      >
+        <div className="flex items-center gap-3">
+          {audit.isClean ? (
+            <ShieldCheck className="w-7 h-7 text-emerald-400 shrink-0" />
+          ) : (
+            <ShieldAlert className="w-7 h-7 text-rose-400 shrink-0" />
+          )}
           <div>
-            <h3 className="text-sm font-mono font-bold text-slate-100 flex items-center gap-2">
-              <Cpu className="w-4 h-4 text-amber-400" />
-              <span>Physical Heap Arena Layout (Proportional Block Strip)</span>
+            <h3 className="font-mono text-sm font-extrabold tracking-tight">
+              {audit.isClean
+                ? "MEMORY AUDIT PASSED — All Heap Blocks Were Freed (0 Errors)"
+                : `MEMORY ISSUES DETECTED — ${formatNum(
+                    audit.errorCount
+                  )} Diagnostic(s), ${formatNum(
+                    audit.inUseAtExitBytes
+                  )} B In Use at Exit`}
             </h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Click any block in the strip to jump directly to its allocation or
-              fault line in the C editor.
+            <p className="text-xs font-mono opacity-85 mt-0.5">
+              {audit.isClean
+                ? `Total heap usage: ${formatNum(
+                    audit.totalAllocs
+                  )} allocs, ${formatNum(
+                    audit.totalFrees
+                  )} frees, ${formatNum(
+                    audit.totalBytesAllocated
+                  )} bytes allocated.`
+                : `Total heap usage: ${formatNum(
+                    audit.totalAllocs
+                  )} allocs, ${formatNum(
+                    audit.totalFrees
+                  )} frees (${formatNum(
+                    unfreedBlocksCount
+                  )} unfreed), ${formatNum(
+                    audit.totalBytesAllocated
+                  )} bytes allocated.`}
             </p>
           </div>
-          <span className="text-xs font-mono text-slate-400">
-            Arena Span: {summary.total_allocated_bytes.toLocaleString()} B
-          </span>
         </div>
 
-        {/* Sequential Proportional Strip */}
-        <div className="w-full min-h-[82px] rounded-lg bg-slate-950 border border-slate-800 p-1.5 flex items-stretch gap-1.5 overflow-x-auto">
-          {isZeroHeapUsage ? (
-            <div className="w-full rounded-md bg-slate-900/70 border border-slate-800 p-3 flex items-center justify-center text-xs font-mono text-slate-400">
-              0 Heap Bytes Allocated (Stack-Only Execution)
-            </div>
-          ) : isCompletelyCleanWithHeapUsage ? (
-            <div className="w-full rounded-md bg-gradient-to-r from-emerald-950/90 via-emerald-900/60 to-emerald-950/90 border-2 border-emerald-500/80 p-3.5 flex items-center justify-between shadow-[0_0_20px_rgba(16,185,129,0.2)]">
-              <div className="flex items-center gap-2.5">
-                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
-                <div>
-                  <div className="text-xs font-mono font-extrabold text-emerald-200 tracking-wide">
-                    100% FREED / CLEAN HEAP ARENA
-                  </div>
-                  <div className="text-[11px] font-mono text-emerald-300/85 mt-0.5">
-                    All {freedBytes.toLocaleString()} bytes across{" "}
-                    {summary.total_alloc_calls || "all"} heap allocation(s) were
-                    cleanly reclaimed via free()
-                  </div>
-                </div>
-              </div>
-              <span className="px-2.5 py-1 rounded bg-emerald-500 text-slate-950 font-mono text-xs font-extrabold">
-                {freedBytes.toLocaleString()} /{" "}
-                {summary.total_allocated_bytes.toLocaleString()} B Freed
-              </span>
-            </div>
-          ) : (
-            <>
-              {freedBytes > 0 && (
-                <div
-                  style={{
-                    flexGrow: Math.max(
-                      15,
-                      Math.round((freedBytes / totalArenaBytes) * 100)
-                    ),
-                    minWidth: "145px",
-                  }}
-                  className="rounded-md bg-emerald-950/70 border border-emerald-600/70 p-2.5 flex flex-col justify-between transition hover:border-emerald-400"
-                >
-                  <div className="flex items-center justify-between text-[11px] font-mono">
-                    <span className="text-emerald-300 font-bold">
-                      FREED / CLEAN
-                    </span>
-                    <span className="text-emerald-400">
-                      {freedBytes.toLocaleString()} B
-                    </span>
-                  </div>
-                  <div className="text-[11px] font-mono text-emerald-200/80 truncate mt-1">
-                    Reclaimed via free()
-                  </div>
-                </div>
-              )}
+        <span
+          className={`px-3 py-1 rounded-full font-mono text-xs font-extrabold border ${
+            audit.isClean
+              ? "bg-emerald-500/20 border-emerald-400/50 text-emerald-300"
+              : "bg-rose-500/20 border-rose-400/60 text-rose-300"
+          }`}
+        >
+          {audit.isClean ? "HEAP CLEAN" : "LEAK / ERROR"}
+        </span>
+      </div>
 
-              {blocks.map((block) => {
-                const weight = Math.max(
-                  15,
-                  Math.round(((block.size_bytes || 32) / totalArenaBytes) * 100)
-                );
-
-                const isDefLost = block.state === "DEFINITELY_LOST";
-                const isInvalid =
-                  block.state === "INVALID_ACCESS" ||
-                  block.state === "INVALID_FREE" ||
-                  block.state === "UNINITIALIZED_READ";
-
-                let borderAndBg =
-                  "bg-amber-950/60 border-amber-500/80 text-amber-200";
-                if (isDefLost) {
-                  borderAndBg = "border-red-500 text-red-100";
-                } else if (isInvalid) {
-                  borderAndBg =
-                    "bg-rose-950/90 border-2 border-rose-500 text-rose-100 shadow-[0_0_15px_rgba(244,63,94,0.35)]";
-                }
-
-                return (
-                  <button
-                    key={block.id}
-                    type="button"
-                    onClick={() => handleBlockClick(block, isInvalid)}
-                    style={{
-                      flexGrow: weight,
-                      minWidth: "155px",
-                      ...(isDefLost ? DIAGONAL_RED_STRIPE_STYLE : {}),
-                    }}
-                    className={`rounded-md border p-2.5 flex flex-col justify-between text-left transition transform hover:-translate-y-0.5 cursor-pointer ${borderAndBg}`}
-                  >
-                    <div className="flex items-center justify-between gap-1 text-[11px] font-mono w-full">
-                      <span className="font-bold truncate">{block.address}</span>
-                      <span className="px-1.5 py-0.2 rounded bg-black/40 text-[10px]">
-                        {block.size_bytes} B
-                      </span>
-                    </div>
-
-                    <div className="flex items-center justify-between gap-1 mt-2 w-full">
-                      <span className="text-[10px] font-mono uppercase tracking-tight font-semibold truncate">
-                        {block.state}
-                      </span>
-                      <span className="text-[10px] font-mono opacity-85 truncate">
-                        {block.allocated_at?.function || "main"}()
-                      </span>
-                    </div>
-                  </button>
-                );
-              })}
-            </>
-          )}
-        </div>
-
-        {/* Legend */}
-        <div className="flex flex-wrap items-center gap-4 mt-3 pt-3 border-t border-slate-800/80 text-[11px] font-mono text-slate-400">
-          <div className="flex items-center gap-1.5">
-            <span className="w-3.5 h-3.5 rounded-sm bg-emerald-900 border border-emerald-500 inline-block" />
-            <span>Freed / Clean</span>
+      {/* 2. Heap Lifecycle KPI Strip */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-4">
+          <div className="flex items-center justify-between text-xs font-mono text-slate-400 mb-1.5">
+            <span>ALLOCATIONS VS. FREES</span>
+            <Layers className="w-4 h-4 text-sky-400" />
           </div>
-          <div className="flex items-center gap-1.5">
-            <span
-              style={DIAGONAL_RED_STRIPE_STYLE}
-              className="w-3.5 h-3.5 rounded-sm border border-red-500 inline-block"
+          <div className="flex items-baseline gap-2 font-mono">
+            <span className="text-xl font-extrabold text-slate-100">
+              {formatNum(audit.totalFrees)} / {formatNum(audit.totalAllocs)}
+            </span>
+            <span className="text-xs text-slate-400">
+              freed ({freeRatioPct}%)
+            </span>
+          </div>
+          <div className="w-full h-2 rounded-full bg-slate-950 border border-slate-800 mt-2.5 overflow-hidden">
+            <div
+              style={{ width: `${freeRatioPct}%` }}
+              className={`h-full transition-all duration-300 ${
+                unfreedBlocksCount === 0 ? "bg-emerald-400" : "bg-amber-400"
+              }`}
             />
-            <span>DEFINITELY_LOST (Striped)</span>
           </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-3.5 h-3.5 rounded-sm bg-rose-950 border-2 border-rose-500 inline-block" />
-            <span>INVALID_ACCESS / CORRUPTION</span>
+        </div>
+
+        <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-4">
+          <div className="flex items-center justify-between text-xs font-mono text-slate-400 mb-1.5">
+            <span>TOTAL BYTES ALLOCATED</span>
+            <Cpu className="w-4 h-4 text-indigo-400" />
           </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-3.5 h-3.5 rounded-sm bg-amber-950 border border-amber-500 inline-block" />
-            <span>STILL_REACHABLE / POSSIBLY_LOST</span>
+          <div className="text-xl font-mono font-extrabold text-indigo-300">
+            {formatNum(audit.totalBytesAllocated)} B
+          </div>
+          <div className="text-[11px] font-mono text-slate-500 mt-2">
+            Across {formatNum(audit.totalAllocs)} heap allocation call(s)
+          </div>
+        </div>
+
+        <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-4">
+          <div className="flex items-center justify-between text-xs font-mono text-slate-400 mb-1.5">
+            <span>IN USE AT EXIT</span>
+            <CheckCircle2
+              className={`w-4 h-4 ${
+                audit.inUseAtExitBytes === 0
+                  ? "text-emerald-400"
+                  : "text-rose-400"
+              }`}
+            />
+          </div>
+          <div
+            className={`text-xl font-mono font-extrabold ${
+              audit.inUseAtExitBytes === 0
+                ? "text-emerald-400"
+                : "text-rose-400"
+            }`}
+          >
+            {formatNum(audit.inUseAtExitBytes)} B
+          </div>
+          <div className="text-[11px] font-mono text-slate-500 mt-2">
+            In {formatNum(audit.inUseAtExitBlocks)} active block(s) at exit
           </div>
         </div>
       </div>
 
-      {/* 3. Detailed Valgrind Diagnostic Cards */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-mono uppercase tracking-wider text-slate-400">
-          Detailed Block &amp; Access Diagnostics ({blocks.length})
+      {/* 3. Leak Summary Breakdown */}
+      <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-4">
+        <h4 className="text-xs font-mono uppercase tracking-wider text-slate-400 mb-3">
+          Valgrind Leak Summary Breakdown
         </h4>
-
-        {blocks.length === 0 ? (
-          <div className="rounded-xl bg-emerald-950/20 border border-emerald-800/50 p-4 flex items-center gap-3 text-emerald-300 text-xs font-mono">
-            <ShieldCheck className="w-5 h-5 shrink-0 text-emerald-400" />
-            <span>
-              {summary.total_allocated_bytes > 0
-                ? `All ${summary.total_allocated_bytes.toLocaleString()} allocated heap bytes were cleanly freed via free() and no invalid memory operations were detected.`
-                : "No heap leaks or invalid memory operations were detected."}
-            </span>
-          </div>
-        ) : (
-          blocks.map((block) => {
-            const isDefLost = block.state === "DEFINITELY_LOST";
-            const isInvalid =
-              block.state === "INVALID_ACCESS" ||
-              block.state === "INVALID_FREE" ||
-              block.state === "UNINITIALIZED_READ";
-
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          {leakCategories.map((cat) => {
+            const hasLeak = cat.bytes > 0 || cat.blocks > 0;
             return (
               <div
-                key={block.id}
-                style={isDefLost ? DIAGONAL_RED_STRIPE_STYLE : undefined}
-                className={`rounded-xl border p-4 transition ${
-                  isInvalid
-                    ? "bg-rose-950/40 border-rose-500/80"
-                    : isDefLost
-                    ? "border-red-500/80 bg-slate-900"
-                    : "bg-amber-950/25 border-amber-600/60"
+                key={cat.label}
+                className={`rounded-lg border p-3 font-mono transition-colors ${
+                  hasLeak
+                    ? cat.activeClass
+                    : "bg-slate-950/80 border-slate-800/80 text-slate-400"
                 }`}
               >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2.5">
-                    {isInvalid ? (
-                      <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-                    ) : (
-                      <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
-                    )}
-                    <span className="px-2 py-0.5 rounded bg-black/50 border border-white/15 font-mono text-xs font-bold text-white">
-                      {block.state}
-                    </span>
-                    <span className="font-mono text-xs text-sky-300 font-semibold">
-                      {block.address}
-                    </span>
-                    <span className="text-xs font-mono text-slate-300">
-                      ({block.size_bytes} bytes in {block.block_count} block
-                      {block.block_count === 1 ? "" : "s"})
-                    </span>
-                  </div>
-
-                  <span className="text-[11px] font-mono text-slate-400">
-                    ID: {block.id}
-                  </span>
+                <div className="text-[11px] uppercase tracking-tight opacity-85">
+                  {cat.label}
                 </div>
-
-                <p className="text-xs font-mono text-slate-200 mt-2.5 bg-slate-950/70 px-3 py-2 rounded border border-slate-800">
-                  {block.description}
-                </p>
-
-                <div className="flex flex-wrap items-center gap-3 mt-3">
-                  {block.allocated_at && (
-                    <button
-                      type="button"
-                      onClick={() => handleBlockClick(block, false)}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-950 hover:bg-slate-800 border border-slate-700 text-xs font-mono text-sky-300 transition cursor-pointer"
-                    >
-                      <span>
-                        Allocated at{" "}
-                        <strong>{block.allocated_at.function}()</strong> (
-                        {block.allocated_at.file}:{block.allocated_at.line})
-                      </span>
-                      <ArrowUpRight className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-
-                  {block.detected_at && (
-                    <button
-                      type="button"
-                      onClick={() => handleBlockClick(block, true)}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-950/90 hover:bg-rose-900 border border-rose-500 text-xs font-mono text-rose-200 transition cursor-pointer"
-                    >
-                      <span>
-                        Fault Detected at{" "}
-                        <strong>{block.detected_at.function}()</strong> (
-                        {block.detected_at.file}:{block.detected_at.line})
-                      </span>
-                      <ArrowUpRight className="w-3.5 h-3.5" />
-                    </button>
-                  )}
+                <div
+                  className={`text-base font-extrabold mt-1 ${
+                    hasLeak ? cat.badgeClass : "text-slate-300"
+                  }`}
+                >
+                  {formatNum(cat.bytes)} B
+                </div>
+                <div className="text-[11px] opacity-75 mt-0.5">
+                  in {formatNum(cat.blocks)} block(s)
                 </div>
               </div>
             );
-          })
-        )}
+          })}
+        </div>
       </div>
+
+      {/* 4. Detailed Valgrind Diagnostics & Call Stacks */}
+      {audit.diagnostics.length > 0 && (
+        <div className="flex flex-col gap-3">
+          <h4 className="text-xs font-mono uppercase tracking-wider text-slate-400">
+            Detailed Memory Diagnostics &amp; Stack Traces (
+            {formatNum(audit.diagnostics.length)})
+          </h4>
+
+          {audit.diagnostics.map((diag, idx) => {
+            const isLeak = (diag.kind || "").startsWith("Leak_");
+            const leakedBytes = safeNum(diag.bytes_leaked, 0);
+            const leakedBlocks = safeNum(diag.blocks_leaked, 0);
+            const stackFrames = Array.isArray(diag.stack) ? diag.stack : [];
+
+            return (
+              <div
+                key={diag.id || `diag-${idx}`}
+                className="rounded-xl bg-slate-900/95 border border-rose-500/40 p-4 shadow-md"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5 mb-3">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+                    <span className="px-2 py-0.5 rounded bg-rose-500/20 border border-rose-500/40 text-rose-300 font-mono text-xs font-bold">
+                      {diag.kind}
+                    </span>
+                    {diag.file && safeNum(diag.line, 0) > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => handleLineClick(safeNum(diag.line, 0))}
+                        className="px-2 py-0.5 rounded bg-sky-500/15 hover:bg-sky-500/25 border border-sky-500/40 text-sky-300 font-mono text-xs font-semibold transition cursor-pointer"
+                      >
+                        {diag.file}:{formatNum(diag.line)}
+                      </button>
+                    )}
+                  </div>
+
+                  {isLeak && leakedBytes > 0 && (
+                    <span className="px-2.5 py-0.5 rounded-full bg-rose-950 border border-rose-500/50 text-rose-200 font-mono text-xs font-bold">
+                      {formatNum(leakedBytes)} B leaked in{" "}
+                      {formatNum(leakedBlocks)} block(s)
+                    </span>
+                  )}
+                </div>
+
+                <p className="text-xs font-mono text-slate-200 font-semibold mb-2">
+                  {diag.what}
+                </p>
+
+                {Array.isArray(diag.auxwhat) && diag.auxwhat.length > 0 && (
+                  <div className="mb-3 space-y-1">
+                    {diag.auxwhat.map((aux, aIdx) => (
+                      <p
+                        key={`aux-${aIdx}`}
+                        className="text-xs font-mono text-amber-300/90 pl-3 border-l-2 border-amber-500/50"
+                      >
+                        {aux}
+                      </p>
+                    ))}
+                  </div>
+                )}
+
+                {stackFrames.length > 0 && (
+                  <div className="rounded-lg bg-slate-950 border border-slate-800 p-2.5 space-y-1 font-mono text-xs">
+                    {stackFrames.map((fr, fIdx) => {
+                      const fLine = safeNum(fr.line, 0);
+                      const isUserFrame =
+                        Boolean(fr.is_user_code) ||
+                        Boolean(fr.file && fr.file.endsWith("target.c"));
+                      return (
+                        <div
+                          key={`frame-${fIdx}`}
+                          onClick={() => isUserFrame && handleLineClick(fLine)}
+                          className={`flex flex-wrap items-center justify-between gap-2 px-2 py-1 rounded ${
+                            isUserFrame
+                              ? "bg-sky-950/50 border border-sky-500/30 text-sky-200 cursor-pointer hover:bg-sky-900/50"
+                              : "text-slate-400"
+                          }`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="text-slate-500">#{fIdx}</span>
+                            <span className="font-bold text-emerald-300">
+                              {fr.fn || "??"}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2 text-[11px]">
+                            {fr.file ? (
+                              <span
+                                className={
+                                  isUserFrame
+                                    ? "text-sky-300 font-bold underline"
+                                    : "text-slate-500"
+                                }
+                              >
+                                {fr.file}
+                                {fLine > 0 ? `:${formatNum(fLine)}` : ""}
+                              </span>
+                            ) : (
+                              <span className="text-slate-600">{fr.ip}</span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 5. Program Standard Output (`stdout`) */}
+      {audit.stdout.trim() !== "" && (
+        <div className="rounded-xl bg-slate-900/90 border border-slate-800 p-4">
+          <div className="flex items-center gap-2 text-xs font-mono uppercase tracking-wider text-slate-400 mb-2">
+            <Terminal className="w-3.5 h-3.5 text-emerald-400" />
+            <span>Program Standard Output (stdout)</span>
+          </div>
+          <pre className="text-xs font-mono text-emerald-300 bg-slate-950 border border-slate-800 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap">
+            {audit.stdout}
+          </pre>
+        </div>
+      )}
+
+      {/* 6. Collapsible Raw Valgrind Log */}
+      {audit.rawLog.trim() !== "" && (
+        <div className="rounded-xl bg-slate-900/90 border border-slate-800 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowRawLog((prev) => !prev)}
+            className="w-full flex items-center justify-between px-4 py-3 text-xs font-mono font-semibold text-slate-300 hover:bg-slate-800/60 transition cursor-pointer"
+          >
+            <div className="flex items-center gap-2">
+              <Terminal className="w-4 h-4 text-sky-400" />
+              <span>Raw Valgrind Memcheck Report</span>
+            </div>
+            {showRawLog ? (
+              <ChevronDown className="w-4 h-4 text-slate-400" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-slate-400" />
+            )}
+          </button>
+
+          {showRawLog && (
+            <pre className="text-xs font-mono text-slate-300 bg-slate-950 border-t border-slate-800 p-4 overflow-x-auto whitespace-pre-wrap max-h-96">
+              {audit.rawLog}
+            </pre>
+          )}
+        </div>
+      )}
     </div>
   );
 };
+
+export const HeapVisualizer: React.FC<HeapVisualizerProps> = (props) => {
+  return (
+    <HeapVisualizerErrorBoundary>
+      <HeapVisualizerContent {...props} />
+    </HeapVisualizerErrorBoundary>
+  );
+};
+
+export default HeapVisualizer;
