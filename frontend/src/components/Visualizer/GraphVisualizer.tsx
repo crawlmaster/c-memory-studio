@@ -3,20 +3,16 @@
  * Topology-Aware DWARF Graph, Tree, Linear-List & Pointer Mesh Visualizer.
  *
  * Key Capabilities:
- * 1. Parallel Edge Separation & Node-Position Routing:
- *    - Uses `curve-style: 'bezier'`, `control-point-step-size: 58`, and
- *      `edge-distances: 'node-position'` so parallel or co-directional pointers
- *      never blend into a single line.
- * 2. Edge Label Legibility & Z-Depth Layering:
- *    - Offsets edge labels (`text-margin-y: -8`) with an opaque `#0f172a` pill background
- *      (`text-background-opacity: 1`, `text-background-padding: '3px'`, `text-border-width: 1`,
- *      `text-border-color: '#334155'`) and places edges at `z-compound-depth: 'bottom'`
- *      beneath node cards.
- * 3. Ample Dagre & Multi-Lane Horizontal Clearance:
- *    - Enforces minimum `rankSep >= 110px` and `nodeSep >= 80px` border-to-border spacing.
- *    - Positions multi-bucket container headers (e.g. `Graph` with `adj[0..V-1]`) in a
- *      dedicated left column beside their horizontal bucket chains so outgoing bucket
- *      arrows never run vertically through sibling cards.
+ * 1. Atomic Traversal-Pointer Driven Edge & Weight Activation (Zero One-Step Lag):
+ *    - As soon as a frame pointer references a physical edge struct `E` in the heap,
+ *      the incident logical edge `(vertex-u -> vertex-v)` and its weight badge activate
+ *      IMMEDIATELY from `E`'s physical fields without waiting for local scalar copies
+ *      to finish executing.
+ * 2. Zero-Hardcoding Metric vs. Vertex Discrimination (`knownMetricVarsRef` & Single-Owner Endpoints):
+ *    - Prevents edge-weight and distance-metric scalars from ever rendering above vertex
+ *      circles, including on intermediate steps before a metric assignment line executes.
+ *    - Binds active metric variables exclusively to the active logical edge `(vertex-u -> vertex-v)`.
+ * 3. Parallel Edge Separation, Container Isolation & Responsive Topology Updates.
  */
 
 import React, {
@@ -59,6 +55,9 @@ export interface ExtendedGraphNode extends GraphNode {
 
 export interface ExtendedGraphEdge extends GraphEdge {
   field_order_idx?: number;
+  base_label?: string;
+  is_active_edge?: boolean;
+  has_active_metric?: boolean;
 }
 
 export interface ExtendedGraphData extends GraphData {
@@ -384,13 +383,8 @@ export function detectTopology(
   return "tree";
 }
 
-/**
- * Dimension-Aware Dagre Hierarchical Layout Engine (`rankDir: 'LR'` & `rankDir: 'TB'`).
- * Enforces minimum `rankSep >= 110px` and `nodeSep >= 80px` border-to-border clearance.
- * When a container header fans out to multiple horizontal chains (e.g. `Graph` -> `adj[0..V-1]`),
- * places the container in a dedicated left column so fan-out edges never cut vertically through
- * bucket cards.
- */
+const INDEXED_EDGE_RE = /^([a-zA-Z_][a-zA-Z0-9_]*)\[(\d+)\]$/;
+
 function computeDagreHierarchicalPositions(
   nodes: ExtendedGraphNode[],
   edges: ExtendedGraphEdge[],
@@ -422,7 +416,6 @@ function computeDagreHierarchicalPositions(
     (e) => nodeMap.has(e.source) && nodeMap.has(e.target) && e.source !== e.target
   );
 
-  // Mode 1: Horizontal 1D Linear List / Multi-Lane Bucket Chains (`rankDir: 'LR'`)
   if (config.rankDir === "LR") {
     const { containerNodes, backboneNodes, backboneEdges } =
       partitionContainersAndBackbone(nodes, allValidEdges);
@@ -453,7 +446,6 @@ function computeDagreHierarchicalPositions(
       }
     });
 
-    // If a container has indexed outgoing edges (`adj[0]`, `adj[1]`, ...), preserve bucket index order
     const bucketOrderByNodeId = new Map<string, number>();
     containerNodes.forEach((cNode) => {
       allValidEdges
@@ -516,14 +508,13 @@ function computeDagreHierarchicalPositions(
       chains.push(chain);
     }
 
-    // Distinguish between a multi-lane container (e.g. `Graph` pointing to >=2 separate bucket chains)
-    // vs. a single-chain header (e.g. `Queue` with `front`/`rear` pointing to 1 horizontal chain)
     const isMultiLaneContainer =
       containerNodes.length > 0 && chains.length >= 2;
     const chainStartX = isMultiLaneContainer
       ? 140 + 160 + effectiveRankSep + 30
       : 140;
-    let currentRowY = containerNodes.length > 0 && !isMultiLaneContainer ? 260 : 140;
+    let currentRowY =
+      containerNodes.length > 0 && !isMultiLaneContainer ? 260 : 140;
 
     chains.forEach((chain) => {
       let cursorX = chainStartX;
@@ -537,8 +528,7 @@ function computeDagreHierarchicalPositions(
         } else {
           const prevId = chain[idx - 1];
           const prevDim = nodeDims.get(prevId) || { width: 160, height: 76 };
-          const stepX =
-            prevDim.width / 2 + effectiveRankSep + dim.width / 2;
+          const stepX = prevDim.width / 2 + effectiveRankSep + dim.width / 2;
           cursorX += stepX;
           positions[nodeId] = {
             x: Math.round(cursorX),
@@ -561,15 +551,15 @@ function computeDagreHierarchicalPositions(
         const cDim = nodeDims.get(cNode.id) || { width: 160, height: 84 };
 
         if (isMultiLaneContainer && cTargets.length > 0) {
-          // Place multi-lane container in a dedicated LEFT column, vertically centered across its buckets
           const minY = Math.min(...cTargets.map((pos) => pos.y));
           const maxY = Math.max(...cTargets.map((pos) => pos.y));
           positions[cNode.id] = {
             x: 140,
-            y: Math.round((minY + maxY) / 2 + cIdx * (cDim.height + effectiveNodeSep)),
+            y: Math.round(
+              (minY + maxY) / 2 + cIdx * (cDim.height + effectiveNodeSep)
+            ),
           };
         } else if (cTargets.length > 0) {
-          // Single-chain container (e.g. `Queue` with `front` and `rear`): center cleanly ABOVE the horizontal chain
           const avgX =
             cTargets.reduce((sum, pos) => sum + pos.x, 0) / cTargets.length;
           const minY = Math.min(...cTargets.map((pos) => pos.y));
@@ -776,7 +766,9 @@ function computeDagreHierarchicalPositions(
     containerNodes.length > 0 && roots.length >= 2;
   const baseRootY =
     containerNodes.length > 0 && !isMultiTreeContainer ? 260 : 120;
-  let cursorX = isMultiTreeContainer ? 140 + 160 + effectiveRankSep + 30 : 140;
+  let cursorX = isMultiTreeContainer
+    ? 140 + 160 + effectiveRankSep + 30
+    : 140;
 
   roots.forEach((rId) => {
     const rW = subtreeWidth.get(rId) || UNIT_SLOT;
@@ -796,7 +788,9 @@ function computeDagreHierarchicalPositions(
         const maxY = Math.max(...cTargets.map((pos) => pos.y));
         positions[cNode.id] = {
           x: 140,
-          y: Math.round((minY + maxY) / 2 + cIdx * (cDim.height + effectiveNodeSep)),
+          y: Math.round(
+            (minY + maxY) / 2 + cIdx * (cDim.height + effectiveNodeSep)
+          ),
         };
       } else if (cTargets.length > 0) {
         const avgX =
@@ -1043,25 +1037,64 @@ function buildSvgVertexCard(
   };
 }
 
-const INDEXED_EDGE_RE = /^([a-zA-Z_][a-zA-Z0-9_]*)\[(\d+)\]$/;
+interface DiscoveredPhysicalEdge {
+  u: number;
+  v: number;
+  weight: number | string | null;
+  metricFieldNames: string[];
+  metricValues: number[];
+  chainNodeId: string;
+  isActiveTraversal: boolean;
+  traversalPtrs: string[];
+}
 
-function resolveLogicalGraphData(
+/**
+ * Atomic Traversal-Pointer Driven Logical Graph & Edge-Metric Projection:
+ *
+ * 1. Immediate Active Edge Resolution via Traversal Pointer:
+ *    - When any stack pointer references a physical edge struct `E` in bucket `u`,
+ *      the directed edge `(vertex-u -> vertex-v)` and its weight badge (`w: ${weight}`)
+ *      activate IMMEDIATELY on that step (`is_active_edge = true`, `has_active_metric = true`),
+ *      without waiting for local scalar copies to be evaluated.
+ * 2. Zero Transient Metric Placement on Vertex Nodes:
+ *    - Tracks variables that act as edge/distance metrics (`knownMetricVars`) and variables
+ *      that act as proven vertex endpoints (`knownVertexVars`).
+ *    - During active edge traversal `(actU -> actV)`, at most ONE scalar variable can bind
+ *      to `actU` and at most ONE scalar variable (the first established endpoint variable)
+ *      can bind to `actV`. Any second variable or known metric variable is strictly excluded
+ *      from `vertexPointers` and bound to the active edge `(vertex-actU -> vertex-actV)`.
+ */
+function projectLogicalGraphFromMesh(
   physicalGraph: ExtendedGraphData,
-  explicitLogicalGraph?: LogicalGraphPayload | null,
-  locals?: Record<string, number | string>,
-  arrays?: ArraySnapshot[]
+  explicitLogicalGraph: LogicalGraphPayload | null | undefined,
+  locals: Record<string, number | string> | undefined,
+  arrays: ArraySnapshot[] | undefined,
+  knownMetricVars: Set<string>,
+  knownVertexVars: Set<string>
 ): {
   canProject: boolean;
   isForestTopology: boolean;
   logicalGraph: ExtendedGraphData;
 } {
   const backendLogical = explicitLogicalGraph ?? physicalGraph?.logical_graph;
+  const pNodes = (physicalGraph?.nodes || []) as ExtendedGraphNode[];
+  const pEdges = (physicalGraph?.edges || []) as ExtendedGraphEdge[];
+
+  // Case 1: Index-Buffer Forest Topology (e.g. Disjoint Set Union parent[] array)
   if (
-    backendLogical &&
-    Array.isArray(backendLogical.nodes) &&
-    backendLogical.nodes.length > 0
+    (backendLogical && backendLogical.is_forest) ||
+    (pNodes.length > 0 && pNodes.every((n) => n.type === "IndexNode"))
   ) {
-    const activeNodes: ExtendedGraphNode[] = backendLogical.nodes
+    const sourceNodes =
+      backendLogical && backendLogical.nodes.length > 0
+        ? backendLogical.nodes
+        : pNodes;
+    const sourceEdges =
+      backendLogical && backendLogical.edges.length > 0
+        ? backendLogical.edges
+        : pEdges;
+
+    const logicalNodes: ExtendedGraphNode[] = sourceNodes
       .filter((n) => !n.is_freed && n.status !== "freed")
       .map((n, idx) => {
         if (n.type === "IndexNode") {
@@ -1083,86 +1116,17 @@ function resolveLogicalGraphData(
         return n;
       });
 
-    const rawEdges: ExtendedGraphEdge[] = backendLogical.edges || [];
-    if (backendLogical.is_forest) {
-      return {
-        canProject: true,
-        isForestTopology: true,
-        logicalGraph: {
-          nodes: activeNodes,
-          edges: rawEdges,
-        },
-      };
-    }
-
-    const edgeLookup = new Set<string>(
-      rawEdges.map((e) => `${e.source}->${e.target}:${e.label ?? ""}`)
-    );
-    const emittedUndirected = new Set<string>();
-    const dedupedEdges: ExtendedGraphEdge[] = [];
-
-    for (const e of rawEdges) {
-      const reverseKey = `${e.target}->${e.source}:${e.label ?? ""}`;
-      if (edgeLookup.has(reverseKey)) {
-        const uMin = e.source < e.target ? e.source : e.target;
-        const vMax = e.source < e.target ? e.target : e.source;
-        const canonKey = `${uMin}--${vMax}:${e.label ?? ""}`;
-        if (emittedUndirected.has(canonKey)) continue;
-        emittedUndirected.add(canonKey);
-      }
-      dedupedEdges.push(e);
-    }
-
-    return {
-      canProject: true,
-      isForestTopology: false,
-      logicalGraph: {
-        nodes: activeNodes,
-        edges: dedupedEdges,
-      },
-    };
-  }
-
-  const pNodes = (physicalGraph?.nodes || []) as ExtendedGraphNode[];
-  const pEdges = (physicalGraph?.edges || []) as ExtendedGraphEdge[];
-
-  if (pNodes.length === 0) {
-    return {
-      canProject: false,
-      isForestTopology: false,
-      logicalGraph: { nodes: [], edges: [] },
-    };
-  }
-
-  if (pNodes.every((n) => n.type === "IndexNode")) {
-    const logicalNodes: ExtendedGraphNode[] = pNodes
-      .filter((n) => !n.is_freed && n.status !== "freed")
-      .map((n, idx) => {
-        const idxNum = n.fields?.index ?? idx;
-        const entries = Object.entries(n.fields || {}).filter(
-          ([k]) => k !== "index" && k !== "role"
-        );
-        const targetVal = entries.length > 0 ? entries[0][1] : idxNum;
-        return {
-          ...n,
-          type: "LogicalVertex",
-          label: `Node ${idxNum}`,
-          fields: {
-            vertex: idxNum,
-            "→": targetVal,
-          },
-        };
-      });
     return {
       canProject: logicalNodes.length > 0,
       isForestTopology: true,
       logicalGraph: {
         nodes: logicalNodes,
-        edges: pEdges,
+        edges: sourceEdges,
       },
     };
   }
 
+  // Case 2: Adjacency-List Graph Projection & Atomic Traversal-Pointer Edge Activation
   const nodeById = new Map<string, ExtendedGraphNode>();
   pNodes.forEach((n) => nodeById.set(n.id, n));
 
@@ -1201,25 +1165,23 @@ function resolveLogicalGraphData(
     }
   }
 
-  if (!containerNode) {
-    return {
-      canProject: false,
-      isForestTopology: false,
-      logicalGraph: { nodes: [], edges: [] },
-    };
-  }
+  let vertexCount =
+    backendLogical && Array.isArray(backendLogical.nodes)
+      ? backendLogical.nodes.length
+      : 0;
 
-  let vertexCount = 0;
-  Object.values(containerNode.fields || {}).forEach((val) => {
-    if (typeof val === "number" && val >= 1 && val <= 32) {
-      vertexCount = Math.max(vertexCount, val);
-    } else if (typeof val === "string" && val.startsWith("ptr[")) {
-      const m = /^ptr\[(\d+)\]/.exec(val);
-      if (m) {
-        vertexCount = Math.max(vertexCount, Number(m[1]));
+  if (containerNode) {
+    Object.values(containerNode.fields || {}).forEach((val) => {
+      if (typeof val === "number" && val >= 1 && val <= 32) {
+        vertexCount = Math.max(vertexCount, val);
+      } else if (typeof val === "string" && val.startsWith("ptr[")) {
+        const m = /^ptr\[(\d+)\]/.exec(val);
+        if (m) {
+          vertexCount = Math.max(vertexCount, Number(m[1]));
+        }
       }
-    }
-  });
+    });
+  }
 
   indexedEdges.forEach((ie) => {
     vertexCount = Math.max(vertexCount, ie.uIdx + 1);
@@ -1233,12 +1195,42 @@ function resolveLogicalGraphData(
     };
   }
 
-  const rawLogicalEdges: Array<{
-    u: number;
-    v: number;
-    weight: number | string | null;
-    chainNodeId: string;
-  }> = [];
+  // Classify `locals`: record pointer addresses, scalar integers, and any out-of-vertex-domain
+  // metric values (e.g. `INF` / `∞` or values `> vertexCount`)
+  const addrToLocalPtrNames = new Map<string, string[]>();
+  const scalarLocals = new Map<string, number>();
+
+  if (locals) {
+    Object.entries(locals).forEach(([varName, rawVal]) => {
+      const strVal = String(rawVal).trim();
+      if (strVal.startsWith("0x") || strVal.startsWith("0X")) {
+        const normAddr = strVal.toLowerCase();
+        if (!addrToLocalPtrNames.has(normAddr)) {
+          addrToLocalPtrNames.set(normAddr, []);
+        }
+        addrToLocalPtrNames.get(normAddr)!.push(varName);
+      } else if (strVal === "∞" || strVal === "-∞") {
+        // Any variable that holds infinity is a distance/cost metric, never a vertex index
+        knownMetricVars.add(varName);
+      } else if (typeof rawVal === "number" && Number.isFinite(rawVal)) {
+        scalarLocals.set(varName, rawVal);
+        if (rawVal > vertexCount || rawVal < -1) {
+          knownMetricVars.add(varName);
+        }
+      } else if (/^-?\d+(\.\d+)?$/.test(strVal)) {
+        const num = Number(strVal);
+        if (Number.isFinite(num)) {
+          scalarLocals.set(varName, num);
+          if (num > vertexCount || num < -1) {
+            knownMetricVars.add(varName);
+          }
+        }
+      }
+    });
+  }
+
+  // Walk physical bucket chains to discover physical edge structs and detect active pointer traversal
+  const discoveredEdges: DiscoveredPhysicalEdge[] = [];
 
   for (const { uIdx, targetId } of indexedEdges) {
     let currId: string | undefined = targetId;
@@ -1268,16 +1260,39 @@ function resolveLogicalGraphData(
         if (scalarNums.length >= 1) {
           const destVal = Number(scalarNums[0][1]);
           const weightVal = scalarNums.length >= 2 ? scalarNums[1][1] : null;
+          const metricFieldNames: string[] = scalarNums
+            .slice(1)
+            .map(([k]) => k);
+          const metricValues: number[] = scalarNums
+            .slice(1)
+            .map(([, mv]) => Number(mv))
+            .filter((n) => Number.isFinite(n));
+
+          const directPtrs = new Set<string>();
+          (chainNode.pointers || []).forEach((pName) => {
+            const cleanPtr = pName.split(":").pop() || pName;
+            if (!cleanPtr.includes("->") && !cleanPtr.includes("[")) {
+              directPtrs.add(cleanPtr);
+            }
+          });
+          const localAddrPtrs =
+            addrToLocalPtrNames.get(chainNode.id.toLowerCase()) || [];
+          localAddrPtrs.forEach((pName) => directPtrs.add(pName));
+
           if (
             Number.isInteger(destVal) &&
             destVal >= 0 &&
             destVal < vertexCount
           ) {
-            rawLogicalEdges.push({
+            discoveredEdges.push({
               u: uIdx,
               v: destVal,
               weight: weightVal,
+              metricFieldNames,
+              metricValues,
               chainNodeId: currId,
+              isActiveTraversal: directPtrs.size > 0,
+              traversalPtrs: Array.from(directPtrs),
             });
           }
         }
@@ -1289,56 +1304,185 @@ function resolveLogicalGraphData(
     }
   }
 
-  const matchingMetricArray: ArraySnapshot | undefined = (arrays || []).find(
+  // Identify 1D vertex-domain buffers (arrays with length === vertexCount)
+  const vertexDomainArrays: ArraySnapshot[] = (arrays || []).filter(
     (a) =>
       !a.is_compound && a.kind !== "matrix" && a.elements.length === vertexCount
   );
+  const primaryMetricArray: ArraySnapshot | undefined = vertexDomainArrays[0];
 
-  const vertexPointers: Record<number, string[]> = {};
-  if (matchingMetricArray?.active_indices) {
-    Object.entries(matchingMetricArray.active_indices).forEach(
-      ([varName, idxVal]) => {
-        if (idxVal >= 0 && idxVal < vertexCount) {
-          if (!vertexPointers[idxVal]) vertexPointers[idxVal] = [];
-          vertexPointers[idxVal].push(varName);
+  // Collect candidate vertex cursors from `active_indices` of vertex-domain arrays
+  const candidateVertexVars = new Map<string, number>();
+  vertexDomainArrays.forEach((vArr) => {
+    Object.entries(vArr.active_indices || {}).forEach(([varName, idxVal]) => {
+      if (
+        typeof idxVal === "number" &&
+        Number.isInteger(idxVal) &&
+        idxVal >= 0 &&
+        idxVal < vertexCount &&
+        !knownMetricVars.has(varName)
+      ) {
+        if (!candidateVertexVars.has(varName)) {
+          candidateVertexVars.set(varName, idxVal);
         }
       }
-    );
-  } else if (locals) {
-    Object.entries(locals).forEach(([varName, val]) => {
+    });
+  });
+
+  // Resolve the currently active physical edge directly from the traversal pointer
+  const activePhysicalEdge: DiscoveredPhysicalEdge | undefined =
+    discoveredEdges.find((de) => de.isActiveTraversal);
+
+  let activeEdgeMetricBinding: {
+    u: number;
+    v: number;
+    varName: string;
+    varVal: number | string;
+  } | null = null;
+
+  const vertexPointers: Record<number, string[]> = {};
+
+  if (activePhysicalEdge) {
+    const { u: actU, v: actV, weight: actWeight, metricValues } =
+      activePhysicalEdge;
+
+    // 1. Identify the single owner variable for `actU` (source bucket vertex)
+    let chosenUVar: string | null = null;
+    candidateVertexVars.forEach((val, varName) => {
+      if (val === actU && !knownMetricVars.has(varName)) {
+        if (
+          chosenUVar === null ||
+          (knownVertexVars.has(varName) && !knownVertexVars.has(chosenUVar))
+        ) {
+          chosenUVar = varName;
+        }
+      }
+    });
+    if (chosenUVar !== null) {
+      knownVertexVars.add(chosenUVar);
+      vertexPointers[actU] = [chosenUVar];
+    }
+
+    // 2. Identify the single owner variable for `actV` (destination vertex):
+    //    If multiple variables currently hold `actV` (e.g. `v = 1` and stale `w = 1` on the
+    //    step `int w = curr->weight;`), ONLY the first/established vertex variable (`chosenVVar`)
+    //    binds to `actV`. Any second variable holding `actV` is classified as a metric variable!
+    let chosenVVar: string | null = null;
+    candidateVertexVars.forEach((val, varName) => {
       if (
-        typeof val === "number" &&
-        Number.isInteger(val) &&
-        val >= 0 &&
-        val < vertexCount
+        val === actV &&
+        varName !== chosenUVar &&
+        !knownMetricVars.has(varName)
       ) {
-        if (!vertexPointers[val]) vertexPointers[val] = [];
-        vertexPointers[val].push(varName);
+        if (chosenVVar === null) {
+          chosenVVar = varName;
+        } else if (
+          knownVertexVars.has(varName) &&
+          !knownVertexVars.has(chosenVVar)
+        ) {
+          knownMetricVars.add(chosenVVar);
+          chosenVVar = varName;
+        } else {
+          // Second variable colliding on `actV` during edge traversal is the metric variable
+          knownMetricVars.add(varName);
+        }
+      }
+    });
+    if (chosenVVar !== null) {
+      knownVertexVars.add(chosenVVar);
+      if (!vertexPointers[actV]) {
+        vertexPointers[actV] = [];
+      }
+      if (!vertexPointers[actV].includes(chosenVVar)) {
+        vertexPointers[actV].push(chosenVVar);
+      }
+    }
+
+    // 3. Classify any remaining local scalar variables that match `metricValues`
+    //    (and are not `chosenUVar` or `chosenVVar`) as edge-metric variables
+    scalarLocals.forEach((val, varName) => {
+      if (varName !== chosenUVar && varName !== chosenVVar) {
+        if (metricValues.includes(val)) {
+          knownMetricVars.add(varName);
+        }
+      }
+    });
+
+    // 4. Bind the active edge metric label atomically via the traversal pointer:
+    //    Find the active metric variable name (either matching `metricValues` now, or
+    //    already known in `knownMetricVars` and present in `scalarLocals`), and bind it
+    //    directly to `activePhysicalEdge`'s true weight `actWeight` so there is ZERO 1-step lag!
+    let boundMetricVarName: string | null = null;
+    scalarLocals.forEach((val, varName) => {
+      if (
+        varName !== chosenUVar &&
+        varName !== chosenVVar &&
+        !knownVertexVars.has(varName) &&
+        metricValues.includes(val)
+      ) {
+        boundMetricVarName = varName;
+      }
+    });
+
+    if (!boundMetricVarName) {
+      scalarLocals.forEach((_val, varName) => {
+        if (
+          boundMetricVarName === null &&
+          varName !== chosenUVar &&
+          varName !== chosenVVar &&
+          knownMetricVars.has(varName) &&
+          (primaryMetricArray?.active_indices?.[varName] !== undefined ||
+            vertexDomainArrays.some(
+              (a) => a.active_indices?.[varName] !== undefined
+            ))
+        ) {
+          boundMetricVarName = varName;
+        }
+      });
+    }
+
+    if (boundMetricVarName && actWeight !== null) {
+      activeEdgeMetricBinding = {
+        u: actU,
+        v: actV,
+        varName: boundMetricVarName,
+        varVal: actWeight,
+      };
+    }
+
+    // 5. Attach traversal struct pointer indicator (`curr→`) to `actV`
+    activePhysicalEdge.traversalPtrs.forEach((pName) => {
+      const tag = `${pName}→`;
+      if (!vertexPointers[actV]) {
+        vertexPointers[actV] = [];
+      }
+      if (!vertexPointers[actV].includes(tag)) {
+        vertexPointers[actV].push(tag);
+      }
+    });
+  } else {
+    // No active edge traversal pointer (`curr` is NULL or out of scope):
+    // Render proven vertex cursors while excluding all `knownMetricVars`
+    candidateVertexVars.forEach((idxVal, varName) => {
+      if (knownMetricVars.has(varName)) {
+        return;
+      }
+      if (!vertexPointers[idxVal]) {
+        vertexPointers[idxVal] = [];
+      }
+      if (!vertexPointers[idxVal].includes(varName)) {
+        vertexPointers[idxVal].push(varName);
       }
     });
   }
 
-  rawLogicalEdges.forEach((reItem) => {
-    const cNode = nodeById.get(reItem.chainNodeId);
-    if (cNode?.pointers && cNode.pointers.length > 0) {
-      cNode.pointers.forEach((pName) => {
-        if (!pName.includes("->")) {
-          if (!vertexPointers[reItem.v]) vertexPointers[reItem.v] = [];
-          const tag = `${pName}→`;
-          if (!vertexPointers[reItem.v].includes(tag)) {
-            vertexPointers[reItem.v].push(tag);
-          }
-        }
-      });
-    }
-  });
-
+  // Construct Logical Vertex Nodes (`vertex-0 .. vertex-(V-1)`)
   const logicalNodes: ExtendedGraphNode[] = [];
   for (let i = 0; i < vertexCount; i++) {
     const ptrs = vertexPointers[i] || [];
     const metricVal =
-      matchingMetricArray && i < matchingMetricArray.elements.length
-        ? matchingMetricArray.elements[i]
+      primaryMetricArray && i < primaryMetricArray.elements.length
+        ? primaryMetricArray.elements[i]
         : undefined;
 
     const fieldsObj: Record<string, number | string> = { vertex: i };
@@ -1348,8 +1492,8 @@ function resolveLogicalGraphData(
       metricVal !== undefined &&
       (typeof metricVal === "number" || typeof metricVal === "string")
     ) {
-      fieldsObj[matchingMetricArray!.name] = metricVal;
-      metricLabel = `${matchingMetricArray!.name}: ${String(metricVal)}`;
+      fieldsObj[primaryMetricArray!.name] = metricVal;
+      metricLabel = `${primaryMetricArray!.name}: ${String(metricVal)}`;
     }
 
     logicalNodes.push({
@@ -1365,27 +1509,100 @@ function resolveLogicalGraphData(
     });
   }
 
+  // Construct Logical Edges
+  const sourceEdgesList: Array<{
+    u: number;
+    v: number;
+    weightStr: string;
+    isActive: boolean;
+  }> = [];
+
+  if (discoveredEdges.length > 0) {
+    discoveredEdges.forEach((de) => {
+      sourceEdgesList.push({
+        u: de.u,
+        v: de.v,
+        weightStr: de.weight !== null ? String(de.weight) : "",
+        isActive: de.isActiveTraversal,
+      });
+    });
+  } else if (backendLogical && Array.isArray(backendLogical.edges)) {
+    backendLogical.edges.forEach((be) => {
+      const uNum = Number(be.source.replace("vertex-", ""));
+      const vNum = Number(be.target.replace("vertex-", ""));
+      const rawW = (be.label || "").replace(/^w:\s*/, "").trim();
+      if (Number.isInteger(uNum) && Number.isInteger(vNum)) {
+        sourceEdgesList.push({
+          u: uNum,
+          v: vNum,
+          weightStr: rawW,
+          isActive: false,
+        });
+      }
+    });
+  }
+
   const edgeSet = new Set<string>(
-    rawLogicalEdges.map((e) => `${e.u}->${e.v}:${String(e.weight ?? "")}`)
+    sourceEdgesList.map((e) => `${e.u}->${e.v}:${e.weightStr}`)
   );
+  const activeDirectedPairs = new Set<string>(
+    sourceEdgesList
+      .filter((e) => e.isActive)
+      .map((e) => `${e.u}->${e.v}:${e.weightStr}`)
+  );
+
   const emittedPairs = new Set<string>();
   const logicalEdges: ExtendedGraphEdge[] = [];
 
-  for (const e of rawLogicalEdges) {
-    const wStr = String(e.weight ?? "");
-    const reverseKey = `${e.v}->${e.u}:${wStr}`;
+  for (const e of sourceEdgesList) {
+    const reverseKey = `${e.v}->${e.u}:${e.weightStr}`;
     const isUndirected = edgeSet.has(reverseKey);
 
+    let finalU = e.u;
+    let finalV = e.v;
+    let isEdgeActive = e.isActive;
+
     if (isUndirected) {
-      const canon = `${Math.min(e.u, e.v)}--${Math.max(e.u, e.v)}:${wStr}`;
+      const canon = `${Math.min(e.u, e.v)}--${Math.max(e.u, e.v)}:${e.weightStr}`;
       if (emittedPairs.has(canon)) continue;
       emittedPairs.add(canon);
+
+      const forwardActive = activeDirectedPairs.has(
+        `${e.u}->${e.v}:${e.weightStr}`
+      );
+      const reverseActive = activeDirectedPairs.has(reverseKey);
+      isEdgeActive = forwardActive || reverseActive;
+
+      if (reverseActive && !forwardActive) {
+        finalU = e.v;
+        finalV = e.u;
+      }
+    }
+
+    const baseLabel = e.weightStr !== "" ? `w: ${e.weightStr}` : "";
+    let displayLabel = baseLabel;
+    // Activate the amber weight badge pill IMMEDIATELY whenever `isEdgeActive` is true!
+    const hasActiveMetric = isEdgeActive && baseLabel !== "";
+
+    if (
+      isEdgeActive &&
+      activeEdgeMetricBinding &&
+      activeEdgeMetricBinding.u === finalU &&
+      activeEdgeMetricBinding.v === finalV
+    ) {
+      displayLabel =
+        baseLabel !== ""
+          ? `${baseLabel} (${activeEdgeMetricBinding.varName} = ${activeEdgeMetricBinding.varVal})`
+          : `${activeEdgeMetricBinding.varName} = ${activeEdgeMetricBinding.varVal}`;
     }
 
     logicalEdges.push({
-      source: `vertex-${e.u}`,
-      target: `vertex-${e.v}`,
-      label: e.weight !== null ? `w: ${String(e.weight)}` : "",
+      source: `vertex-${finalU}`,
+      target: `vertex-${finalV}`,
+      label: displayLabel,
+      base_label: baseLabel,
+      is_active_edge: isEdgeActive,
+      has_active_metric: hasActiveMetric,
     });
   }
 
@@ -1461,8 +1678,8 @@ function computeGeneralMeshSeedPositions(
 
   const visited = new Set<string>();
   let currentLaneY = 120;
-  const HORIZONTAL_PITCH = 280; // 160px card + 120px open horizontal corridor for edge labels
-  const VERTICAL_MARGIN = 90;   // Ample vertical separation between horizontal lanes
+  const HORIZONTAL_PITCH = 280;
+  const VERTICAL_MARGIN = 90;
 
   roots.forEach((rootId) => {
     if (visited.has(rootId)) return;
@@ -1582,15 +1799,31 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
   const prevModeRef = useRef<ViewMode>("logical");
   const userDraggedPositionsRef = useRef<Record<string, { x: number; y: number }>>({});
 
+  // Session-persistent classification sets to eliminate transient 1-step metric jumps
+  const knownMetricVarsRef = useRef<Set<string>>(new Set<string>());
+  const knownVertexVarsRef = useRef<Set<string>>(new Set<string>());
+
   const [viewMode, setViewMode] = useState<ViewMode>("logical");
   const [selectedNode, setSelectedNode] = useState<ExtendedGraphNode | null>(
     null
   );
   const [badgeOverlays, setBadgeOverlays] = useState<BadgeOverlayItem[]>([]);
 
+  if (isConnecting) {
+    knownMetricVarsRef.current.clear();
+    knownVertexVarsRef.current.clear();
+  }
+
   const { canProject, isForestTopology, logicalGraph } = useMemo(
     () =>
-      resolveLogicalGraphData(graph, explicitLogicalGraph, locals, arrays),
+      projectLogicalGraphFromMesh(
+        graph,
+        explicitLogicalGraph,
+        locals,
+        arrays,
+        knownMetricVarsRef.current,
+        knownVertexVarsRef.current
+      ),
     [graph, explicitLogicalGraph, locals, arrays]
   );
 
@@ -1792,11 +2025,19 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
       .sort()
       .join(",");
     const eKeys = edges
-      .map((e) => `${e.source}->${e.target}:${e.label ?? ""}`)
+      .map((e) => {
+        const baseLbl = e.base_label ?? e.label ?? "";
+        if (effectiveMode === "logical" && !isForestTopology) {
+          const uMin = e.source < e.target ? e.source : e.target;
+          const vMax = e.source < e.target ? e.target : e.source;
+          return `${uMin}--${vMax}:${baseLbl}`;
+        }
+        return `${e.source}->${e.target}:${baseLbl}`;
+      })
       .sort()
       .join(",");
     return `${effectiveMode}|${detectedTopology}|${nKeys}|${eKeys}`;
-  }, [nodes, edges, effectiveMode, detectedTopology]);
+  }, [nodes, edges, effectiveMode, isForestTopology, detectedTopology]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -1890,6 +2131,30 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
             "line-color": "#64748b",
             "target-arrow-shape": "none",
             color: "#fde047",
+          },
+        },
+        {
+          selector: "edge[?isActiveEdge]",
+          style: {
+            width: 3.5,
+            "line-color": "#f59e0b",
+            "target-arrow-color": "#f59e0b",
+            "target-arrow-shape": "triangle",
+            "arrow-scale": 1.25,
+            "z-compound-depth": "top",
+            "z-index": 99,
+          },
+        },
+        {
+          selector: "edge[?hasActiveMetricBadge]",
+          style: {
+            color: "#fef3c7",
+            "text-background-color": "#b45309",
+            "text-background-opacity": 1,
+            "text-background-padding": "4px",
+            "text-border-color": "#f59e0b",
+            "text-border-width": 1.5,
+            "text-border-opacity": 1,
           },
         },
         {
@@ -1988,11 +2253,15 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         label: string;
         fieldOrderIdx: number;
         isUndirectedLogical: boolean;
+        isActiveEdge: boolean;
+        hasActiveMetricBadge: boolean;
         isDeleting: boolean;
       }
     >();
 
+    const activeCanonicalPairs = new Set<string>();
     const pairOccurrenceCounter = new Map<string, number>();
+
     edges.forEach((e) => {
       if (
         e.source &&
@@ -2000,10 +2269,18 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
         validNodeIds.has(e.source) &&
         validNodeIds.has(e.target)
       ) {
-        const baseKey = `${e.source}->${e.target}:${e.label ?? ""}`;
+        const uMin = e.source < e.target ? e.source : e.target;
+        const vMax = e.source < e.target ? e.target : e.source;
+        const baseLbl = e.base_label ?? e.label ?? "";
+        activeCanonicalPairs.add(`${uMin}--${vMax}:${baseLbl}`);
+
+        const baseKey = `${e.source}->${e.target}:${baseLbl}`;
         const occ = pairOccurrenceCounter.get(baseKey) ?? 0;
         pairOccurrenceCounter.set(baseKey, occ + 1);
         const edgeId = `edge-${baseKey}-${occ}`;
+
+        const isAct = Boolean(e.is_active_edge);
+        const hasMetric = Boolean(e.has_active_metric);
 
         desiredEdgeMap.set(edgeId, {
           id: edgeId,
@@ -2012,7 +2289,9 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
           label: e.label ?? "",
           fieldOrderIdx: e.field_order_idx ?? 0,
           isUndirectedLogical:
-            effectiveMode === "logical" && !isForestTopology,
+            effectiveMode === "logical" && !isForestTopology && !isAct,
+          isActiveEdge: isAct,
+          hasActiveMetricBadge: hasMetric,
           isDeleting: false,
         });
       }
@@ -2039,14 +2318,28 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
 
       cy.edges().forEach((existingEdge) => {
         if (!desiredEdgeMap.has(existingEdge.id())) {
-          const srcExists = validNodeIds.has(existingEdge.source().id());
-          const tgtExists = validNodeIds.has(existingEdge.target().id());
+          const srcId = existingEdge.source().id();
+          const tgtId = existingEdge.target().id();
+          const srcExists = validNodeIds.has(srcId);
+          const tgtExists = validNodeIds.has(tgtId);
+
+          const uMin = srcId < tgtId ? srcId : tgtId;
+          const vMax = srcId < tgtId ? tgtId : srcId;
+          const rawLbl = String(existingEdge.data("label") ?? "").replace(
+            /\s*\([^\)]+\)$/,
+            ""
+          );
+          const stillExistsReversed = activeCanonicalPairs.has(
+            `${uMin}--${vMax}:${rawLbl}`
+          );
+
           if (
             effectiveMode === "logical" &&
             !modeChanged &&
             !isForestTopology &&
             srcExists &&
-            tgtExists
+            tgtExists &&
+            !stillExistsReversed
           ) {
             if (!existingEdge.data("isDeleting")) {
               existingEdge.data("isDeleting", true);
@@ -2191,7 +2484,7 @@ export const GraphVisualizer: React.FC<GraphVisualizerProps> = ({
             }`}
             title={
               canProject
-                ? "View Mathematical Graph G = (V, E) with Automatic Deallocated Edge Pruning"
+                ? "View Mathematical Graph G = (V, E) with Atomic Active Edge & Metric Binding"
                 : "Logical Graph projection activates automatically when an adjacency or forest structure is detected"
             }
           >
