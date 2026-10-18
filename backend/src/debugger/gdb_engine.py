@@ -2,33 +2,31 @@
 r"""
 backend/src/debugger/gdb_engine.py
 
-High-Throughput, Purely Structural DWARF/GDB-MI Introspection Engine for C-Memory-Studio.
+High-Throughput, Deterministic DWARF/GDB-MI Introspection Engine for C-Memory-Studio.
 Zero hardcoded variable names, struct member names, or algorithm presets.
 
 Key Capabilities:
-  1. Scalar Reference Pointer Suppression (`_is_scalar_reference_pointer`):
-     - Inspects local syntactic usage of `T *` parameters (e.g. `void swap(int *a, int *b)`).
-     - Pointers accessed strictly via unary dereference (`*a`, `*b`) without subscripting
-       (`a[i]`), pointer offset arithmetic (`a + i`, `a++`), or heap allocation are treated
-       strictly as scalar references and NEVER inflated into fake `ArraySnapshot` slices.
-     - Retains caller-frame arrays (`arr`) via their base stack address while stepping inside
-       helper routines like `swap`, showing live element swaps in place.
-  2. Three-Stage Physical Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`):
-     - Guarantees that on the immediate step where `free(ptr)` executes (`freed_at_step == step_count`),
-       and on any subsequent step where a dangling local/heap pointer still holds `addr`,
-       the block is emitted with `status="freed"`, `is_freed=True`, `is_dangling=True`, and
-       its frozen pre-free fields.
-     - Purges the block (`status="purged"`) only on subsequent steps after all references vanish.
-  3. Deterministic Step-Into for All User Functions (`_should_step_into_current_line`).
-  4. Dedicated Logical Graph Builder (`_build_logical_graph_snapshot`) with Immediate Edge Pruning.
-  5. Caller-Frame Decayed Array Bound Resolution (`_address_bounds_ledger`) &
-     Positional 2D Matrix Subscript Resolution (`_resolve_matrix_access`).
+  1. Safe Session Timer Initialization & Startup Synchronization:
+     - Initializes `self.session_start_time = time.monotonic()` in `__init__()` and refreshes
+       it at the top of `start()` before any budget check executes, eliminating instant
+       `TimeoutError` on container startup.
+     - Safely drains initial GDB banner output via `get_gdb_response(timeout_sec=0.5, raise_error_on_timeout=False)`.
+  2. Deterministic Execution Barrier (`_cmd_exec`):
+     - Waits for GDB's `*stopped` notification on `-exec-run`, `-exec-step`, `-exec-next`,
+       and `-exec-finish`.
+  3. Guaranteed Subprocess Teardown (`GDBTracer.close()`):
+     - Cleanly exits GDB and forcefully terminates any lingering `gdb` subprocess (`spawn.kill()`).
+  4. Scalar Reference Pointer Suppression (`_is_scalar_reference_pointer`).
+  5. Three-Stage Physical Heap Block Lifecycle (`ALLOCATED` -> `FREED` -> `PURGED`) &
+     Dedicated Logical Graph Builder (`_build_logical_graph_snapshot`).
 """
 
 import asyncio
 import os
 import re
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,6 +58,25 @@ FREE_CALL_RE = re.compile(
     r"\bfree\s*\(\s*([a-zA-Z_][a-zA-Z0-9_\->\.\[\]]*)\s*\)"
 )
 ALLOC_CALL_RE = re.compile(r"\b(malloc|calloc|realloc)\s*\(")
+
+# ==============================================================================
+# Global Active Tracer Registry (Prevents Zombie GDB Processes)
+# ==============================================================================
+
+_ACTIVE_TRACERS_LOCK = threading.Lock()
+_ACTIVE_TRACERS: Set["GDBTracer"] = set()
+
+
+def terminate_all_active_tracers() -> None:
+    with _ACTIVE_TRACERS_LOCK:
+        tracers = list(_ACTIVE_TRACERS)
+        _ACTIVE_TRACERS.clear()
+    for t in tracers:
+        try:
+            t.close()
+        except Exception:
+            pass
+
 
 # ==============================================================================
 # C Lexical, Grammar & Runtime Noise Filter Constants
@@ -360,14 +377,21 @@ class GDBTracer:
         binary_path: Path,
         source_path: Path,
         stdin_path: Optional[Path] = None,
+        cancel_event: Optional[threading.Event] = None,
     ):
         self.binary_path = binary_path
         self.source_path = source_path
         self.stdin_path = stdin_path
+        self._cancel_event = cancel_event or threading.Event()
+        self._closed = False
+        self._close_lock = threading.Lock()
         self.gdb: Optional[GdbController] = None
         self.step_count = 0
-        self.session_start_time = 0.0
-        self.last_step_time = 0.0
+
+        # Initialize monotonic clocks immediately so `_check_budget()` never compares against 0.0
+        now = time.monotonic()
+        self.session_start_time = now
+        self.last_step_time = now
 
         self._source_lines: List[str] = [""]
         self._full_clean_source: str = ""
@@ -384,18 +408,7 @@ class GDBTracer:
 
         self._type_cache: Dict[str, DwarfTypeEntry] = {}
 
-        # Cumulative Session Heap Block Ledger:
-        # Maps canonical hex address -> {
-        #   "address": str,
-        #   "status": "active" | "freed" | "purged",
-        #   "type": str,
-        #   "fields": Dict[str, Any],
-        #   "label": str,
-        #   "self_ref_order": List[str],
-        #   "edges": List[GraphEdge],
-        #   "freed_at_step": Optional[int],
-        #   "freed_by_var": Optional[str],
-        # }
+        # Cumulative Session Heap Block Ledger
         self.heap_blocks: Dict[str, Dict[str, Any]] = {}
         self._freed_addresses: Set[str] = set()
 
@@ -428,6 +441,9 @@ class GDBTracer:
         self._last_executed_line: int = 0
         self._token_counter: int = 100
 
+        with _ACTIVE_TRACERS_LOCK:
+            _ACTIVE_TRACERS.add(self)
+
     @staticmethod
     def _is_system_or_runtime_symbol(var_name: str, var_type: str = "") -> bool:
         if not var_name:
@@ -454,11 +470,6 @@ class GDBTracer:
     def _mark_address_freed(
         self, addr: str, freed_by_var: Optional[str] = None
     ) -> None:
-        r"""
-        Transitions `addr` to `"status": "freed"` in `self.heap_blocks`, freezes its
-        last known valid struct fields, and records `freed_at_step = self.step_count`
-        so the immediate post-free snapshot always retains the `[FREED]` card.
-        """
         self._freed_addresses.add(addr)
         self._address_bounds_ledger.pop(addr, None)
         clean_var = (
@@ -492,9 +503,14 @@ class GDBTracer:
         return bool(blk and blk.get("status") in {"freed", "purged"})
 
     def start(self) -> bool:
+        r"""
+        Spawns GDB, drains initial banner output non-blockingly, configures MI settings,
+        places a breakpoint at `main`, and runs until `main` is hit.
+        """
         now = time.monotonic()
         self.session_start_time = now
         self.last_step_time = now
+        self._check_budget()
 
         self.gdb = GdbController(
             command=[
@@ -506,7 +522,12 @@ class GDBTracer:
             ],
             time_to_check_for_additional_output_sec=0.002,
         )
-        self.gdb.get_gdb_response(timeout_sec=1.0, raise_error_on_timeout=False)
+        try:
+            self.gdb.get_gdb_response(
+                timeout_sec=0.5, raise_error_on_timeout=False
+            )
+        except Exception:
+            pass
 
         startup_cmds = [
             "-gdb-set disable-randomization on",
@@ -522,21 +543,68 @@ class GDBTracer:
             startup_cmds.append(f'-gdb-set args < "{self.stdin_path}"')
         startup_cmds.append("-break-insert main")
 
-        self._cmd("\n".join(startup_cmds))
-        run_res = self._cmd("-exec-run", timeout=STEP_INACTIVITY_TIMEOUT_SEC)
+        self._cmd_batch_tokenized(startup_cmds)
+        run_res = self._cmd_exec("-exec-run", timeout=STEP_INACTIVITY_TIMEOUT_SEC)
         return not self._update_stop_state(run_res)
 
     def close(self) -> None:
-        if self.gdb:
-            try:
-                self.gdb.exit()
-            except Exception:
-                pass
+        r"""
+        Guaranteed GDB & inferior process teardown.
+        """
+        self._cancel_event.set()
+        with _ACTIVE_TRACERS_LOCK:
+            _ACTIVE_TRACERS.discard(self)
+
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+            gdb_ctrl = self.gdb
             self.gdb = None
 
+        if gdb_ctrl is not None:
+            proc = getattr(gdb_ctrl, "gdb_process", None) or getattr(
+                gdb_ctrl, "spawn", None
+            )
+            pid: Optional[int] = getattr(proc, "pid", None) if proc else None
+
+            try:
+                gdb_ctrl.exit()
+            except Exception:
+                pass
+
+            try:
+                if hasattr(gdb_ctrl, "spawn") and gdb_ctrl.spawn:
+                    gdb_ctrl.spawn.kill()
+            except Exception:
+                pass
+
+            try:
+                if proc is not None:
+                    proc.kill()
+            except Exception:
+                pass
+
+            if pid and pid > 0:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
+            if proc is not None:
+                for pipe_attr in ("stdin", "stdout", "stderr"):
+                    pipe_obj = getattr(proc, pipe_attr, None)
+                    if pipe_obj is not None:
+                        try:
+                            pipe_obj.close()
+                        except Exception:
+                            pass
+
     def _check_budget(self) -> None:
+        if self._closed or self._cancel_event.is_set():
+            raise RuntimeError("Trace session was cancelled by client.")
         now = time.monotonic()
-        if now - self.session_start_time > SESSION_TIMEOUT_SEC:
+        if self.session_start_time > 0.0 and (now - self.session_start_time > SESSION_TIMEOUT_SEC):
             raise TimeoutError(
                 f"Trace session exceeded {SESSION_TIMEOUT_SEC:.0f}s maximum duration."
             )
@@ -558,6 +626,49 @@ class GDBTracer:
             raise_error_on_timeout=False,
         )
 
+    def _cmd_exec(
+        self, exec_command: str, timeout: float = STEP_INACTIVITY_TIMEOUT_SEC
+    ) -> List[Dict[str, Any]]:
+        self._check_budget()
+        if not self.gdb:
+            raise RuntimeError("GDB controller is not initialized.")
+
+        self._token_counter += 1
+        tok = self._token_counter
+        deadline = time.monotonic() + timeout
+        self.last_step_time = time.monotonic()
+
+        responses = self.gdb.write(
+            f"{tok}{exec_command}",
+            timeout_sec=0.05,
+            raise_error_on_timeout=False,
+        )
+
+        while time.monotonic() < deadline:
+            if self._closed or self._cancel_event.is_set():
+                raise RuntimeError("Trace session was cancelled by client.")
+
+            has_stopped = any(
+                r.get("type") == "notify" and r.get("message") == "stopped"
+                for r in responses
+            )
+            has_error = any(
+                r.get("type") == "result"
+                and r.get("message") == "error"
+                and (r.get("token") is None or str(r.get("token")) == str(tok))
+                for r in responses
+            )
+            if has_stopped or has_error:
+                break
+
+            more = self.gdb.get_gdb_response(
+                timeout_sec=0.015, raise_error_on_timeout=False
+            )
+            if more:
+                responses.extend(more)
+
+        return responses
+
     def _cmd_tokenized(
         self, mi_command: str, timeout: float = STEP_INACTIVITY_TIMEOUT_SEC
     ) -> List[Dict[str, Any]]:
@@ -577,6 +688,9 @@ class GDBTracer:
         )
 
         while time.monotonic() < deadline:
+            if self._closed or self._cancel_event.is_set():
+                raise RuntimeError("Trace session was cancelled by client.")
+
             if any(
                 r.get("type") == "result" and str(r.get("token")) == str(tok)
                 for r in responses
@@ -635,6 +749,9 @@ class GDBTracer:
         harvest(responses)
 
         while pending_tokens and time.monotonic() < deadline:
+            if self._closed or self._cancel_event.is_set():
+                raise RuntimeError("Trace session was cancelled by client.")
+
             more = self.gdb.get_gdb_response(
                 timeout_sec=0.015, raise_error_on_timeout=False
             )
@@ -717,6 +834,9 @@ class GDBTracer:
         process_responses(responses)
 
         while pending_tokens and time.monotonic() < deadline:
+            if self._closed or self._cancel_event.is_set():
+                raise RuntimeError("Trace session was cancelled by client.")
+
             more = self.gdb.get_gdb_response(
                 timeout_sec=0.015, raise_error_on_timeout=False
             )
@@ -726,8 +846,11 @@ class GDBTracer:
         return results
 
     def _update_stop_state(self, responses: List[Dict[str, Any]]) -> bool:
+        saw_stopped = False
+
         for r in responses:
             if r.get("type") == "notify" and r.get("message") == "stopped":
+                saw_stopped = True
                 payload = r.get("payload", {})
                 if not isinstance(payload, dict):
                     continue
@@ -747,7 +870,7 @@ class GDBTracer:
                     file_raw = frame.get("file") or frame.get("fullname") or ""
                     line_raw = frame.get("line", 0)
 
-                    if func in SYSTEM_ENTRY_FUNCTIONS or func.startswith("_"):
+                    if func in SYSTEM_ENTRY_FUNCTIONS:
                         return True
 
                     self._current_func = func or "main"
@@ -756,15 +879,19 @@ class GDBTracer:
                         self._current_line = int(line_raw)
                     except (ValueError, TypeError):
                         self._current_line = 0
-                return False
+
+        if not saw_stopped:
+            for r in responses:
+                if r.get("type") == "result" and r.get("message") == "error":
+                    payload = r.get("payload", {})
+                    msg = str(payload.get("msg", "")) if isinstance(payload, dict) else str(payload)
+                    if "not being run" in msg or "No registers" in msg or "No stack" in msg:
+                        return True
+            return True
+
         return False
 
     def _record_pending_free_on_current_line(self) -> None:
-        r"""
-        Intercepts `free(expr)` on `self._current_line` BEFORE GDB steps over it,
-        evaluates the target pointer address, and marks the block as `"freed"`
-        with `freed_at_step = self.step_count` and `freed_by_var = expr`.
-        """
         if 1 <= self._current_line < len(self._source_lines):
             src_line = self._source_lines[self._current_line].split("//")[0]
             free_exprs = [
@@ -884,15 +1011,6 @@ class GDBTracer:
     def _is_uninitialized_at_line(
         self, func_name: str, var_name: str, current_line: int, curr_depth: int = 0
     ) -> bool:
-        r"""
-        Returns True if `var_name` has NOT yet executed its declaration/initialization
-        in the current frame depth (`curr_depth`).
-        Once `var_name` has executed past its declaration line in `curr_depth` (e.g. on
-        iteration 1 of a `while` loop), it is recorded in `self._initialized_vars_by_depth[curr_depth]`
-        so on iteration 2+ when execution jumps back to `while (...)` or `SNode *tmp = head;`,
-        `tmp` retains its previous iteration's (potentially dangling) pointer value until
-        the declaration line executes again.
-        """
         decl_info = self._get_var_declaration_info(func_name, var_name, current_line)
         if decl_info is None:
             return False
@@ -960,14 +1078,13 @@ class GDBTracer:
         self._last_executed_line = self._current_line
         self._record_pending_free_on_current_line()
 
-        mi_step_cmd = (
-            "-exec-step" if self._should_step_into_current_line() else "-exec-next"
-        )
-        responses = self._cmd(mi_step_cmd)
+        want_step_into = self._should_step_into_current_line()
+        mi_step_cmd = "-exec-step" if want_step_into else "-exec-next"
+        responses = self._cmd_exec(mi_step_cmd)
         if self._update_stop_state(responses):
             return False
 
-        for _ in range(6):
+        for _ in range(8):
             if (
                 self._current_file == self.source_path.name
                 and self._current_line > 0
@@ -975,12 +1092,21 @@ class GDBTracer:
             ):
                 return True
 
-            if self._current_func in SYSTEM_ENTRY_FUNCTIONS or self._current_func.startswith("_"):
+            if self._current_func in SYSTEM_ENTRY_FUNCTIONS:
                 return False
 
-            fin_res = self._cmd("-exec-finish")
+            fin_res = self._cmd_exec("-exec-finish")
             if self._update_stop_state(fin_res):
                 return False
+
+            if (
+                self._current_file == self.source_path.name
+                and self._current_line == self._last_executed_line
+                and want_step_into
+            ):
+                step_res = self._cmd_exec("-exec-step")
+                if self._update_stop_state(step_res):
+                    return False
 
         return (
             self._current_file == self.source_path.name
@@ -995,18 +1121,6 @@ class GDBTracer:
     def _is_scalar_reference_pointer(
         self, func_name: str, ptr_name: str, anchor_line: int
     ) -> bool:
-        r"""
-        Determines purely from the local AST/tokens of `func_name` whether a primitive
-        pointer `T *ptr_name` (such as `int *a, int *b` in `swap(int *a, int *b)`) is a
-        scalar pass-by-reference pointer rather than an array buffer:
-          - If `ptr_name` has array subscripts (`ptr_name[...]`), pointer offset arithmetic
-            (`*(ptr_name + ...)`, `ptr_name + i`, `ptr_name++`, `ptr_name--`, `ptr_name +=`),
-            or heap allocation (`ptr_name = malloc(...)`) inside `func_name`, returns `False`
-            (it IS used as an array/buffer).
-          - If `ptr_name` has NO array subscripts or offset arithmetic in `func_name`, and
-            IS accessed via unary dereference (`*ptr_name`), returns `True` (strictly a
-            scalar pass-by-reference pointer; NEVER emit an `ArraySnapshot`).
-        """
         clean_ptr = ptr_name.split(":")[-1].strip()
         cache_key = (func_name, clean_ptr)
         if cache_key in self._scalar_ref_ptr_cache:
@@ -1019,13 +1133,10 @@ class GDBTracer:
 
         esc = re.escape(clean_ptr)
 
-        # 1. Check for array subscript access: `ptr[...]`
-        has_subscript = bool(re.search(rf"\b{esc}\s*\[", body))
-        if has_subscript:
+        if re.search(rf"\b{esc}\s*\[", body):
             self._scalar_ref_ptr_cache[cache_key] = False
             return False
 
-        # 2. Check for pointer offset arithmetic or cursor increment: `*(ptr + ...)`, `ptr + offset`, `ptr++`, `++ptr`, `ptr +=`
         has_ptr_arith = bool(
             re.search(
                 rf"\*\s*\(\s*(?:{esc}\s*[\+\-]|[^\)]+\+\s*{esc}\b)"
@@ -1038,7 +1149,6 @@ class GDBTracer:
             self._scalar_ref_ptr_cache[cache_key] = False
             return False
 
-        # 3. Check for dynamic allocation: `ptr = malloc(...)`
         has_alloc = bool(
             re.search(
                 rf"\b{esc}\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(",
@@ -1049,9 +1159,6 @@ class GDBTracer:
             self._scalar_ref_ptr_cache[cache_key] = False
             return False
 
-        # 4. Check for unary dereference `*ptr` (e.g. `int t = *a; *a = *b; *b = t;`)
-        #    Note: Since `body` starts at the opening `{` of the function body, parameter
-        #    declarations like `void swap(int *a, int *b)` are already excluded.
         has_unary_deref = bool(
             re.search(rf"(?<![a-zA-Z0-9_])\*\s*{esc}\b(?!\s*\[)", body)
         )
@@ -1337,8 +1444,6 @@ class GDBTracer:
             array_name=array_name,
         )
 
-        # If currently inside a helper like `swap(int *a, int *b)` where `array_name` (`arr`)
-        # is not directly mentioned, also check caller functions on the active call stack
         if not proven_index_names and len(self._active_call_stack) > 1:
             for caller_fn in reversed(self._active_call_stack[:-1]):
                 caller_proven = self._get_syntactically_proven_indices(
@@ -1410,7 +1515,6 @@ class GDBTracer:
         if ptr_leaf_name not in self._alloc_bound_expr_cache:
             candidates: List[str] = []
             esc = re.escape(ptr_leaf_name)
-            # 1. Explicit heap allocation: `ptr = malloc(BOUND * ...)`
             alloc_re = re.compile(
                 rf"\b{esc}\s*(?:\[[^\]]+\])?\s*=\s*(?:\([^\)]*\)\s*)?(?:malloc|calloc|realloc)\s*\(\s*([^,\)\*]+)"
             )
@@ -1419,7 +1523,6 @@ class GDBTracer:
                     if ident not in candidates:
                         candidates.append(ident)
 
-            # 2. Only extract `< BOUND` or `BOUND - 1` from functions that actually subscript `ptr_leaf_name`!
             if re.search(rf"\b{esc}\s*\[", self._full_clean_source):
                 bound_re = re.compile(r"<\s*([a-zA-Z_][a-zA-Z0-9_]*)\b")
                 for m in bound_re.finditer(self._full_clean_source):
@@ -2005,7 +2108,6 @@ class GDBTracer:
                 if not addr:
                     continue
 
-                # Suppress scalar pass-by-reference pointers (`*a`, `*b` in `swap`)
                 if self._is_scalar_reference_pointer(
                     owner_fn, v_name, self._current_line if f_level == 0 else 1
                 ):
@@ -2674,16 +2776,6 @@ class GDBTracer:
         leaf_scalar_ints: Dict[str, int],
         all_scalar_ints: Dict[str, int],
     ) -> Tuple[GraphSnapshot, List[ArraySnapshot]]:
-        r"""
-        Crawls all reachable struct nodes starting from `active_struct_ptrs` AND
-        any block freed on the immediate step transition (`freed_at_step == self.step_count`):
-          - Blocks freed on the immediate step (`freed_at_step == self.step_count`) or still
-            referenced by any live local/heap pointer (`reference_counts[addr] > 0`) are
-            emitted with `status="freed"`, `is_freed=True`, `is_dangling=True`, and their
-            frozen pre-free `fields`.
-          - On subsequent steps (`self.step_count > freed_at_step`), once `reference_counts[addr] == 0`,
-            the freed block transitions to `"purged"` and is omitted from the snapshot.
-        """
         emitted_node_ids: Set[str] = set()
         queued_addresses: Set[str] = set()
         reference_counts: Dict[str, int] = {}
@@ -2695,7 +2787,6 @@ class GDBTracer:
         addr_to_ptr_names: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, str, str]] = []
 
-        # 1. Seed from all live stack pointers across active call stack frames
         for ptr_name, (addr, s_type) in active_struct_ptrs.items():
             if self._is_system_or_runtime_symbol(s_type, s_type):
                 continue
@@ -2708,9 +2799,6 @@ class GDBTracer:
                     queued_addresses.add(addr)
                     frontier.append((addr, s_type, display_ptr))
 
-        # 2. Seed any block freed on the IMMEDIATE step (`freed_at_step == self.step_count`)
-        #    so sequential loops like `while (head) { tmp = head; head = head->next; free(tmp); }`
-        #    ALWAYS render the `[FREED]` card on the step `free(tmp)` executes!
         for blk_addr, blk_info in list(self.heap_blocks.items()):
             if (
                 blk_info.get("status") == "freed"
@@ -2764,8 +2852,6 @@ class GDBTracer:
                     for saved_edge in blk.get("edges", []):
                         tgt = saved_edge.target
                         tgt_blk = self.heap_blocks.get(tgt)
-                        # Follow frozen edges either to active nodes (e.g. `tmp->next` pointing to new `head`)
-                        # or to previously freed child nodes in a post-order tree cleanup
                         if tgt_blk and tgt_blk.get("status") in {"active", "freed"}:
                             if tgt_blk.get("status") == "freed":
                                 if (tgt_blk.get("freed_at_step") or 0) <= (
@@ -3226,14 +3312,12 @@ class GDBTracer:
 
             frontier.extend(next_frontier)
 
-        # Prune any edge whose target was not emitted in `nodes`
         edges = [
             e
             for e in edges
             if e.source in emitted_node_ids and e.target in emitted_node_ids
         ]
 
-        # Transition `"freed"` blocks with 0 live references (on steps after `freed_at_step`) to `"purged"`
         for blk_addr, blk_info in self.heap_blocks.items():
             if blk_info.get("status") == "freed":
                 if (
@@ -3343,9 +3427,21 @@ class GDBTracer:
 def compile_c_source(
     source_code: str, workdir: Path = TMPFS_ROOT
 ) -> Tuple[bool, Path, Path, str]:
+    r"""
+    Terminates any lingering active GDB tracers, unlinks any existing `target` binary
+    first, and compiles `target.c` to `target` with DWARF-3 debug symbols.
+    """
+    terminate_all_active_tracers()
+
     workdir.mkdir(parents=True, exist_ok=True)
     source_path = workdir / "target.c"
     binary_path = workdir / "target"
+
+    if binary_path.exists():
+        try:
+            binary_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     source_path.write_text(source_code, encoding="utf-8")
 
@@ -3381,24 +3477,42 @@ def run_trace_session(
     stdin_path: Optional[Path],
     snapshot_queue: asyncio.Queue,
     loop: asyncio.AbstractEventLoop,
+    cancel_event: Optional[threading.Event] = None,
+    tracer_holder: Optional[List[GDBTracer]] = None,
 ) -> None:
+    r"""
+    Executes a deterministic GDB trace session in a background thread executor
+    and streams snapshots to `snapshot_queue`.
+    """
+    terminate_all_active_tracers()
+
     tracer = GDBTracer(
         binary_path=binary_path,
         source_path=source_path,
         stdin_path=stdin_path,
+        cancel_event=cancel_event,
     )
+    if tracer_holder is not None:
+        tracer_holder.append(tracer)
 
-    def emit(payload: Dict[str, Any]) -> None:
-        asyncio.run_coroutine_threadsafe(snapshot_queue.put(payload), loop).result()
+    def emit(payload: Optional[Dict[str, Any]]) -> None:
+        if cancel_event is not None and cancel_event.is_set() and payload is not None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(snapshot_queue.put(payload), loop).result(
+                timeout=2.0
+            )
+        except Exception:
+            pass
 
     try:
         reached_main = tracer.start()
-        if reached_main:
+        if reached_main and not (cancel_event and cancel_event.is_set()):
             initial_snap = tracer.inspect_state()
             if initial_snap:
                 emit(initial_snap.model_dump(by_alias=True))
 
-            while True:
+            while not (cancel_event and cancel_event.is_set()):
                 alive = tracer.step_next_user_line()
                 if not alive:
                     break
@@ -3407,14 +3521,35 @@ def run_trace_session(
                 if snap:
                     emit(snap.model_dump(by_alias=True))
 
-        emit({"event": "completed", "status": "completed", "total_steps": tracer.step_count})
+        if not (cancel_event and cancel_event.is_set()):
+            emit(
+                {
+                    "event": "completed",
+                    "status": "completed",
+                    "total_steps": tracer.step_count,
+                }
+            )
 
     except TimeoutError as exc:
         emit({"event": "error", "error_type": "TimeoutError", "detail": str(exc)})
     except RuntimeError as exc:
-        emit({"event": "error", "error_type": "StepLimitExceeded", "detail": str(exc)})
+        if not (cancel_event and cancel_event.is_set()):
+            emit(
+                {
+                    "event": "error",
+                    "error_type": "StepLimitExceeded",
+                    "detail": str(exc),
+                }
+            )
     except Exception as exc:
-        emit({"event": "error", "error_type": "InternalTracerError", "detail": str(exc)})
+        if not (cancel_event and cancel_event.is_set()):
+            emit(
+                {
+                    "event": "error",
+                    "error_type": "InternalTracerError",
+                    "detail": str(exc),
+                }
+            )
     finally:
         tracer.close()
-        asyncio.run_coroutine_threadsafe(snapshot_queue.put(None), loop).result()
+        emit(None)

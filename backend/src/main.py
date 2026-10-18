@@ -1,126 +1,131 @@
 #!/usr/bin/env python3
-"""
+r"""
 backend/src/main.py
 
-Main FastAPI application entry point for C-Memory-Studio.
-Routes:
-  - WS   /ws/trace           -> src.debugger.gdb_engine
-  - POST /api/analyze/memory -> src.analyzer.valgrind
+FastAPI WebSocket & REST Entrypoint for C-Memory-Studio.
+Streams DWARF/GDB-MI execution snapshots asynchronously via `asyncio.Queue`
+without blocking the event loop, and tears down the GDB subprocess cleanly on disconnect.
 """
 
 import asyncio
-import os
+import json
+import logging
 import shutil
-import traceback
+import threading
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
-from src.analyzer.valgrind import ValgrindAuditResponse, run_memory_audit
-from src.debugger.gdb_engine import TMPFS_ROOT, compile_c_source, run_trace_session
+from src.debugger.gdb_engine import (
+    GDBTracer,
+    TMPFS_ROOT,
+    compile_c_source,
+    run_trace_session,
+)
 
-app = FastAPI(title="C-Memory-Studio Tracer API", version="1.0.0")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("c-memory-studio.main")
 
-# ==============================================================================
-# CORS Middleware Configuration
-# ==============================================================================
-
-ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "*",
-]
+app = FastAPI(
+    title="C-Memory-Studio Backend",
+    version="2.1.0",
+    description="Deterministic DWARF/GDB-MI Memory & Topology Visualizer Engine",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=3600,
 )
 
 
-@app.exception_handler(Exception)
-async def global_cors_safe_exception_handler(
-    request: Request, exc: Exception
-) -> JSONResponse:
-    origin = request.headers.get("origin") or "*"
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "success": False,
-            "runtime_error": f"Internal Server Error: {type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(),
-        },
-        headers={
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Credentials": "true",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        },
-    )
+def _extract_code_and_stdin(raw_message: str) -> Tuple[str, Optional[str]]:
+    r"""
+    Extracts `(source_code, stdin_text)` from a JSON WebSocket payload
+    or falls back to treating `raw_message` as raw C source code.
+    """
+    try:
+        data = json.loads(raw_message)
+        if isinstance(data, dict):
+            code = (
+                data.get("code")
+                or data.get("source_code")
+                or data.get("source")
+                or data.get("c_code")
+                or ""
+            )
+            stdin_val = data.get("stdin") or data.get("input")
+            return (str(code), str(stdin_val) if stdin_val is not None else None)
+    except json.JSONDecodeError:
+        pass
+    return (raw_message, None)
 
 
-# ==============================================================================
-# Request Schemas
-# ==============================================================================
-
-class TraceRequest(BaseModel):
-    action: Optional[str] = Field(default="start", description="WebSocket action trigger")
-    code: str = Field(..., description="Raw C source code to compile and trace")
-    stdin: str = Field(default="", description="Optional standard input for the program")
+@app.get("/")
+@app.get("/health")
+@app.get("/api/health")
+async def health_check() -> Dict[str, str]:
+    return {"status": "ok", "service": "c-memory-studio-backend"}
 
 
-class MemoryAnalyzeRequest(BaseModel):
-    code: str = Field(..., min_length=1, description="C source code to compile and audit")
-    stdin: str = Field(default="", description="Optional standard input passed to the binary")
-
-
-# ==============================================================================
-# Endpoints
-# ==============================================================================
-
-@app.websocket("/ws/trace")
-async def websocket_trace_endpoint(websocket: WebSocket) -> None:
+async def _handle_trace_websocket(websocket: WebSocket) -> None:
     await websocket.accept()
-    session_dir = TMPFS_ROOT / f"run_{uuid.uuid4().hex[:8]}"
-    session_dir.mkdir(parents=True, exist_ok=True)
+    loop = asyncio.get_running_loop()
+
+    cancel_event = threading.Event()
+    tracer_holder: List[GDBTracer] = []
+    session_workdir = TMPFS_ROOT / f"session_{uuid.uuid4().hex[:12]}"
+    worker_future: Optional[asyncio.Future[Any]] = None
 
     try:
-        raw_payload = await asyncio.wait_for(websocket.receive_json(), timeout=10.0)
-        req = TraceRequest(**raw_payload)
+        raw_msg = await websocket.receive_text()
+        source_code, stdin_text = _extract_code_and_stdin(raw_msg)
 
-        success, binary_path, source_path, stderr = await asyncio.to_thread(
-            compile_c_source, req.code, TMPFS_ROOT
+        if not source_code.strip():
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "status": "error",
+                    "error_type": "EmptySourceError",
+                    "detail": "No C source code was provided for tracing.",
+                }
+            )
+            return
+
+        session_workdir.mkdir(parents=True, exist_ok=True)
+
+        ok, binary_path, source_path, stderr_txt = await loop.run_in_executor(
+            None, compile_c_source, source_code, session_workdir
         )
 
-        if not success:
-            await websocket.send_json({
-                "event": "compile_error",
-                "stderr": stderr,
-            })
-            await websocket.close(code=1000)
+        if not ok:
+            await websocket.send_json(
+                {
+                    "event": "compile_error",
+                    "status": "compile_error",
+                    "error_type": "CompilationError",
+                    "detail": stderr_txt,
+                    "stderr": stderr_txt,
+                }
+            )
             return
 
         stdin_path: Optional[Path] = None
-        if req.stdin:
-            stdin_path = session_dir / "stdin.txt"
-            stdin_path.write_text(req.stdin, encoding="utf-8")
+        if stdin_text:
+            stdin_path = session_workdir / "stdin.txt"
+            stdin_path.write_text(stdin_text, encoding="utf-8")
 
-        snapshot_queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_running_loop()
+        snapshot_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
 
-        tracer_future = loop.run_in_executor(
+        worker_future = loop.run_in_executor(
             None,
             run_trace_session,
             binary_path,
@@ -128,6 +133,8 @@ async def websocket_trace_endpoint(websocket: WebSocket) -> None:
             stdin_path,
             snapshot_queue,
             loop,
+            cancel_event,
+            tracer_holder,
         )
 
         while True:
@@ -135,76 +142,54 @@ async def websocket_trace_endpoint(websocket: WebSocket) -> None:
             if item is None:
                 break
             await websocket.send_json(item)
-
-        await tracer_future
-        await websocket.close(code=1000)
+            if item.get("event") in {"completed", "error", "compile_error"}:
+                break
 
     except WebSocketDisconnect:
-        pass
+        logger.info("WebSocket client disconnected; cancelling active GDB trace.")
+        cancel_event.set()
+    except asyncio.CancelledError:
+        logger.info("WebSocket handler task cancelled.")
+        cancel_event.set()
     except Exception as exc:
+        logger.exception("Unhandled error in WebSocket trace handler: %s", exc)
+        cancel_event.set()
         try:
-            await websocket.send_json({
-                "event": "error",
-                "error_type": type(exc).__name__,
-                "detail": str(exc),
-            })
-            await websocket.close(code=1011)
+            await websocket.send_json(
+                {
+                    "event": "error",
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "detail": str(exc),
+                }
+            )
         except Exception:
             pass
     finally:
-        shutil.rmtree(session_dir, ignore_errors=True)
+        cancel_event.set()
+        if worker_future is not None and not worker_future.done():
+            worker_future.cancel()
+
+        def _cleanup_resources() -> None:
+            for t in list(tracer_holder):
+                try:
+                    t.close()
+                except Exception:
+                    pass
+            shutil.rmtree(session_workdir, ignore_errors=True)
+
+        loop.run_in_executor(None, _cleanup_resources)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
-@app.post(
-    "/api/analyze/memory",
-    response_model=ValgrindAuditResponse,
-    responses={
-        200: {"description": "Valgrind analysis completed successfully"},
-        400: {"description": "GCC compilation failed"},
-        500: {"description": "Internal execution failure"},
-    },
-)
-async def analyze_memory_endpoint(
-    payload: MemoryAnalyzeRequest,
-    request: Request,
-) -> JSONResponse:
-    origin = request.headers.get("origin") or "*"
-    cors_headers = {
-        "Access-Control-Allow-Origin": origin,
-        "Access-Control-Allow-Credentials": "true",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
-    }
+@app.websocket("/ws/trace")
+async def websocket_trace_endpoint(websocket: WebSocket) -> None:
+    await _handle_trace_websocket(websocket)
 
-    try:
-        result: ValgrindAuditResponse = await asyncio.to_thread(
-            run_memory_audit,
-            payload.code,
-            payload.stdin,
-        )
 
-        if not result.success:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={
-                    "success": False,
-                    "compilation_error": result.compilation_error,
-                },
-                headers=cors_headers,
-            )
-
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content=result.model_dump(exclude_none=True),
-            headers=cors_headers,
-        )
-
-    except Exception as exc:
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={
-                "success": False,
-                "runtime_error": f"Valgrind execution failed: {type(exc).__name__}: {exc}",
-            },
-            headers=cors_headers,
-        )
+@app.websocket("/api/ws/trace")
+async def websocket_api_trace_endpoint(websocket: WebSocket) -> None:
+    await _handle_trace_websocket(websocket)
